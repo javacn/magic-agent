@@ -84,7 +84,7 @@ func streamArgsFor(e Engine) []string {
 	case *TraeEngine:
 		return []string{"stream-json"}
 	case *LLMEngine:
-		return []string{"sse"} // openai-completions SSE / CLI 委托；ollama 运行时报错
+		return []string{"stream"} // llm prompt 默认流式（纯文本 stdout）
 	}
 	return nil
 }

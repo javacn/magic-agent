@@ -1,50 +1,64 @@
 package agent
 
-// llmengine_test.go - llm 引擎的 HTTP 路由测试（扁平 models.json）。
+// llmengine_test.go - llm 引擎（simonw/LLM CLI 包装）测试。
 //
-// 本引擎只走 HTTP：不再有委托其他引擎或 ollama 分支，因此测试围绕
-// 请求构造、响应解析、错误透传与 Detect 报告展开。
+// 用 fake CLI 脚本模拟 llm prompt 的行为，验证：
+//	- buildArgs 参数构造（-n、-m、-s、--no-stream、prompt 位置）
+//	- Complete：--no-stream + 标签剥离
+//	- Stream：纯文本逐行流式 + thinkSplitter 标签路由
+//	- 标签被行边界切开的边界情况
+//	- CLI 失败报错
+//
+// 标签字面量同样分段拼接（见 tags.go 头注释）。
 
 import (
 	"context"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestLLMEngineOpenAIRoute 走 HTTP：验证请求构造与响应解析。
-func TestLLMEngineOpenAIRoute(t *testing.T) {
-	var gotBody map[string]any
-	var gotAuth string
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("Authorization")
-		raw, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(raw, &gotBody)
+// llmTag 拼接思维链标签（避免源码出现连续 token）。
+func llmTag(parts ...string) string { return strings.Join(parts, "") }
 
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"答案是 2"}}]}`))
-	}))
-	defer srv.Close()
-
-	withModels(t, `[
-	  {
-	    "id":"test-model",
-	    "url":"`+srv.URL+`/chat/completions",
-	    "apiKey":"secret",
-	    "extraBody":{"thinking":{"type":"disabled"}}
-	  }
-	]`)
-
+// TestLLMBuildArgs 参数构造：-n 恒有；-m / -s 按需；prompt 收尾。
+func TestLLMBuildArgs(t *testing.T) {
 	e := &LLMEngine{}
+
+	// 最小形式
+	got := e.buildArgs(Request{Model: "minimax-m3"}, "你好")
+	want := []string{"prompt", "-n", "-m", "minimax-m3", "你好"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 带 system + engine/model 前缀剥离
+	got = e.buildArgs(Request{Model: "llm/minimax-m3", SystemPrompt: "你是助手"}, "问题")
+	want = []string{"prompt", "-n", "-m", "minimax-m3", "-s", "你是助手", "问题"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 无模型：不传 -m（llm 用自己的默认模型）
+	got = e.buildArgs(Request{}, "hi")
+	want = []string{"prompt", "-n", "hi"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+}
+
+// TestLLMCompleteStripsThinking Complete 模式：--no-stream 全量输出，
+// 标签块被剥离、正文与思维链分离。
+func TestLLMCompleteStripsThinking(t *testing.T) {
+	open := llmTag("<", "think", ">")
+	closeTag := llmTag("<", "/", "think", ">")
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+open+"先想一下"+closeTag+"答案是 2\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
 	resp, err := e.Complete(context.Background(), Request{
-		Model:        "test-model",
-		SystemPrompt: "你是严谨的助手",
-		Messages:     []Message{{Role: "user", Content: "1+1=?"}},
+		Model:    "minimax-m3",
+		Messages: []Message{{Role: "user", Content: "1+1"}},
 	})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -52,240 +66,202 @@ func TestLLMEngineOpenAIRoute(t *testing.T) {
 	if resp.Text != "答案是 2" {
 		t.Errorf("Text = %q, want 答案是 2", resp.Text)
 	}
-	if resp.Model != "test-model" {
-		t.Errorf("Model = %q, want test-model", resp.Model)
+	if resp.Engine != "llm" {
+		t.Errorf("Engine = %q, want llm", resp.Engine)
 	}
-	if gotAuth != "Bearer secret" {
-		t.Errorf("Authorization = %q, want Bearer secret", gotAuth)
-	}
-	if gotPath != "/chat/completions" {
-		t.Errorf("path = %q, want /chat/completions", gotPath)
-	}
-
-	// system 作为首条消息，user 跟随。
-	msgs, ok := gotBody["messages"].([]any)
-	if !ok || len(msgs) != 2 {
-		t.Fatalf("messages = %#v, want 2 entries", gotBody["messages"])
-	}
-	first := msgs[0].(map[string]any)
-	if first["role"] != "system" || first["content"] != "你是严谨的助手" {
-		t.Errorf("first message = %#v, want system prompt", first)
-	}
-	// extraBody 必须并入请求体顶层。
-	thinking, ok := gotBody["thinking"].(map[string]any)
-	if !ok || thinking["type"] != "disabled" {
-		t.Errorf("extraBody not merged into request: thinking=%#v", gotBody["thinking"])
-	}
-	// 发往 API 的模型名 = id（未配 model）。
-	if gotBody["model"] != "test-model" {
-		t.Errorf("model = %v, want test-model", gotBody["model"])
-	}
-	// 非流式。
-	if gotBody["stream"] != false {
-		t.Errorf("stream = %v, want false", gotBody["stream"])
+	if resp.Model != "minimax-m3" {
+		t.Errorf("Model = %q, want minimax-m3", resp.Model)
 	}
 }
 
-// TestLLMEngineWireModelUsed 配了 model 时发往 API 用 model，响应 Model 用 id。
-func TestLLMEngineWireModelUsed(t *testing.T) {
-	var gotModel string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var body map[string]any
-		_ = json.Unmarshal(raw, &body)
-		gotModel, _ = body["model"].(string)
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
-	}))
-	defer srv.Close()
+// TestLLMCompletePlainText 无标签模型：正文原样返回。
+func TestLLMCompletePlainText(t *testing.T) {
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\necho '普通回答'\n")
+	e := &LLMEngine{BinPath: cli}
 
-	withModels(t, `[{"id":"minimax-nothink","model":"MiniMax-M3","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
-
-	resp, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "minimax-nothink",
+	resp, err := e.Complete(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if gotModel != "MiniMax-M3" {
-		t.Errorf("wire model = %q, want MiniMax-M3", gotModel)
-	}
-	if resp.Model != "minimax-nothink" {
-		t.Errorf("response Model = %q, want the caller-facing id", resp.Model)
+	if resp.Text != "普通回答" {
+		t.Errorf("Text = %q, want 普通回答", resp.Text)
 	}
 }
 
-// TestLLMEngineEndpointAppended base 地址（无 /chat/completions）被自动补全。
-func TestLLMEngineEndpointAppended(t *testing.T) {
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
-	}))
-	defer srv.Close()
+// TestLLMCompletePassesFlags --no-stream 与 -s 落到真实命令行。
+func TestLLMCompletePassesFlags(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.log")
+	cli := filepath.Join(dir, "llm")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + log + "\necho 'ok'\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &LLMEngine{BinPath: cli}
 
-	// 注意：url 只给到 /v1，不带 /chat/completions
-	withModels(t, `[{"id":"m","url":"`+srv.URL+`/v1","apiKey":"k"}]`)
-
-	if _, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "m",
-		Messages: []Message{{Role: "user", Content: "hi"}},
-	}); err != nil {
+	_, err := e.Complete(context.Background(), Request{
+		Model:        "minimax-m3",
+		SystemPrompt: "你是助手",
+		Messages:     []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if gotPath != "/v1/chat/completions" {
-		t.Errorf("path = %q, want /v1/chat/completions (auto-appended)", gotPath)
+	data, _ := os.ReadFile(log)
+	args := string(data)
+	for _, want := range []string{"prompt", "-n", "-m minimax-m3", "-s 你是助手", "--no-stream"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("%q missing in args: %q", want, args)
+		}
 	}
 }
 
-// TestLLMEngineHTTPErrorStatus 非 2xx 时错误信息带状态码（便于重试分类）。
-func TestLLMEngineHTTPErrorStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":{"message":"slow down"}}`))
-	}))
-	defer srv.Close()
+// TestLLMCompleteCliError CLI 非零退出 → 报错。
+func TestLLMCompleteCliError(t *testing.T) {
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\necho 'Error: no such model' >&2\nexit 1\n")
+	e := &LLMEngine{BinPath: cli}
 
-	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
-
-	_, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "m",
+	_, err := e.Complete(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	})
 	if err == nil {
-		t.Fatal("want error for HTTP 429")
+		t.Fatal("expected error for non-zero exit")
 	}
-	if !strings.Contains(err.Error(), "429") {
-		t.Errorf("error = %v, want it to mention 429", err)
+	if !strings.Contains(err.Error(), "llm") {
+		t.Errorf("error should mention llm: %v", err)
 	}
 }
 
-// TestLLMEngineProviderErrorInBody 200 + error 体也应报错。
-func TestLLMEngineProviderErrorInBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request","message":"bad model"}}`))
-	}))
-	defer srv.Close()
+// TestLLMStreamSplitsThinkingTags 流式：标签块路由到 thinking，
+// 标签外正文路由到 text；换行保留。
+func TestLLMStreamSplitsThinkingTags(t *testing.T) {
+	open := llmTag("<", "think", ">")
+	closeTag := llmTag("<", "/", "think", ">")
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+open+"\n用户在做加法。\n"+closeTag+"\n答案是 2。\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
 
-	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
+	events, onEvent := collectEvents()
+	res, err := e.Stream(context.Background(), Request{
+		Model:    "minimax-m3",
+		Messages: []Message{{Role: "user", Content: "1+1"}},
+	}, onEvent)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if res.Text != "答案是 2。" {
+		t.Errorf("Text = %q, want 答案是 2。", res.Text)
+	}
+	// 思维链内容：开闭标签之间的文本（收尾 TrimSpace 去掉标签行的换行）。
+	if res.Thinking != "用户在做加法。" {
+		t.Errorf("Thinking = %q, want 用户在做加法。", res.Thinking)
+	}
+	// 至少各一条增量
+	var hasThink, hasText bool
+	for _, ev := range *events {
+		switch ev.Kind {
+		case KindThinking:
+			hasThink = true
+		case KindText:
+			hasText = true
+		}
+	}
+	if !hasThink || !hasText {
+		t.Errorf("events missing kinds: thinking=%v text=%v (events=%v)", hasThink, hasText, *events)
+	}
+	// 第一条事件必须是 thinking（开标签在最前）
+	if len(*events) > 0 && (*events)[0].Kind != KindThinking {
+		t.Errorf("first event = %v, want thinking", (*events)[0].Kind)
+	}
+}
 
-	_, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "m",
+// TestLLMStreamFakeTagNotSplit 被换行打断的伪标签（如 "<th\nink>"）
+// 不是标签——标签本身不含换行，不可能被 Scanner 的行边界切开。
+// 行为与非流式 splitThinkingTags 一致：视为正文原样输出。
+func TestLLMStreamFakeTagNotSplit(t *testing.T) {
+	open := llmTag("<", "think", ">")
+	closeTag := llmTag("<", "/", "think", ">")
+	half1, half2 := open[:3], open[3:]
+	chalf1, chalf2 := closeTag[:4], closeTag[4:]
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+half1+"\n"+half2+"推理"+chalf1+"\n"+chalf2+"正文\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
+	res, err := e.Stream(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "bad model") {
-		t.Fatalf("error = %v, want provider error surfaced", err)
+	}, nil)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	// 切开的伪标签整体属于正文（换行保留，行首尾空白已在收尾 TrimSpace）。
+	want := half1 + "\n" + half2 + "推理" + chalf1 + "\n" + chalf2 + "正文"
+	if res.Text != want {
+		t.Errorf("Text = %q, want %q（伪标签不是标签，原样输出）", res.Text, want)
+	}
+	if res.Thinking != "" {
+		t.Errorf("Thinking = %q, want empty", res.Thinking)
 	}
 }
 
-// TestLLMEngineUnknownModel 未知模型报错带配置路径。
-func TestLLMEngineUnknownModel(t *testing.T) {
-	p := withModels(t, `[{"id":"m","url":"http://x/v1/chat/completions","apiKey":"k"}]`)
+// TestLLMStreamTagAcrossLines 真标签跨行结构：开标签后正文多行、
+// 闭标签独立成行、闭标签后还有正文——思维链块跨行正确聚合。
+func TestLLMStreamTagAcrossLines(t *testing.T) {
+	open := llmTag("<", "think", ">")
+	closeTag := llmTag("<", "/", "think", ">")
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+open+"\n第一行推理\n第二行推理\n"+closeTag+"\n最终答案\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
 
-	_, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "nope",
+	events, onEvent := collectEvents()
+	res, err := e.Stream(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil {
-		t.Fatal("want error for unknown model")
+	}, onEvent)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
 	}
-	if !strings.Contains(err.Error(), p) {
-		t.Errorf("error should include config path %s: %v", p, err)
+	if res.Text != "最终答案" {
+		t.Errorf("Text = %q, want 最终答案", res.Text)
+	}
+	if res.Thinking != "第一行推理\n第二行推理" {
+		t.Errorf("Thinking = %q, want 跨行思维链完整聚合（首尾换行已 trim）", res.Thinking)
+	}
+	if len(*events) == 0 || (*events)[0].Kind != KindThinking {
+		t.Errorf("first event should be thinking: %v", *events)
 	}
 }
 
-// TestLLMEngineEmptyContent 200 但正文为空时报错。
-func TestLLMEngineEmptyContent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":""}}]}`))
-	}))
-	defer srv.Close()
+// TestLLMStreamPlainText 无标签流式：全部走 text 通道，换行保留。
+func TestLLMStreamPlainText(t *testing.T) {
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n第一行\n第二行\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
 
-	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
-
-	_, err := (&LLMEngine{}).Complete(context.Background(), Request{
-		Model:    "m",
+	events, onEvent := collectEvents()
+	res, err := e.Stream(context.Background(), Request{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "empty content") {
-		t.Fatalf("error = %v, want empty content", err)
+	}, onEvent)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if res.Text != "第一行\n第二行" {
+		t.Errorf("Text = %q, want 第一行\\n第二行", res.Text)
+	}
+	if res.Thinking != "" {
+		t.Errorf("Thinking = %q, want empty", res.Thinking)
+	}
+	for _, ev := range *events {
+		if ev.Kind != KindText {
+			t.Errorf("all events should be text, got %v", ev.Kind)
+		}
 	}
 }
 
-// TestLLMEngineDetectReportsConfig Detect 成功时报告条目数与默认 id。
-func TestLLMEngineDetectReportsConfig(t *testing.T) {
-	withModels(t, sampleModels)
-
-	ok, note := (&LLMEngine{}).Detect()
-	if !ok {
-		t.Fatalf("Detect = false: %s", note)
-	}
-	if !strings.Contains(note, "3 models") {
-		t.Errorf("note = %q, want model count", note)
-	}
-	if !strings.Contains(note, "default=MiniMax-M3") {
-		t.Errorf("note = %q, want default id", note)
-	}
-}
-
-// TestLLMEngineDetectMissingConfig 配置缺失时 Detect 报不可用并给出补救提示。
-func TestLLMEngineDetectMissingConfig(t *testing.T) {
-	t.Setenv("MAGIC_AGENT_MODELS", "/nonexistent/models.json")
-	t.Setenv("HOME", t.TempDir())
-
-	ok, note := (&LLMEngine{}).Detect()
+// TestLLMDetectMissingCli CLI 不存在 → Detect 失败并给出路径。
+func TestLLMDetectMissingCli(t *testing.T) {
+	e := &LLMEngine{BinPath: "/nonexistent/llm"}
+	ok, note := e.Detect()
 	if ok {
-		t.Fatal("Detect should fail without config")
+		t.Fatal("Detect should fail for missing CLI")
 	}
-	if !strings.Contains(note, "models.json") {
-		t.Errorf("note = %q, want hint to create models.json", note)
-	}
-}
-
-// TestLLMEngineDetectNoKey 默认条目无 key 时给出提示（本地端点场景）。
-func TestLLMEngineDetectNoKey(t *testing.T) {
-	withModels(t, `[{"id":"local","url":"http://localhost:11434/v1/chat/completions"}]`)
-
-	ok, note := (&LLMEngine{}).Detect()
-	if !ok {
-		t.Fatalf("Detect = false: %s", note)
-	}
-	if !strings.Contains(note, "no apiKey") {
-		t.Errorf("note = %q, want a no-apiKey hint", note)
-	}
-}
-
-// TestBuildChatPayload 请求体构造：空 system 不产生 system 消息。
-func TestBuildChatPayload(t *testing.T) {
-	req := buildChatPayload(ModelEntry{}, "m", "  ", []Message{{Role: "user", Content: "hi"}})
-	if len(req.Messages) != 1 {
-		t.Fatalf("messages = %d, want 1 (blank system skipped)", len(req.Messages))
-	}
-	if req.Messages[0].Role != "user" {
-		t.Errorf("role = %q, want user", req.Messages[0].Role)
-	}
-	if !req.ReasoningSplit {
-		t.Error("ReasoningSplit should be true (MiniMax thinking split)")
-	}
-	if req.Stream {
-		t.Error("Stream should be false")
-	}
-	if req.Temperature != nil {
-		t.Error("Temperature should be nil when unset (omitempty)")
-	}
-
-	// 空 role 兜底为 user。
-	req2 := buildChatPayload(ModelEntry{}, "m", "", []Message{{Content: "x"}})
-	if req2.Messages[0].Role != "user" {
-		t.Errorf("empty role should default to user, got %q", req2.Messages[0].Role)
-	}
-}
-
-// TestBuildChatPayloadTemperature temperature 透传。
-func TestBuildChatPayloadTemperature(t *testing.T) {
-	temp := 0.3
-	req := buildChatPayload(ModelEntry{Temperature: &temp}, "m", "", []Message{{Role: "user", Content: "hi"}})
-	if req.Temperature == nil || *req.Temperature != 0.3 {
-		t.Errorf("Temperature = %v, want 0.3", req.Temperature)
+	if !strings.Contains(note, "/nonexistent/llm") {
+		t.Errorf("note = %q, want the missing path", note)
 	}
 }

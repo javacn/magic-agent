@@ -1,8 +1,8 @@
 # magic-agent
 
-专业的 agent CLI 代理工具 —— 把 **claude / codebuddy / trae** 三家 CLI 的非交互调用统一成一条命令，提供一致的引擎/模型切换、超时与重试、固定输出格式与稳定退出码。适合脚本化编排与上层工具（如 magic-video）集成。
+专业的 agent CLI 代理工具 —— 把 **claude / codebuddy / trae / llm** 四家 CLI 的非交互调用统一成一条命令，提供一致的引擎/模型切换、超时与重试、固定输出格式与稳定退出码。适合脚本化编排与上层工具（如 magic-video）集成。
 
-从 [magic-video](../magic-video) 的 `base/llm/codebuddy.go` / `base/llm/trae.go` / `base/engine.go` 剥离而来，独立演进。
+从 [magic-video](../magic-video) 的 `base/llm/codebuddy.go` / `base/llm/trae.go` / `base/engine.go` 剥离而来，独立演进。其中 `-e llm` 包装 [simonw/LLM](https://github.com/simonw/LLM) —— 用它屏蔽背后全部模型差异（OpenAI / Anthropic / MiniMax / ollama / 开源端点…），模型注册、密钥、端点全部由 llm 自管。
 
 ## 安装
 
@@ -48,15 +48,16 @@ npm pack           # 产出 magic-agent-<version>.tgz
 `npm run build:current` 只编译当前平台（本地开发更快）。版本号由 `npm build` 从 `package.json` 经 ldflags 注入 `internal/cli.Version`，无需手改源码。
 
 > 平台不支持或产物缺失时，`postinstall` 会尝试用本机 Go 现场编译；两者都没有则只告警，不阻断安装。
+> 同一个 `postinstall` 还会安装 **llm CLI**（simonw/LLM，`-e llm` 引擎的依赖）：已有安装（`MAGIC_AGENT_LLM_BIN` / `~/.llm-venv` / PATH / brew）则跳过；否则建 `~/.llm-venv` 隔离安装，失败只告警不阻断。
 
-依赖：Go 1.26+（仅源码构建需要）。三个 CLI 按需安装，未安装的引擎自动探测失败但不影响其他引擎：
+依赖：Go 1.26+（仅源码构建需要）。四个 CLI 按需安装，未安装的引擎自动探测失败但不影响其他引擎：
 
 | 引擎 | CLI | 探测路径 / 环境变量 |
 |------|-----|---------------------|
-| claude | Claude Code | `/opt/homebrew/bin/claude` → PATH → `MAGIC_AGENT_CLAUDE_BIN` |
-| codebuddy | WorkBuddy 内置 CLI | `WorkBuddy.app/.../cli/bin/codebuddy` → PATH → `MAGIC_AGENT_CODEBUDDY_BIN` |
-| trae | trae-cli | `~/.local/bin/trae-cli` → PATH → `MAGIC_AGENT_TRAE_BIN` |
-| llm | 无（读 `~/.magic-agent/models.json`） | 扁平模型数组；配置缺失即不可用；`MAGIC_AGENT_MODELS` 可换路径 |
+| claude | Claude Code | `MAGIC_AGENT_CLAUDE_BIN` → `/opt/homebrew/bin/claude` → PATH |
+| codebuddy | WorkBuddy 内置 CLI | `MAGIC_AGENT_CODEBUDDY_BIN` → `WorkBuddy.app/.../cli/bin/codebuddy` → PATH |
+| trae | trae-cli | `MAGIC_AGENT_TRAE_BIN` → `~/.local/bin/trae-cli` → PATH |
+| llm | [simonw/LLM](https://github.com/simonw/LLM) | `MAGIC_AGENT_LLM_BIN` → `~/.llm-venv/bin/llm` → `/opt/homebrew/bin/llm` → PATH |
 
 ```bash
 $ magic-agent --engines
@@ -64,7 +65,7 @@ ENGINE     STATUS  CLI
 claude     ✓       /opt/homebrew/bin/claude
 codebuddy  ✓       /Applications/WorkBuddy.app/.../cli/bin/codebuddy
 trae       ✓       /Users/you/.local/bin/trae-cli
-llm        ✓       /Users/you/.magic-agent/models.json (3 models, default=MiniMax-M3)
+llm        ✓       /Users/you/.llm-venv/bin/llm
 ```
 
 ## 用法
@@ -88,10 +89,9 @@ magic-agent -e codebuddy -m glm-5.3 "写一首俳句"
 magic-agent -e trae "总结这篇文档"               # trae 用自身配置的默认模型
 magic-agent -e trae -m My-MiniMax-M3 "..."      # -c model.name= 覆盖
 
-# 直连 LLM（读 ~/.magic-agent/models.json，扁平数组，见下节）
-magic-agent -e llm -m MiniMax-M3 "问题"          # 按 id 指定
-magic-agent -e llm -m minimax-nothink "问题"     # 同模型不同变体（关思维链）
-magic-agent -e llm "问题"                        # 用数组首条
+# llm 引擎（包装 simonw/LLM）
+magic-agent -e llm "问题"                # llm 的默认模型
+magic-agent -e llm -m minimax-m3 "问题"  # 显式模型（llm models 里注册过的）
 
 # 工具开关（默认 off = 纯 chat；on = agent 模式；或白名单）
 magic-agent -e claude --tools on -p "看看当前目录有什么"
@@ -123,13 +123,14 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 
 ## 流式模式（--stream）
 
-三家引擎都走 CLI 原生 `stream-json` 协议，增量实时转发，无缓冲等待：
+claude / codebuddy / trae 走 CLI 原生 `stream-json` NDJSON 协议；llm 走纯文本流式
+（内置 thinkSplitter 把混在正文里的思维链标签路由到 thinking 通道）。增量实时转发，无缓冲等待：
 
-| | claude / codebuddy | trae |
-|---|---|---|
-| 协议 | `stream_event` + `content_block_delta` | `stream_event` + `delta.content` |
-| 思考过程 | ✅ `thinking_delta`（模型开 reasoning 时） | ❌（模型侧无 reasoning 通道） |
-| 收尾 | `result` 行（全文以此为准） | 同左 |
+| | claude / codebuddy | trae | llm |
+|---|---|---|---|
+| 协议 | `stream_event` + `content_block_delta` | `stream_event` + `delta.content` | 纯文本 stdout + 思维链标签 |
+| 思考过程 | ✅ `thinking_delta`（模型开 reasoning 时） | ❌（模型侧无 reasoning 通道） | ✅ 标签块 → thinking 通道 |
+| 收尾 | `result` 行（全文以此为准） | 同左 | EOF（全文 = 增量拼接） |
 
 **text 模式**：正文增量 → stdout 实时打印；思考增量 → stderr（`…` 前缀），
 `2>/dev/null` 静音或 `2>&1 | tee` 保留都由你控制。
@@ -153,7 +154,7 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 | Flag | 默认 | 说明 |
 |------|------|------|
 | `-e, --engine` | `codebuddy` | 引擎：`claude` \| `codebuddy` \| `trae` \| `llm` |
-| `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`；llm 引擎读 models.json）。trae 无 `--model`，内部转 `-c model.name=<m>` |
+| `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`；llm 用其自身默认模型）。trae 无 `--model`，内部转 `-c model.name=<m>` |
 | `-s, --system` | 空 | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
 | `-p, --prompt` | 空 | 提示词 |
 | `-f, --file` | 空 | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
@@ -170,119 +171,69 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 
 prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道（stdin 非 TTY 且无其他输入时自动读）。
 
-## llm 引擎与 models.json
+## llm 引擎（simonw/LLM 包装）
 
-`-e llm` 直接按配置调 LLM，不依赖任何外部 agent CLI，也不依赖任何第三方 LLM 工具。
-配置读取顺序（先命中先用）：
+`-e llm` 不直连任何 HTTP 端点，而是转调 [simonw/LLM](https://github.com/simonw/LLM) CLI，
+用一个工具屏蔽全部模型差异。模型注册、密钥、端点管理全部交给 llm：
 
-1. `$MAGIC_AGENT_MODELS` 指定的路径
-2. `~/.magic-agent/models.json`
-
-配置文件是一个**扁平 JSON 数组**，每条模型自带完整的 `url` + `apiKey`：
-
-```json
-[
-  {
-    "id": "MiniMax-M3",
-    "name": "MiniMax-M3",
-    "vendor": "MiniMax",
-    "url": "https://api.minimaxi.com/v1/chat/completions",
-    "apiKey": "sk-...",
-    "supportsToolCall": true,
-    "supportsImages": true,
-    "supportsReasoning": true,
-    "maxInputTokens": 1000000,
-    "maxOutputTokens": 524288,
-    "timeout": 600
-  },
-  {
-    "id": "minimax-nothink",
-    "model": "MiniMax-M3",
-    "name": "MiniMax-M3 (no thinking)",
-    "vendor": "MiniMax",
-    "url": "https://api.minimaxi.com/v1/chat/completions",
-    "apiKey": "sk-...",
-    "timeout": 600,
-    "extraBody": { "thinking": { "type": "disabled" } }
-  }
-]
+```bash
+llm models                          # 列出可用模型
+llm keys set openai                 # 存 OpenAI 密钥
+llm keys set minimax                # 存 MiniMax 密钥
 ```
 
-### 字段
+### 注册自定义模型（OpenAI 兼容端点）
 
-本格式与 WorkBuddy / CodeBuddy CLI 的 `models.json`（`LanguageModel`）**互为超集** ——
-对方的条目直接拿来也能读，本工具只是多了三个扩展字段（`timeout` / `extraBody` / `temperature`）。
+llm 只内置大厂模型；MiniMax 等需要手动注册。编辑
+`~/Library/Application Support/io.datasette.llm/extra-openai-models.yaml`（Linux: `~/.config/io.datasette.llm/`）：
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `id` | ✓ | 调用方标识（`-m` 用）。文件内需唯一（忽略大小写） |
-| `model` | | 发往 API 的真实模型名；空 = 用 `id`。见下方「同模型多变体」 |
-| `name` / `vendor` | | 展示用 |
-| `url` | ✓ | 完整 API 端点。支持 `${ENV_VAR}` |
-| `apiKey` | | Bearer 密钥。支持 `${ENV_VAR}`；本地端点可留空 |
-| `useCustomProtocol` | | `true` = `url` 原样透传，不补 `/chat/completions` |
-| `supportsToolCall` / `supportsImages` / `supportsReasoning` | | 能力标记（仅展示/校验，不参与请求构造） |
-| `maxInputTokens` / `maxOutputTokens` | | 上下文与输出上限（仅展示） |
-| `timeout` | | 单次 HTTP 超时（秒）；0 = 默认 300s。**magic-agent 扩展** |
-| `extraBody` | | 原样并入请求体顶层。**magic-agent 扩展**，见下 |
-| `temperature` | | 采样温度；不写则不发该字段。**magic-agent 扩展** |
-
-### 默认模型与 `-m`
-
-```
-不给 -m           # 用数组首条（顺序即优先级）
--m MiniMax-M3     # 按 id 指定（忽略大小写，命中后回填规范大小写）
+```yaml
+- model_id: minimax-m3
+  model_name: MiniMax-M3
+  api_base: https://api.minimaxi.com/v1
+  api_key_name: minimax     # 引用 llm keys set 存的密钥名
 ```
 
-没有 `default` 包装字段：**数组首条即默认**。
+注册后即可 `magic-agent -e llm -m minimax-m3 "问题"`。
 
-### 同模型多变体：`id` 与 `model`
+### 调用映射
 
-API 只认线上模型名，但你可能需要同一个模型出现多次（不同 key、不同开关）。
-这时用 `id` 区分调用方视角、用 `model` 指定线上模型名：
-
-```jsonc
-{ "id": "MiniMax-M3",       "url": "...", "apiKey": "k1" },            // model 省略 → 发 "MiniMax-M3"
-{ "id": "minimax-peter",    "model": "MiniMax-M3", "url": "...", "apiKey": "k2" },
-{ "id": "minimax-nothink",  "model": "MiniMax-M3", "url": "...", "extraBody": {"thinking":{"type":"disabled"}} }
-```
-
-`magic-agent -e llm -m minimax-nothink` 发往 API 的 `model` 仍是 `MiniMax-M3`，
-但输 envelope 的 `model` 字段是 `minimax-nothink`，便于区分路由来源。
-
-### URL 补全规则
-
-| `url` 写法 | 实际请求 |
+| magic-agent | llm CLI |
 |---|---|
-| `https://api.minimaxi.com/v1/chat/completions` | 原样（已带完整路径） |
-| `https://ark.cn-beijing.volces.com/api/coding/v3` | 自动补成 `.../api/coding/v3/chat/completions` |
-| 任意写法 + `"useCustomProtocol": true` | 原样透传，不补全 |
+| `-e llm "问题"` | `llm prompt -n "问题" --no-stream` |
+| `-e llm -m <model>` | `llm prompt -n -m <model> ...` |
+| `-e llm -s <system>` | `llm prompt -n -s <system> ...` |
+| `--stream -e llm` | `llm prompt -n ...`（默认流式，纯文本 stdout） |
 
-规则与 WorkBuddy 一致：`url` 是接口完整路径时直接用，是 base 地址时补 `/chat/completions`。
+流式输出是纯文本（非 NDJSON）。MiniMax 等推理模型会把思维链以标签形式混在
+正文里，magic-agent 内置状态机把标签块路由到 thinking 通道（实测 llm 的
+`-R/--hide-reasoning` 挡不住 MiniMax 的标签，所以剥离必须自己做）。
 
-### 环境变量引用
+### 安装
 
-`apiKey` 与 `url` 支持 `${VAR}` 语法，便于把密钥留在环境里而非文件内：
+`npm install` 时 postinstall 自动装（已有则跳过）：
 
-```json
-{ "id": "gpt-4o", "url": "https://api.openai.com/v1/chat/completions", "apiKey": "${OPENAI_API_KEY}" }
+- 探测顺序：`MAGIC_AGENT_LLM_BIN` → `~/.llm-venv/bin/llm` → PATH → brew
+- 都没有时：`python3 -m venv ~/.llm-venv && pip install llm`（隔离安装，不污染系统 Python）
+- 安装失败只告警，不阻断；claude/codebuddy/trae 不受影响
+
+手动安装任选：
+
+```bash
+pip install llm            # 或 pipx install llm / brew install llm
+export MAGIC_AGENT_LLM_BIN=$(which llm)   # 装在非默认位置时指定
 ```
 
-变量不存在时**保留占位符原样**（不静默置空），让问题在发请求时以 401/404 暴露。
+> macOS Homebrew Python 3.14 的 pip 有 truststore bug（`invalid literal for int()`
+> 报错），建议用 venv / pipx 方式安装。
 
-### extraBody 是必须保留的字段
+### 密钥与数据位置
 
-推理模型（如 MiniMax-M3）不关思维链时，长文本生成会被推理吃光 token 预算、**正文为空**。
-`extraBody` 原样并入请求体顶层，是关掉它的唯一手段：
-
-```json
-"extraBody": { "thinking": { "type": "disabled" } }
-```
-
-HTTP 客户端另外固定发 `reasoning_split: true`，让 thinking 走 `reasoning_content`，
-并对 content 里残留的思维链标签做兜底剥离。
-
-配置里含 API key，建议 `chmod 600 ~/.magic-agent/models.json`。
+| 内容 | 位置 |
+|---|---|
+| 密钥 | `~/Library/Application Support/io.datasette.llm/keys.json`（Linux: `~/.config/io.datasette.llm/`） |
+| 自定义模型 | 同目录 `extra-openai-models.yaml` |
+| 会话日志 | 同目录 `logs.db`（llm 自身功能，magic-agent 不读写） |
 
 ## 输出格式
 
@@ -338,14 +289,14 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae, llm)
 
 ## 引擎差异说明
 
-| | claude | codebuddy | trae | llm |
-|---|---|---|---|---|
-| 非交互模式 | `-p --output-format json` | `--print --output-format json` | `-p`（纯文本） | HTTP `/chat/completions` |
-| 模型指定 | `--model <m>` | `--model <m>` | `-c model.name=<m>`（无 --model flag） | `-m <id>`（models.json 的 id） |
-| 默认模型 | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` | models.json 的**首条** |
-| system 注入 | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 | HTTP 走 messages[0] |
-| 工具禁用 | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） | 不适用（纯 chat） |
-| 超时联动 | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） | HTTP client timeout |
+| | | claude | codebuddy | trae | llm |
+|---|---|---|---|---|---|
+| 非交互模式 | | `-p --output-format json` | `--print --output-format json` | `-p`（纯文本） | `llm prompt -n --no-stream` |
+| 模型指定 | | `--model <m>` | `--model <m>` | `-c model.name=<m>`（无 --model flag） | `-m <m>` |
+| 默认模型 | | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` | llm 自身的默认模型 |
+| system 注入 | | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 | `-s <system>` |
+| 工具禁用 | | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） | 不适用（纯 chat） |
+| 超时联动 | | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） | 进程组 kill |
 
 所有引擎都以独立**进程组**运行：超时/取消时 `kill(-pgid)` 杀掉整个进程树，CLI 内部 spawn 的 node worker 不会残留（有回归测试保障）。
 
@@ -361,9 +312,8 @@ internal/agent/
   claude.go                 Claude Code 引擎（非流式 + 流式）
   codebuddy.go              CodeBuddy 引擎（envelope 多形态解析 + 回显剥离 + 流式）
   trae.go                   Trae 引擎（模型覆盖 + query-timeout 映射 + 流式）
-  models.go                 models.json 加载（扁平数组）+ 模型解析 + Endpoint/ENV 展开
-  openai_client.go          OpenAI 兼容 HTTP 客户端（extraBody 透传、思维链剥离）
-  llmengine.go              llm 引擎：按 models.json 直连 HTTP 端点
+  tags.go                   思维链标签常量（分段拼接防 tokenizer 改写）+ 剥离
+  llmengine.go              llm 引擎：包装 simonw/LLM CLI + thinkSplitter 流式标签路由
   runner.go                 超时 + 重试编排（错误分类、指数退避、可取消）
   runcmd.go                 进程组感知执行（平台无关调度）
   runcmd_unix.go            Setpgid + kill(-pgid)（darwin/linux）
@@ -373,7 +323,7 @@ npm/
   bin/magic-agent.js        npm bin 转发层（spawnSync + stdio inherit）
   lib/platform.js           平台 -> Go 目标 / 产物路径映射
   build.js                  交叉编译 5 平台 + 版本号注入
-  install.js                postinstall 兜底（缺产物时现场编译）
+  install.js                postinstall：二进制兜底 + llm CLI（simonw/LLM）安装
   dist/                     构建产物（gitignore）
 tests/                      （预留）跨包集成测试
 ```
@@ -385,13 +335,10 @@ tests/                      （预留）跨包集成测试
 - claude 引擎：真实调用成功（text + json + stdin 管道）
 - trae 引擎：真实调用成功（默认模型 + query-timeout 映射）
 - codebuddy 引擎：CLI 探测/参数构造正确；本环境该 CLI 单次调用 20 分钟不返回（与 magic-video 时代一致），超时 + 进程组清理验证通过（超时后 0 残留进程）
-- **llm 引擎**（真实调用）：
-  - HTTP 直连：`-m MiniMax-M3` → `{"engine":"llm","model":"MiniMax-M3",...,"text":"..."}`
-  - 大小写不敏感：`-m MINIMAX-M3` → 命中并回填规范 id
-  - 默认模型（不给 `-m`）→ 走数组**首条**
-  - 同模型变体：`-m minimax-nothink` → 发往 API 的 `model` 仍为 `MiniMax-M3`，并带上 `extraBody` 关思维链
-  - URL 补全：`url` 只给 base 时不重复/不漏拼 `/chat/completions`
-  - 错误 envelope：`reason` 为根因摘要，含可用 id 清单与配置路径
+- **llm 引擎**（真实调用，包装 simonw/LLM CLI）：
+  - Complete：`-m minimax-m3` → `{"engine":"llm","model":"minimax-m3",...,"text":"2"}`（标签思维链剥离生效）
+  - Stream：`--stream` → thinking/text 增量正确分流，标签行的换行不污染正文
+  - llm 安装：postinstall 在干净 HOME 下成功建 `~/.llm-venv` 并安装 llm（0.27.1）
 - npm 分发：5 平台交叉编译通过；全局 `npm install -g ./magic-agent-0.1.0.tgz` 后 `magic-agent` 可直接调用；stdin 管道、json 输出、退出码 0/1/2、超时杀进程组均验证通过（`go test ./...` 全绿）
 
 ## 平台支持
