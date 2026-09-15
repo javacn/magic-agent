@@ -146,8 +146,10 @@ claude / codebuddy / trae 走 CLI 原生 `stream-json` NDJSON 协议；llm 走�
 `jq -c 'select(.type != "result")'` 逐事件消费，或 `tail -1` 取 result 全文。
 
 **语义差异**（相对非流式）：流式不做自动重试（增量已实时发出，重放会重复消费），
-`-r` 被忽略；超时照常生效（杀整个 CLI 进程组）。codebuddy 引擎本环境单次调用
-长期不返回（与非流式行为一致），流式实现按同源协议提供。
+`-r` 被忽略；超时照常生效（杀整个 CLI 进程组）。codebuddy 引擎走同源
+`stream-json` 协议（CodeBuddy Code 系）；早期「本环境单次调用长期不返回」
+的现象已定位为父会话 `SERVER__PORT` 端口冲突，见「在 WorkBuddy / CodeBuddy
+会话内使用」一节。
 
 ## Flags
 
@@ -158,7 +160,7 @@ claude / codebuddy / trae 走 CLI 原生 `stream-json` NDJSON 协议；llm 走�
 | `-s, --system` | 空 | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
 | `-p, --prompt` | 空 | 提示词 |
 | `-f, --file` | 空 | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
-| `--tools` | `off` | `off`（纯 chat）\| `on`（agent 模式）\| 逗号分隔白名单（如 `Bash,Read`） |
+| `--tools` | `off` | `off`（纯 chat）\| `on`（agent 模式）\| 逗号分隔白名单（如 `WebSearch,WebFetch`） |
 | `-t, --timeout` | `600s` | 单次尝试超时（如 `90s` / `3m`） |
 | `-r, --retries` | `0` | 失败重试次数（总尝试 = 1 + retries） |
 | `--backoff` | `2s` | 首次重试退避（指数翻倍，上限 30s，带抖动） |
@@ -296,9 +298,62 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae, llm)
 | 默认模型 | | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` | llm 自身的默认模型 |
 | system 注入 | | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 | `-s <system>` |
 | 工具禁用 | | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） | 不适用（纯 chat） |
+| 工具启用 | | 不传 `--tools` + `-y` | `-y` | `--allowed-tool <n>` + `-y` | 不适用（纯 chat） |
 | 超时联动 | | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） | 进程组 kill |
 
 所有引擎都以独立**进程组**运行：超时/取消时 `kill(-pgid)` 杀掉整个进程树，CLI 内部 spawn 的 node worker 不会残留（有回归测试保障）。
+
+## 工具启用（--tools）
+
+`--tools` 同时管两件事：CLI 侧的工具白名单，以及是否在 system prompt 里
+注入 `noToolSuffix`。
+
+| `--tools` | CLI 参数（codebuddy） | noToolSuffix | 效果 |
+|---|---|---|---|
+| `off`（默认） | `--tools ""` | 注入 | 纯 chat，模型不调工具；后缀额外压制「伪工具调用」 |
+| `on` | `-y` | 不注入 | 全工具可用（含 `WebSearch` / `WebFetch`） |
+| `WebSearch,WebFetch` | `--tools WebSearch,WebFetch -y` | 不注入 | 仅白名单工具可用 |
+
+> ⚠️ `noToolSuffix` 明文写着「严禁使用任何工具」。它**只在 `off` 模式注入** ——
+> 若在 `on`/白名单下也注入，就会出现「CLI 侧工具已开、system prompt 却在
+> 压制调用」的自相矛盾，表现为**启用了工具却没有网络搜索**。
+
+实测（2026-09-15，本机 codebuddy 2.137.1）：
+
+```bash
+magic-agent -e codebuddy --tools on -o text "用 WebSearch 查今天的日期"      # ✅ 真调用了搜索
+magic-agent -e codebuddy --tools WebSearch -o text "用 WebSearch 查今天日期" # ✅
+magic-agent -e codebuddy --tools off -o text "用 WebSearch 查今天的日期"     # 返回 NO_TOOLS（符合预期）
+```
+
+## 在 WorkBuddy / CodeBuddy 会话内使用（重要）
+
+**现象**：在 WorkBuddy 的会话里调用 codebuddy 引擎，单次调用**永久不返回**
+（既无 stdout 也无 stderr，直到超时被杀）。同样的命令在本机终端里数秒即回。
+
+**根因**：父会话把自身内置 HTTP 服务的监听端口通过 `SERVER__HOST` /
+`SERVER__PORT` 注入给子进程。codebuddy CLI 读到这两个变量后会在**同一端口**
+再起一个服务，撞上父进程已监听 → `EADDRINUSE` → 该错误在启动流程里是
+unhandled rejection，CLI 既不退出也不产出任何输出 → 永久挂起。
+
+```
+Unhandled rejection Error: listen EADDRINUSE: address already in use 127.0.0.1:58311
+```
+
+**处理**：magic-agent 在 `internal/agent/env.go` 里维护子进程环境 denylist，
+`SERVER__*` 前缀（以及父会话的 `CODEBUDDY_SESSION_ID` / `CLAUDE_SESSION_ID`
+等会话标识）一律不传给子 CLI。**在 WorkBuddy 会话内无需任何额外配置**。
+
+验证（同一环境、`SERVER__PORT` 仍在）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `--tools off` | 挂起 120s+ | 4.0s → `NO_TOOLS` |
+| `--tools on` | 挂起 100s（超时被杀） | 16.6s → 正常回答 |
+| `--tools WebSearch` | 挂起 | 6.2s → 正常回答 |
+
+若在**其他**宿主环境遇到类似挂起，可用同一思路排查：把该宿主注入的
+「监听端口/会话标识」类变量从子进程环境里剔除。
 
 ## 架构
 
@@ -315,6 +370,7 @@ internal/agent/
   tags.go                   思维链标签常量（分段拼接防 tokenizer 改写）+ 剥离
   llmengine.go              llm 引擎：包装 simonw/LLM CLI + thinkSplitter 流式标签路由
   runner.go                 超时 + 重试编排（错误分类、指数退避、可取消）
+  env.go                    子进程环境构造（剔除 SERVER__* 等父进程专属变量）
   runcmd.go                 进程组感知执行（平台无关调度）
   runcmd_unix.go            Setpgid + kill(-pgid)（darwin/linux）
   runcmd_windows.go         CREATE_NEW_PROCESS_GROUP + taskkill /T /F

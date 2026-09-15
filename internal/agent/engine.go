@@ -86,9 +86,44 @@ type Request struct {
 	// Messages 对话消息；CLI 引擎会扁平化为单条 prompt。
 	Messages []Message
 
+	// MaxTokens 输出 token 上限。0 = 不指定（交给引擎/模型默认）。
+	//
+	// 各引擎支持度不同（见各引擎文件）：llm 引擎经 `-o max_tokens` 透传；
+	// 其余 CLI 引擎不支持该参数，会忽略（不上报错误）。
+	// 推理模型（MiniMax-M3 等）的思考过程计入 output 配额，调用方
+	// 需要给足够大的值，否则正文会被思考吃光。
+	MaxTokens int
+
+	// Temperature 采样温度。nil = 不提（交给引擎/模型默认）。
+	// 支持度同 MaxTokens。
+	Temperature *float64
+
+	// JSONSchema 是可选的结构化输出约束。
+	//
+	// 各引擎行为：
+	//   llm 引擎：尝试把 Response.Text 解析回 JSON 对象。
+	//             严格匹配 schema 的顶层 Required 字段集 + Type=object，
+	//             解析成功则把 Text 替换为 json.Marshal 后的紧凑串。
+	//             失败则原样返回（不阻断，让上层解析器兜底）。
+	//   其他引擎：暂忽略；约束完全靠 system prompt 注入。
+	//
+	// 上游（magic-video）已经会把 schema 渲染进 system prompt 作为
+	// 提示词约束；本字段只是 llm 引擎做"输出后处理"以稳定 JSON。
+	JSONSchema *JSONSchema
+
 	// Timeout 单次尝试的超时（含引擎 CLI 自身执行时间）。
 	// 0 = 引擎默认。
 	Timeout time.Duration
+}
+
+// JSONSchema 是传给 Engine 的结构化输出契约（精简版）。
+//
+// 故意保持极简：只覆盖本项目实际用到（type=object + 顶层 Required）。
+// 需要更多字段时再按需扩展。
+type JSONSchema struct {
+	Type       string         // "object"
+	Properties map[string]any // field name -> 描述字典（不深解析）
+	Required   []string       // 顶层必填字段名
 }
 
 // Response 是一次成功调用的结果。
@@ -104,6 +139,13 @@ type Response struct {
 
 	// SessionID 引擎返回的会话 id（可能为空）。
 	SessionID string
+
+	// 以下三个 token 计数尽力而为：引擎/CLI 不上报时为 0。
+	// 目前只有 llm 引擎能拿到（llm prompt --json 的 input_tokens /
+	// output_tokens）；其余 CLI 引擎没有该信息。
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
 
 	// Latency 一次成功尝试的耗时（不含重试等待）。
 	Latency time.Duration
@@ -172,6 +214,13 @@ func toolsOrDefault(t ToolsMode) ToolsMode {
 		return ToolsOff
 	}
 	return t
+}
+
+// toolsIsOff 是否「禁用工具」模式（nil 视为 off）。
+// 各引擎用它决定是否注入 noToolSuffix —— 该后缀明文禁止工具调用，
+// 只能在 off 模式出现，否则会和 on / 白名单模式互相打架。
+func toolsIsOff(req Request) bool {
+	return toolsOrDefault(req.Tools).IsOff()
 }
 
 // ToolsIsOff / ToolsIsOn / ToolsAllowlistOf 跨包检视 ToolsMode 的便捷包装。

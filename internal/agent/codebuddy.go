@@ -14,10 +14,15 @@ package agent
 //	--print --output-format json     单结果 envelope
 //	--model <m>                      裸模型名（hy3 / glm-5.3 / ...）
 //	--tools ""                       禁用全部工具
+//	-y                               启用工具（--dangerously-skip-permissions）
 //	--no-session-persistence         不落会话
-//	--append-system-prompt <s>       注入 system prompt + noToolSuffix
+//	--append-system-prompt <s>       注入 system prompt（仅 off 模式附 noToolSuffix）
 //
 // CLI 路径解析：MAGIC_AGENT_CODEBUDDY_BIN → WorkBuddy.app 内置路径。
+//
+// ⚠️ 在 WorkBuddy 会话内调用时，父进程注入的 SERVER__PORT 会让 CLI 抢
+// 父会话已监听的端口 → EADDRINUSE → 永久挂起。子进程环境由 env.go
+// 的 denylist 统一剔除该类变量。
 
 import (
 	"context"
@@ -121,13 +126,21 @@ func (e *CodeBuddyEngine) buildArgs(req Request) []string {
 		"--print",
 		"--output-format", "json",
 		"--no-session-persistence",
-		"--append-system-prompt", noToolSuffix,
 	}
-	// 工具模式映射（同 claude）。
+	// 工具模式决定两件事：CLI 侧的工具白名单，以及 system prompt 是否
+	// 追加 noToolSuffix。
+	//
+	// ⚠️ noToolSuffix 只在 off 模式注入。它明文写着「严禁使用任何工具」，
+	// 与 on / 白名单模式的目标直接冲突 —— 之前无条件注入，导致
+	// `--tools on` 表面开了工具、system prompt 却在压制模型调用，
+	// 表现为「工具启用无效」。enable 模式下必须让 system prompt 干净。
 	tools := toolsOrDefault(req.Tools)
 	switch {
 	case tools.IsOff():
+		// 关工具：不仅 CLI 侧禁掉，system prompt 也要堵住模型「伪工具调用」
+		// （实测 off 且不注入时，模型会输出 <tool_calls:xxxx> 这类假标签）。
 		args = append(args, "--tools", "")
+		args = append(args, "--append-system-prompt", noToolSuffix)
 	case tools.IsOn():
 		args = append(args, "-y") // --dangerously-skip-permissions
 	default:
@@ -146,8 +159,7 @@ func (e *CodeBuddyEngine) buildArgs(req Request) []string {
 }
 
 // Stream 实现 Streamer：流式调用 codebuddy CLI。
-// 协议与 claude 同源（CodeBuddy Code 系 stream-json）；本环境该 CLI
-// 单次调用长期不返回，实现按同源协议 + fake CLI 测试保障。
+// 协议与 claude 同源（CodeBuddy Code 系 stream-json）。
 func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
 	start := time.Now()
 	bin := e.bin()

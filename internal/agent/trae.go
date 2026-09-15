@@ -115,13 +115,13 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 		return Response{}, fmt.Errorf("trae CLI not found; set MAGIC_AGENT_TRAE_BIN")
 	}
 
-	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, true)
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, toolsIsOff(req))
 	if prompt == "" {
 		return Response{}, fmt.Errorf("trae: empty prompt")
 	}
-	// trae 没有独立 system 注入 flag；无 system prompt 时约束也要生效，
-	// 直接追加到 prompt 末尾。
-	if req.SystemPrompt == "" {
+	// trae 没有独立 system 注入 flag；无 system prompt 时约束也要生效。
+	// 仅 off 模式追加：on/白名单下 noToolSuffix 会与「允许调用工具」冲突。
+	if req.SystemPrompt == "" && toolsIsOff(req) {
 		prompt += noToolSuffix
 	}
 
@@ -208,11 +208,11 @@ func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(Strea
 		return StreamResult{}, fmt.Errorf("trae CLI not found; set MAGIC_AGENT_TRAE_BIN")
 	}
 
-	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, true)
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, toolsIsOff(req))
 	if prompt == "" {
 		return StreamResult{}, fmt.Errorf("trae: empty prompt")
 	}
-	if req.SystemPrompt == "" {
+	if req.SystemPrompt == "" && toolsIsOff(req) {
 		prompt += noToolSuffix
 	}
 
