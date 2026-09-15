@@ -118,11 +118,7 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
-		errMsg := truncateStr(strings.TrimSpace(stderr), 500)
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		return Response{}, fmt.Errorf("codebuddy CLI: %w (stderr: %s)", err, errMsg)
+		return Response{}, wrapCliError("codebuddy", stdout, stderr, err)
 	}
 
 	raw := strings.TrimSpace(stdout)

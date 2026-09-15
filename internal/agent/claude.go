@@ -125,11 +125,7 @@ func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, err
 
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
-		errMsg := truncateStr(strings.TrimSpace(stderr), 500)
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		return Response{}, fmt.Errorf("claude CLI: %w (stderr: %s)", err, errMsg)
+		return Response{}, wrapCliError("claude", stdout, stderr, err)
 	}
 
 	raw := strings.TrimSpace(stdout)

@@ -1,6 +1,6 @@
 package cli
 
-// ask.go - ask 主流程（root 简写与 ask 子命令共用）。
+// ask.go - 提问主流程（根命令直用，无子命令）。
 //
 // 输入来源（优先级：--prompt > args > --file > stdin）：
 //	1. -p/--prompt <text>：命令行直接给提示词
@@ -28,7 +28,7 @@ import (
 	"github.com/darren/magic-agent/internal/agent"
 )
 
-// askOptions ask 的全部参数（root 与 ask 子命令共享同一份绑定）。
+// askOptions 根命令的全部参数。
 type askOptions struct {
 	engine  string
 	model   string
@@ -41,6 +41,8 @@ type askOptions struct {
 	backoff time.Duration
 	output  string
 	verbose bool
+	engines bool
+	jsonOut bool
 }
 
 // newAskOptions 返回带默认值的选项集。
@@ -55,14 +57,13 @@ func newAskOptions() *askOptions {
 	}
 }
 
-// bindAskFlags 把 ask 的 flags 注册为 cmd 的 persistent flags：
-// root 上注册后 ask 子命令自动继承（子命令自身不再重复注册）。
+// bindAskFlags 把全部 flags 注册为根命令的 persistent flags。
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
 	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae（默认 codebuddy）")
 	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3）")
 	f.StringVarP(&opts.system, "system", "s", "", "系统提示词")
-	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词（根命令直接提问用）")
+	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
 	f.StringVar(&opts.tools, "tools", "off", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)")
 	f.DurationVarP(&opts.timeout, "timeout", "t", 600*time.Second, "单次尝试超时（默认 600s=10m）")
@@ -70,19 +71,8 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.DurationVar(&opts.backoff, "backoff", 2*time.Second, "首次重试退避间隔（指数翻倍，上限 30s）")
 	f.StringVarP(&opts.output, "output", "o", "json", "输出格式: json | text")
 	f.BoolVarP(&opts.verbose, "verbose", "v", false, "重试过程打印到 stderr")
-}
-
-// newAskCommand 构建 ask 子命令（与根命令简写等价；flags 继承 persistent）。
-func newAskCommand(opts *askOptions) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "ask [flags] [prompt...]",
-		Short: "向 agent 引擎提一个问题，输出固定格式结果（根命令的显式形式）",
-		Args:  cobra.ArbitraryArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAsk(cmd, args, opts)
-		},
-	}
-	return cmd
+	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎与本机 CLI 可用性（可组合 --json）")
+	f.BoolVar(&opts.jsonOut, "json", false, "--engines 的 JSON 输出开关")
 }
 
 // parseToolsMode 解析 --tools 参数为结构化模式。
@@ -173,7 +163,11 @@ func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 	resp, err := runner.Run(cmd.Context(), req)
 	if err != nil {
 		attempts := 1 + opts.retries
-		_ = agent.WriteError(cmd.ErrOrStderr(), format, engine.Name(), attempts, err)
+		// WriteError 已把失败信息（json envelope / text 行）写到 stderr，
+		// 标记已输出，Execute 不再重复打印。
+		if werr := agent.WriteError(cmd.ErrOrStderr(), format, engine.Name(), attempts, err); werr == nil {
+			return &reportedError{err}
+		}
 		return err
 	}
 	return agent.WriteOutput(cmd.OutOrStdout(), format, resp)

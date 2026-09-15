@@ -5,8 +5,10 @@ package cli
 // 覆盖：
 //	- collectPrompt 输入收集（args / --file / stdin 组合）
 //	- 端到端：fake 引擎注册 + cobra 命令执行 + 默认 json 输出
-//	- 根命令简写（-p / 位置参数）与 ask 子命令等价
+//	- 根命令提问（-p / 位置参数）
 //	- --tools 解析（off / on / 白名单 / 非法值）
+//	- --engines flag（text 表格 + --json）
+//	- 子命令已删除（ask / engines / version / completion 均不存在）
 //	- 引擎/格式参数校验错误 → exit 2
 //
 // 默认值契约（newAskOptions 与 bindAskFlags 双处维护，须一致）：
@@ -131,7 +133,7 @@ func TestAskEndToEndText(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-echo", text: "echoed"})
 
 	// 默认输出 json；-o text 显式要纯文本。
-	stdout, _, err := runAskCmd(t, "", "ask", "-e", "fake-echo", "-o", "text", "你好")
+	stdout, _, err := runAskCmd(t, "", "-e", "fake-echo", "-o", "text", "你好")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -144,7 +146,7 @@ func TestAskEndToEndJSON(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-json", text: "the answer"})
 
 	// 默认（不传 -o）就是 json。
-	stdout, _, err := runAskCmd(t, "", "ask", "-e", "fake-json", "hi")
+	stdout, _, err := runAskCmd(t, "", "-e", "fake-json", "hi")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -161,7 +163,7 @@ func TestAskEndToEndJSON(t *testing.T) {
 	}
 }
 
-// 根命令直接提问 = ask 的简写（flags 提升 persistent + RunE 直连）。
+// 根命令直接提问（唯一形态，子命令已删除）。
 func TestRootShorthandAsk(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-root", text: "root answer"})
 
@@ -227,7 +229,7 @@ func TestToolsPassthrough(t *testing.T) {
 
 // --tools 参数解析：off / on / 白名单 / 非法值。
 // 断言走 agent 包导出的 ToolsIsOff/ToolsIsOn/ToolsAllowlistOf
-//（toolsModeImpl 未导出，跨包接口断言其小写方法不可行）。
+// （toolsModeImpl 未导出，跨包接口断言其小写方法不可行）。
 func TestParseToolsMode(t *testing.T) {
 	m1, err1 := parseToolsMode("off")
 	if err1 != nil {
@@ -278,7 +280,7 @@ func TestDefaults(t *testing.T) {
 func TestAskStdinPipe(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-stdin", text: "ok"})
 
-	stdout, _, err := runAskCmd(t, "来自管道的问题", "ask", "-e", "fake-stdin", "-o", "text")
+	stdout, _, err := runAskCmd(t, "来自管道的问题", "-e", "fake-stdin", "-o", "text")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -288,7 +290,7 @@ func TestAskStdinPipe(t *testing.T) {
 }
 
 func TestAskUnknownEngine(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "ask", "-e", "nope", "hi")
+	_, _, err := runAskCmd(t, "", "-e", "nope", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -298,7 +300,7 @@ func TestAskUnknownEngine(t *testing.T) {
 }
 
 func TestAskBadFormat(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "ask", "-e", "claude", "-o", "yaml", "hi")
+	_, _, err := runAskCmd(t, "", "-e", "claude", "-o", "yaml", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -308,7 +310,7 @@ func TestAskBadFormat(t *testing.T) {
 }
 
 func TestAskEmptyPrompt(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "ask", "-e", "claude")
+	_, _, err := runAskCmd(t, "", "-e", "claude")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -318,7 +320,7 @@ func TestAskEmptyPrompt(t *testing.T) {
 }
 
 func TestAskNegativeRetries(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "ask", "-e", "claude", "-r", "-1", "hi")
+	_, _, err := runAskCmd(t, "", "-e", "claude", "-r", "-1", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -330,7 +332,7 @@ func TestAskNegativeRetries(t *testing.T) {
 func TestAskEngineFailureJSONError(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-bad", err: errors.New("connection refused")})
 
-	stdout, stderr, err := runAskCmd(t, "", "ask", "-e", "fake-bad", "hi")
+	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-bad", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -339,6 +341,42 @@ func TestAskEngineFailureJSONError(t *testing.T) {
 	}
 	if !strings.Contains(stderr, `"error"`) {
 		t.Errorf("stderr should contain json error envelope: %q", stderr)
+	}
+}
+
+// ── json 错误 envelope：error + reason 双字段 ────────────────
+
+// 引擎失败时 json envelope 必须带 reason（根因），且 reason 不含外层包装前缀。
+func TestErrorEnvelopeReasonField(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-reason", err: errors.New("root cause xyz")})
+
+	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-reason", "hi")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	_ = stdout
+	if !strings.Contains(stderr, `"reason":"root cause xyz"`) {
+		t.Errorf("stderr should contain reason field with root cause: %q", stderr)
+	}
+	// error 字段保留完整链（含引擎名），reason 字段是纯根因。
+	if !strings.Contains(stderr, `"error":"`) {
+		t.Errorf("stderr should contain error field: %q", stderr)
+	}
+}
+
+// text 模式失败输出保持单行纯文本（不带 json）。
+func TestErrorTextMode(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-text-err", err: errors.New("boom text")})
+
+	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-text-err", "-o", "text", "hi")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if stdout != "" {
+		t.Errorf("stdout should be empty, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "boom text") || strings.Contains(stderr, `"error"`) {
+		t.Errorf("text mode stderr should be plain text line: %q", stderr)
 	}
 }
 
@@ -354,6 +392,60 @@ func TestExitCodeOf(t *testing.T) {
 // unregisterLast：agent 包未暴露反注册；fake 引擎名字带 fake- 前缀、
 // 不影响真实引擎查找，残留无害。
 func unregisterLast() {}
+
+// ── --engines flag ───────────────────────────────────────────
+
+func TestEnginesFlagText(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-list", text: "x"})
+
+	stdout, _, err := runAskCmd(t, "", "--engines")
+	if err != nil {
+		t.Fatalf("--engines: %v", err)
+	}
+	if !strings.Contains(stdout, "ENGINE") || !strings.Contains(stdout, "fake-list") {
+		t.Errorf("stdout = %q, want engine table with fake-list", stdout)
+	}
+}
+
+func TestEnginesFlagJSON(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-json-list", text: "x"})
+
+	stdout, _, err := runAskCmd(t, "", "--engines", "--json")
+	if err != nil {
+		t.Fatalf("--engines --json: %v", err)
+	}
+	if !strings.Contains(stdout, `"engine":"fake-json-list"`) || !strings.Contains(stdout, `"ok":true`) {
+		t.Errorf("stdout = %q, want json array with engine entries", stdout)
+	}
+}
+
+// --engines 时不应触发提问（无 prompt 也不报错）。
+func TestEnginesFlagSkipsPrompt(t *testing.T) {
+	stdout, _, err := runAskCmd(t, "", "--engines")
+	if err != nil {
+		t.Fatalf("--engines should not require prompt: %v", err)
+	}
+	if !strings.Contains(stdout, "ENGINE") {
+		t.Errorf("stdout = %q, want engine table", stdout)
+	}
+}
+
+// ── 子命令已删除 ──────────────────────────────────────────────
+
+// ask / engines / version / completion 子命令均已删除：
+// 这些词不再被识别为子命令——作为位置参数它们就是普通 prompt。
+// 真实执行会走引擎调用（测试环境无 codebuddy CLI，报 unknown engine），
+// 这里用 cobra 命令树直接断言不存在任何子命令。
+func TestSubcommandsRemoved(t *testing.T) {
+	cmd := NewRootCommand()
+	if subs := cmd.Commands(); len(subs) != 0 {
+		names := make([]string, 0, len(subs))
+		for _, s := range subs {
+			names = append(names, s.Name())
+		}
+		t.Errorf("root should have no subcommands, got %v", names)
+	}
+}
 
 // 确保 cobra 命令满足接口。
 var _ = cobra.Command{}

@@ -118,7 +118,7 @@ type Engine interface {
 	Name() string
 
 	// Detect 探测引擎 CLI 是否可用（可执行文件存在等）。
-	// 返回 (可用, 说明)。说明用于 `engines` 子命令展示。
+	// 返回 (可用, 说明)。说明用于 `--engines` 展示。
 	Detect() (bool, string)
 
 	// Complete 执行一次调用。实现只负责单次尝试；
@@ -126,7 +126,7 @@ type Engine interface {
 	Complete(ctx context.Context, req Request) (Response, error)
 }
 
-// registry 内置引擎注册表（顺序即 `engines` 列表展示顺序）。
+// registry 内置引擎注册表（顺序即 `--engines` 列表展示顺序）。
 var registry []Engine
 
 // Register 注册一个引擎（通常在各引擎文件的 init() 中调用）。

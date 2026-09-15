@@ -58,7 +58,7 @@ npm pack           # 产出 magic-agent-<version>.tgz
 | trae | trae-cli | `~/.local/bin/trae-cli` → PATH → `MAGIC_AGENT_TRAE_BIN` |
 
 ```bash
-$ magic-agent engines
+$ magic-agent --engines
 ENGINE     STATUS  CLI
 claude     ✓       /opt/homebrew/bin/claude
 codebuddy  ✓       /Applications/WorkBuddy.app/.../cli/bin/codebuddy
@@ -67,14 +67,15 @@ trae       ✓       /Users/you/.local/bin/trae-cli
 
 ## 用法
 
+无子命令设计：所有功能都走根命令 + flags。
+
 ```bash
 # 版本
-magic-agent --version          # 等价于 magic-agent version
+magic-agent --version
 
-# 基本提问：根命令直接给 prompt（默认 json 输出）
+# 基本提问：直接给 prompt（默认 json 输出）
 magic-agent -p "用一句话解释什么是熵"
 magic-agent "1+1=?"            # 位置参数等价
-magic-agent ask "1+1=?"        # ask 子命令等价
 
 # 人看用 text
 magic-agent -o text -p "用一句话解释什么是熵"
@@ -103,26 +104,27 @@ magic-agent -e claude -f context.md "基于这个文件回答：……"
 magic-agent -e claude "1+1=?"
 # {"engine":"claude","model":"","session_id":"...","attempts":1,"latency_ms":534,"text":"2"}
 
-# 引擎可用性（支持 --json）
-magic-agent engines --json
+# 引擎可用性
+magic-agent --engines          # text 表格
+magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 ```
 
-## Flags（ask / 根命令共用）
-
-flags 注册在根命令的 persistent flags 上，`ask` 子命令自动继承。
+## Flags
 
 | Flag | 默认 | 说明 |
 |------|------|------|
-| `-e, --engine` | `claude` | 引擎：`claude` \| `codebuddy` \| `trae` |
+| `-e, --engine` | `codebuddy` | 引擎：`claude` \| `codebuddy` \| `trae` |
 | `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`）。trae 无 `--model`，内部转 `-c model.name=<m>` |
 | `-s, --system` | 空 | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
-| `-p, --prompt` | 空 | 提示词（根命令直接提问用） |
+| `-p, --prompt` | 空 | 提示词 |
 | `-f, --file` | 空 | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
 | `--tools` | `off` | `off`（纯 chat）\| `on`（agent 模式）\| 逗号分隔白名单（如 `Bash,Read`） |
-| `-t, --timeout` | 按引擎 | 单次尝试超时（如 `90s` / `3m`；claude/codebuddy 5m、trae 10m） |
+| `-t, --timeout` | `600s` | 单次尝试超时（如 `90s` / `3m`） |
 | `-r, --retries` | `0` | 失败重试次数（总尝试 = 1 + retries） |
 | `--backoff` | `2s` | 首次重试退避（指数翻倍，上限 30s，带抖动） |
 | `-o, --output` | `json` | 输出格式：`json` \| `text` |
+| `--engines` | 关 | 列出引擎与本机 CLI 可用性（替代原 `engines` 子命令） |
+| `--json` | 关 | `--engines` 的 JSON 输出开关 |
 | `-v, --verbose` | `false` | 重试过程打印到 stderr |
 
 prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道（stdin 非 TTY 且无其他输入时自动读）。
@@ -137,11 +139,33 @@ prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道�
 
 **text**（`-o text`）：stdout 只含模型正文 + 尾换行。
 
-失败时 stdout 为空，stderr 输出错误 envelope，退出码非 0：
+**失败时**：stdout 恒为空（不产生半截内容），错误打到 stderr，**格式与 `-o` 联动**：
 
-```json
-{"engine":"codebuddy","attempts":3,"error":"codebuddy: all 3 attempts failed: ..."}
+```bash
+# -o json（默认）：单行错误 envelope，error 与 reason 双字段
+$ magic-agent -e claude -t 2s "写一篇万字长文"
+{"engine":"claude","attempts":1,
+ "error":"claude: all 1 attempts failed: claude CLI: process group killed: context deadline exceeded",
+ "reason":"process group killed: context deadline exceeded"}
+
+# 参数类错误（exit 2）同样输出 envelope（attempts=0 表示尚未执行任何尝试）
+$ magic-agent -e nope "hi"
+{"engine":"nope","attempts":0,"error":"unknown engine \"nope\" ...","reason":"unknown engine \"nope\" ..."}
+
+# -o text：单行纯文本
+$ magic-agent -o text -e nope "hi"
+magic-agent: unknown engine "nope" (available: claude, codebuddy, trae)
 ```
+
+字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `error` | 完整错误链（含引擎/重试包装），面向人排查 |
+| `reason` | 最内层根因（stderr 摘要 / 超时 / 非零退出码），面向程序分支判断 |
+| `attempts` | 实际执行次数；`0` = 参数校验阶段即失败 |
+
+调用方约定：**stderr 整体可按 JSON 解析**（json 模式下只有这一行 envelope），jq 直接 `jq -r .reason` 取根因。
 
 ## 退出码
 
@@ -149,7 +173,7 @@ prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道�
 |----|------|
 | 0 | 成功 |
 | 1 | 调用失败（引擎错误 / 超时耗尽 / 重试耗尽） |
-| 2 | 参数或输入错误（未知引擎、非法格式、空 prompt 等） |
+| 2 | 参数或输入错误（未知引擎、非法格式、空 prompt、已删除的子命令形态等） |
 
 ## 重试语义
 
@@ -174,7 +198,7 @@ prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道�
 
 ```
 cmd/magic-agent/main.go     入口
-internal/cli/               cobra 命令层（ask / engines / version、参数校验、退出码）
+internal/cli/               cobra 命令层（无子命令、参数校验、退出码）
 internal/agent/
   engine.go                 Engine 接口 + Request/Response + 注册表
   prompt.go                 多轮消息扁平化 + noToolSuffix 约束

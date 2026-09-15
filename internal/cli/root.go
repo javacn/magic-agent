@@ -2,30 +2,34 @@ package cli
 
 // root.go - magic-agent CLI 入口与全局 flags。
 //
-// 命令结构：
+// 命令结构（无子命令，统一根命令直用）：
 //
-//	magic-agent                  显示帮助
-//	magic-agent ask <prompt>     单次提问（核心命令）
-//	magic-agent engines          列出引擎与可用性
-//	magic-agent version          版本信息（等价于 --version）
+//	magic-agent [flags] [prompt...]   提问（唯一主流程）
+//	magic-agent --engines             列出引擎与可用性（--json 可组合）
+//	magic-agent --version             版本信息
 //
-// ask 的关键 flags：
+// 关键 flags：
 //
-//	-e, --engine <name>      引擎：claude | codebuddy | trae（默认 claude）
+//	-e, --engine <name>      引擎：claude | codebuddy | trae（默认 codebuddy）
 //	-m, --model <name>       模型（空 = 引擎默认）
 //	-s, --system <prompt>    系统提示词
+//	-p, --prompt <text>      提示词
 //	-f, --file <path>        从文件读 prompt（- 读 stdin）
-//	-t, --timeout <dur>      单次尝试超时（如 3m；默认按引擎）
+//	-t, --timeout <dur>      单次尝试超时（如 3m；默认 600s）
 //	-r, --retries <n>        失败重试次数（默认 0）
 //	    --backoff <dur>      首次重试退避（默认 2s，指数翻倍，上限 30s）
-//	-o, --output <format>    输出：text（默认）| json
+//	-o, --output <format>    输出：json（默认）| text
+//	    --tools <mode>       off（默认）| on | 逗号分隔白名单
+//	    --engines            列出引擎与 CLI 探测结果（替代原 engines 子命令）
 //	-v, --verbose            重试过程打到 stderr
 //
 // 退出码：0 成功；1 调用失败；2 参数/输入错误。
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -35,16 +39,13 @@ import (
 // Version 版本号。
 var Version = "0.1.0"
 
-// NewRootCommand 构建 CLI 根命令。
+// NewRootCommand 构建 CLI 根命令（无子命令，全部走根命令 flags）。
 //
-// 根命令本身可直接提问（ask 的简写形态）：
-//
-//	magic-agent -p "问题"          （-p/--prompt 提示词）
-//	magic-agent "问题"             （位置参数同样有效）
+//	.magic-agent -p "问题"            （-p/--prompt 提示词）
+//	magic-agent "问题"                （位置参数同样有效）
 //	magic-agent -e codebuddy -m hy3 "问题"
+//	magic-agent --engines             （列引擎；--json 可组合）
 //
-// 实现方式：ask 的全部 flags 注册为 root 的 persistent flags，
-// 子命令共享同一份绑定变量；root 无子命令名时直接执行 ask 主流程。
 // 注意 -p 在 claude 语境里是 --print，这里统一让位给 --prompt。
 func NewRootCommand() *cobra.Command {
 	opts := newAskOptions()
@@ -64,39 +65,85 @@ func NewRootCommand() *cobra.Command {
   trae       Trae CLI（使用 trae 自身配置的默认模型）
 
 示例：
-  magic-agent -p "用一句话解释什么是熵"            # 根命令直接提问（默认 json 输出）
-  magic-agent ask "问题"                           # ask 子命令等价
+  magic-agent -p "用一句话解释什么是熵"            # 直接提问（默认 json 输出）
+  magic-agent "问题"                               # 位置参数等价
   magic-agent -e codebuddy "写一首俳句"            # codebuddy 默认 hy3
   magic-agent -e codebuddy -m glm-5.3 "写一首俳句"
   magic-agent -e trae -t 10m "总结这篇文档"        # 默认关工具；--tools on 可开
   magic-agent -e claude --tools Bash,Read "看看这个目录"  # 工具白名单
   cat doc.md | magic-agent -e claude -f - "总结上文"
-  magic-agent -e claude -r 2 "1+1=?"               # 失败重试 2 次`,
+  magic-agent -e claude -r 2 "1+1=?"               # 失败重试 2 次
+  magic-agent --engines                           # 列出引擎与可用性
+  magic-agent --engines --json                    # JSON 形式（可被 jq 解析）`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Args:          cobra.ArbitraryArgs,
+		Args:          rejectRemovedSubcommands,
+		// 禁用 cobra 内置 completion 子命令：本 CLI 无子命令形态。
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.engines {
+				return runEngines(cmd, opts)
+			}
 			return runAsk(cmd, args, opts)
 		},
 	}
 	bindAskFlags(root, opts)
-	root.AddCommand(newAskCommand(opts))
-	root.AddCommand(newEnginesCommand())
-	root.AddCommand(newVersionCommand())
-	// --version 输出与 version 子命令一致（"magic-agent <ver>"，不带 "version " 前缀）。
+	// 无子命令设计：禁用 cobra 自动注入的 completion 命令，
+	// 保证 "magic-agent completion" 也只是被当作 prompt 而非隐藏子命令。
+	root.CompletionOptions.DisableDefaultCmd = true
+	// --version 输出固定 "magic-agent <ver>"，不带 cobra 默认前缀。
 	root.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 	return root
 }
 
 // Execute 运行 CLI，返回进程退出码。
+//
+// 错误输出约定（stderr，与 -o 联动）：
+//   - 引擎执行失败：runAsk 已用 WriteError 输出（reportedError 标记），此处跳过
+//   - 其余错误（参数错 / 引擎预检失败 / 子命令形态）：此处统一输出 ——
+//     -o json 时输出同结构 envelope（attempts=0，engine 为 -e 原值），
+//     text 时一行 "magic-agent: <err>"。stdout 恒不产生半截内容。
 func Execute() int {
 	root := NewRootCommand()
-	if err := root.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "magic-agent: %v\n", err)
+	err := root.Execute()
+	if err == nil {
+		return exitOK
+	}
+	// 已由 WriteError 格式化输出过（json envelope / text 行）。
+	if errors.Is(err, errReportedSentinel) {
 		return exitCodeOf(err)
 	}
-	return 0
+
+	// 按 -o 的实际生效值（含默认）决定 stderr 格式。
+	format := agent.FormatJSON
+	if f := root.PersistentFlags().Lookup("output"); f != nil && f.Value.String() != "" {
+		if v, perr := agent.ParseFormat(f.Value.String()); perr == nil {
+			format = v
+		}
+	}
+	engineName := ""
+	if f := root.PersistentFlags().Lookup("engine"); f != nil {
+		engineName = f.Value.String()
+	}
+	// 参数类错误尚未执行任何尝试；attempts=0 便于调用方区分阶段。
+	_ = agent.WriteError(os.Stderr, format, engineName, 0, err)
+	return exitCodeOf(err)
 }
+
+// errReportedSentinel reportedError 的内部标记（errors.Is 用）。
+var errReportedSentinel = errors.New("already reported")
+
+// reportedError 包装"已输出过失败信息"的错误：
+// WriteError 已把 envelope/文本写到 stderr，Execute 不再打印第二遍。
+type reportedError struct{ err error }
+
+func (r *reportedError) Error() string { return r.err.Error() }
+
+// Is 让 errors.Is(err, errReportedSentinel) 命中。
+func (r *reportedError) Is(target error) bool { return target == errReportedSentinel }
+
+// Unwrap 保留退出码推断（usageError 判定）沿链下钻。
+func (r *reportedError) Unwrap() error { return r.err }
 
 // 退出码约定。
 const (
@@ -110,6 +157,26 @@ type usageError struct{ err error }
 
 func (u *usageError) Error() string { return u.err.Error() }
 
+// removedSubcommands 已删除的子命令名（v0.1 曾有 ask/engines/version
+// 子命令形态；现统一为根命令 flags）。出现在首位参数时直接拒绝，
+// 避免被误当成 prompt 发给引擎。
+var removedSubcommands = map[string]string{
+	"ask":        "--prompt / 位置参数",
+	"engines":    "--engines",
+	"version":    "--version",
+	"completion": "(no shell completion)",
+}
+
+// rejectRemovedSubcommands 首个位置参数命中已删子命令名时报 usage 错误。
+func rejectRemovedSubcommands(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		if hint, ok := removedSubcommands[strings.ToLower(args[0])]; ok {
+			return &usageError{fmt.Errorf("unknown command %q: subcommands were removed, use %s instead", args[0], hint)}
+		}
+	}
+	return cobra.ArbitraryArgs(cmd, args)
+}
+
 // exitCodeOf 从错误推断退出码。
 func exitCodeOf(err error) int {
 	if _, ok := err.(*usageError); ok {
@@ -118,58 +185,38 @@ func exitCodeOf(err error) int {
 	return exitFail
 }
 
-// newVersionCommand version 子命令。
-func newVersionCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "显示版本信息",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintf(cmd.OutOrStdout(), "magic-agent %s\n", Version)
-			return nil
-		},
-	}
-}
-
-// newEnginesCommand engines 子命令：列出引擎与 CLI 探测结果。
-func newEnginesCommand() *cobra.Command {
-	var asJSON bool
-	cmd := &cobra.Command{
-		Use:   "engines",
-		Short: "列出支持的引擎与本机 CLI 可用性",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			engines := agent.Engines()
-			if asJSON {
-				type row struct {
-					Engine string `json:"engine"`
-					OK     bool   `json:"ok"`
-					Bin    string `json:"bin"`
-					Note   string `json:"note,omitempty"`
-				}
-				rows := make([]row, 0, len(engines))
-				for _, e := range engines {
-					ok, note := e.Detect()
-					r := row{Engine: e.Name(), OK: ok, Note: note}
-					if ok {
-						r.Bin = note
-						r.Note = ""
-					}
-					rows = append(rows, r)
-				}
-				return printJSON(cmd.OutOrStdout(), rows)
+// runEngines 列出引擎与 CLI 探测结果（原 engines 子命令的 flag 形态）。
+// text 表格输出；--json 输出单行 JSON 数组（jq 友好）。
+func runEngines(cmd *cobra.Command, opts *askOptions) error {
+	engines := agent.Engines()
+	if opts.jsonOut {
+		type row struct {
+			Engine string `json:"engine"`
+			OK     bool   `json:"ok"`
+			Bin    string `json:"bin"`
+			Note   string `json:"note,omitempty"`
+		}
+		rows := make([]row, 0, len(engines))
+		for _, e := range engines {
+			ok, note := e.Detect()
+			r := row{Engine: e.Name(), OK: ok, Note: note}
+			if ok {
+				r.Bin = note
+				r.Note = ""
 			}
-			w := cmd.OutOrStdout()
-			fmt.Fprintln(w, "ENGINE     STATUS  CLI")
-			for _, e := range engines {
-				ok, note := e.Detect()
-				status := "✗"
-				if ok {
-					status = "✓"
-				}
-				fmt.Fprintf(w, "%-10s %-7s %s\n", e.Name(), status, note)
-			}
-			return nil
-		},
+			rows = append(rows, r)
+		}
+		return printJSON(cmd.OutOrStdout(), rows)
 	}
-	cmd.Flags().BoolVar(&asJSON, "json", false, "以 JSON 输出")
-	return cmd
+	w := cmd.OutOrStdout()
+	fmt.Fprintln(w, "ENGINE     STATUS  CLI")
+	for _, e := range engines {
+		ok, note := e.Detect()
+		status := "✗"
+		if ok {
+			status = "✓"
+		}
+		fmt.Fprintf(w, "%-10s %-7s %s\n", e.Name(), status, note)
+	}
+	return nil
 }

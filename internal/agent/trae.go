@@ -165,11 +165,7 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
-		errMsg := truncateStr(strings.TrimSpace(stderr), 500)
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		return Response{}, fmt.Errorf("trae CLI: %w (stderr: %s)", err, errMsg)
+		return Response{}, wrapCliError("trae", stdout, stderr, err)
 	}
 
 	text := strings.TrimSpace(stdout)

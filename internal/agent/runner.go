@@ -141,7 +141,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (Response, error) {
 		}
 
 		if !isRetryable(err) {
-			return Response{}, fmt.Errorf("%s (attempts=%d, non-retryable)", err, attempt)
+			return Response{}, fmt.Errorf("%w (attempts=%d, non-retryable)", err, attempt)
 		}
 		if attempt == totalAttempts {
 			break

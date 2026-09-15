@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 // runCLI 在独立进程组里执行 bin args，返回 (stdout, stderr, err)。
@@ -52,4 +53,70 @@ func runCLI(ctx context.Context, bin string, args ...string) (string, string, er
 // envWithDefaults 继承当前环境（CLI 依赖 HOME/PATH 等基础变量）。
 func envWithDefaults() []string {
 	return environ()
+}
+
+// stderrSummary 从 CLI 的 stderr 里提取人可读的失败摘要：
+// 取最后一行非空输出（CLI 报错通常在末尾），去 ANSI 色码，截断。
+func stderrSummary(stderr string) string {
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			return truncateStr(stripANSI(s), 500)
+		}
+	}
+	return ""
+}
+
+// wrapCliError 统一包装引擎 CLI 的执行失败。
+//
+// 外层文本 "<engine> CLI: <cliCauseError>"（cliCauseError.Error() 自带
+// stderr 摘要），错误链经 %w 保持完整 —— WriteError 由此提取 reason。
+//
+// stderr 为空时（典型：超时被杀）不追加 stderr 摘要，避免拿 err 自身
+// 回填造成重复。
+func wrapCliError(engine, stdout, stderr string, err error) error {
+	summary := stderrSummary(stderr)
+	return fmt.Errorf("%s CLI: %w", engine, &cliCauseError{cause: err, summary: summary})
+}
+
+// cliCauseError CLI 失败的根因载体。
+// Error() 输出格式：
+//
+//	有摘要  "<cause> (stderr: <摘要>)"
+//	无摘要  "<cause>"（超时 / fork 失败类）
+type cliCauseError struct {
+	cause   error
+	summary string
+}
+
+func (e *cliCauseError) Error() string {
+	if e.summary != "" {
+		return fmt.Sprintf("%v (stderr: %s)", e.cause, e.summary)
+	}
+	return e.cause.Error()
+}
+
+func (e *cliCauseError) Cause() error { return e.cause }
+
+// Summary stderr 摘要；空表示无（超时/fork 失败类）。
+func (e *cliCauseError) Summary() string { return e.summary }
+
+// Unwrap 支持 errors.Is/As 沿链下钻。
+func (e *cliCauseError) Unwrap() error { return e.cause }
+
+// stripANSI 去除 ANSI 转义序列（色码），避免错误信息里混入 "\x1b[31m"。
+func stripANSI(s string) string {
+	var b strings.Builder
+	inEsc := false
+	for _, r := range s {
+		switch {
+		case r == 0x1b:
+			inEsc = true
+		case inEsc && (r == 'm' || r == 'K' || r == 'H'):
+			inEsc = false // CSI 序列终结符
+		case !inEsc:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
