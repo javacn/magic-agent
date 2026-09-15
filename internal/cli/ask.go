@@ -16,6 +16,7 @@ package cli
 //	             + 权限旁路；引擎不支持的白名单成员忽略。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +44,8 @@ type askOptions struct {
 	verbose bool
 	engines bool
 	jsonOut bool
+	stream  bool
+	noThinking bool
 }
 
 // newAskOptions 返回带默认值的选项集。
@@ -60,8 +63,8 @@ func newAskOptions() *askOptions {
 // bindAskFlags 把全部 flags 注册为根命令的 persistent flags。
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
-	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae（默认 codebuddy）")
-	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3）")
+	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm（默认 codebuddy）")
+	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎读 models.json）")
 	f.StringVarP(&opts.system, "system", "s", "", "系统提示词")
 	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
@@ -73,6 +76,8 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.BoolVarP(&opts.verbose, "verbose", "v", false, "重试过程打印到 stderr")
 	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎与本机 CLI 可用性（可组合 --json）")
 	f.BoolVar(&opts.jsonOut, "json", false, "--engines 的 JSON 输出开关")
+	f.BoolVar(&opts.stream, "stream", false, "流式输出：正文/思考增量实时打到 stdout（text 模式思考走 stderr）")
+	f.BoolVar(&opts.noThinking, "no-thinking", false, "流式模式下不转发思考过程增量")
 }
 
 // parseToolsMode 解析 --tools 参数为结构化模式。
@@ -101,58 +106,13 @@ func parseToolsMode(s string) (agent.ToolsMode, error) {
 	}
 }
 
-// runAsk ask 主流程。
+// runAsk ask 主流程（非流式）。
 func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
-	// 1. 校验引擎与输出格式。
-	engine := agent.Lookup(opts.engine)
-	if engine == nil {
-		names := make([]string, 0)
-		for _, e := range agent.Engines() {
-			names = append(names, e.Name())
-		}
-		return &usageError{fmt.Errorf("unknown engine %q (available: %s)", opts.engine, strings.Join(names, ", "))}
-	}
-	format, err := agent.ParseFormat(opts.output)
-	if err != nil {
-		return &usageError{err}
-	}
-	if opts.retries < 0 {
-		return &usageError{fmt.Errorf("--retries must be >= 0, got %d", opts.retries)}
-	}
-	toolsMode, err := parseToolsMode(opts.tools)
+	engine, format, req, err := prepareAsk(cmd, args, opts)
 	if err != nil {
 		return err
 	}
 
-	// 2. 组装 prompt：-p > --file/stdin 内容 + 位置参数。
-	promptParts, err := collectPrompt(cmd.InOrStdin(), args, opts.file)
-	if err != nil {
-		return &usageError{err}
-	}
-	if p := strings.TrimSpace(opts.prompt); p != "" {
-		// --prompt 优先级最高：放到最前（同 --file 语义，附加内容跟后面）。
-		promptParts = append([]string{p}, promptParts...)
-	}
-	prompt := strings.TrimSpace(strings.Join(promptParts, "\n\n"))
-	if prompt == "" {
-		return &usageError{fmt.Errorf("empty prompt: use -p, pass args, --file, or pipe stdin")}
-	}
-
-	// 3. 引擎 CLI 预检（快速失败，给出可操作提示）。
-	if ok, note := engine.Detect(); !ok {
-		return fmt.Errorf("engine %q unavailable: %s", engine.Name(), note)
-	}
-
-	// 4. 组装 Request + Runner，执行。
-	req := agent.Request{
-		Engine:       engine.Name(),
-		Model:        opts.model,
-		SystemPrompt: opts.system,
-		Tools:        toolsMode,
-		Messages: []agent.Message{
-			{Role: "user", Content: prompt},
-		},
-	}
 	runner := &agent.Runner{
 		Engine:  engine,
 		Timeout: opts.timeout,
@@ -171,6 +131,175 @@ func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		return err
 	}
 	return agent.WriteOutput(cmd.OutOrStdout(), format, resp)
+}
+
+// runStreamAsk 流式主流程。
+//
+// 输出分流（增量实时、无缓冲）：
+//
+//	text 模式（-o text）：
+//	  正文增量 → stdout（拼成连续正文）
+//	  思考增量 → stderr（前置 "… " 每行，供 2>/dev/null 静音或 tee 保留）
+//	  结尾 stdout 不再重复全文
+//
+//	json 模式（默认）：
+//	  每条增量一行 NDJSON：{"type":"text","text":"…"} / {"type":"thinking","text":"…"}
+//	  结尾一行汇总 envelope（含 thinking 全文 + attempts + latency），
+//	  jq 逐事件消费或整体 tail 取 result。
+//
+// 语义差异（相对非流式）：
+//   - 不做自动重试（增量已实时发出，重放会重复消费）；-r 被忽略并提示。
+//   - 超时照常生效（杀整个 CLI 进程组）。
+func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
+	engine, format, req, err := prepareAsk(cmd, args, opts)
+	if err != nil {
+		return err
+	}
+	streamer := agent.AsStreamer(engine)
+	if streamer == nil {
+		return &usageError{fmt.Errorf("engine %q does not support streaming", engine.Name())}
+	}
+
+	if opts.retries > 0 {
+		fmt.Fprintln(cmd.ErrOrStderr(), "magic-agent: --stream 不支持自动重试，-r 已忽略")
+	}
+
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	var onEvent func(agent.StreamEvent)
+	if format == agent.FormatJSON {
+		onEvent = func(ev agent.StreamEvent) {
+			if ev.Kind == agent.KindThinking && opts.noThinking {
+				return
+			}
+			_ = writeStreamEventJSON(stdout, ev)
+		}
+	} else {
+		onEvent = func(ev agent.StreamEvent) {
+			switch ev.Kind {
+			case agent.KindThinking:
+				if opts.noThinking {
+					return
+				}
+				fmt.Fprint(stderr, "… "+ev.Text)
+			case agent.KindText:
+				fmt.Fprint(stdout, ev.Text)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(cmd.Context(), opts.timeout)
+	defer cancel()
+
+	res, err := streamer.Stream(ctx, req, onEvent)
+	if err != nil {
+		if format == agent.FormatText {
+			fmt.Fprintf(stderr, "\nmagic-agent: %v\n", err)
+		}
+		return &reportedError{err}
+	}
+
+	if format == agent.FormatJSON {
+		// 结尾汇总行（jq 可 tail -1 取全文 + 思考过程）。
+		out := struct {
+			Type      string `json:"type"`
+			Engine    string `json:"engine"`
+			Model     string `json:"model"`
+			SessionID string `json:"session_id,omitempty"`
+			Attempts  int    `json:"attempts"`
+			LatencyMS int64  `json:"latency_ms"`
+			Thinking  string `json:"thinking,omitempty"`
+			Text      string `json:"text"`
+		}{
+			Type:      "result",
+			Engine:    res.Engine,
+			Model:     res.Model,
+			SessionID: res.SessionID,
+			Attempts:  1,
+			LatencyMS: res.Latency.Milliseconds(),
+			Thinking:  res.Thinking,
+			Text:      res.Text,
+		}
+		if opts.noThinking {
+			out.Thinking = ""
+		}
+		data, jerr := json.Marshal(out)
+		if jerr != nil {
+			return jerr
+		}
+		fmt.Fprintln(stdout, string(data))
+	} else {
+		// text 模式：正文已实时打完，补尾换行即可。
+		fmt.Fprintln(stdout)
+	}
+	return nil
+}
+
+// writeStreamEventJSON 输出一行流式事件 NDJSON。
+func writeStreamEventJSON(w io.Writer, ev agent.StreamEvent) error {
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: string(ev.Kind), Text: ev.Text})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, string(data))
+	return err
+}
+
+// prepareAsk 校验参数并组装 Request（流式 / 非流式共用）。
+func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engine, agent.OutputFormat, agent.Request, error) {
+	// 1. 校验引擎与输出格式。
+	engine := agent.Lookup(opts.engine)
+	if engine == nil {
+		names := make([]string, 0)
+		for _, e := range agent.Engines() {
+			names = append(names, e.Name())
+		}
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("unknown engine %q (available: %s)", opts.engine, strings.Join(names, ", "))}
+	}
+	format, err := agent.ParseFormat(opts.output)
+	if err != nil {
+		return nil, "", agent.Request{}, &usageError{err}
+	}
+	if opts.retries < 0 {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("--retries must be >= 0, got %d", opts.retries)}
+	}
+	toolsMode, err := parseToolsMode(opts.tools)
+	if err != nil {
+		return nil, "", agent.Request{}, err
+	}
+
+	// 2. 组装 prompt：-p > --file/stdin 内容 + 位置参数。
+	promptParts, err := collectPrompt(cmd.InOrStdin(), args, opts.file)
+	if err != nil {
+		return nil, "", agent.Request{}, &usageError{err}
+	}
+	if p := strings.TrimSpace(opts.prompt); p != "" {
+		// --prompt 优先级最高：放到最前（同 --file 语义，附加内容跟后面）。
+		promptParts = append([]string{p}, promptParts...)
+	}
+	prompt := strings.TrimSpace(strings.Join(promptParts, "\n\n"))
+	if prompt == "" {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("empty prompt: use -p, pass args, --file, or pipe stdin")}
+	}
+
+	// 3. 引擎 CLI 预检（快速失败，给出可操作提示）。
+	if ok, note := engine.Detect(); !ok {
+		return nil, "", agent.Request{}, fmt.Errorf("engine %q unavailable: %s", engine.Name(), note)
+	}
+
+	// 4. 组装 Request。
+	req := agent.Request{
+		Engine:       engine.Name(),
+		Model:        opts.model,
+		SystemPrompt: opts.system,
+		Tools:        toolsMode,
+		Messages: []agent.Message{
+			{Role: "user", Content: prompt},
+		},
+	}
+	return engine, format, req, nil
 }
 
 // collectPrompt 收集 prompt 输入。返回 (parts)：

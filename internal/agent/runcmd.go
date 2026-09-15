@@ -55,6 +55,38 @@ func envWithDefaults() []string {
 	return environ()
 }
 
+// newStreamCmd 构造流式 CLI 进程（进程组 + 环境继承，stdout 留给调用方接管）。
+func newStreamCmd(bin string, args []string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	configureProcAttr(cmd)
+	cmd.Env = envWithDefaults()
+	return cmd
+}
+
+// streamStderrBuf 流式进程的 stderr 缓冲（保留尾部 32KB 供错误摘要）。
+type streamStderrBuf struct {
+	buf [32 * 1024]byte
+	n   int
+}
+
+func (b *streamStderrBuf) Write(p []byte) (int, error) {
+	if room := len(b.buf) - b.n; room > 0 {
+		if len(p) <= room {
+			copy(b.buf[b.n:], p)
+			b.n += len(p)
+			return len(p), nil
+		}
+		copy(b.buf[b.n:], p[:room])
+		b.n = len(b.buf)
+	}
+	return len(p), nil
+}
+
+// String 尾部内容（去 ANSI）。
+func (b *streamStderrBuf) String() string {
+	return stripANSI(string(b.buf[:b.n]))
+}
+
 // stderrSummary 从 CLI 的 stderr 里提取人可读的失败摘要：
 // 取最后一行非空输出（CLI 报错通常在末尾），去 ANSI 色码，截断。
 func stderrSummary(stderr string) string {

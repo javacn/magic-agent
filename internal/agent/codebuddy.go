@@ -85,36 +85,7 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 		return Response{}, fmt.Errorf("codebuddy CLI not found; set MAGIC_AGENT_CODEBUDDY_BIN")
 	}
 
-	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
-	if prompt == "" {
-		return Response{}, fmt.Errorf("codebuddy: empty prompt")
-	}
-
-	args := []string{
-		"--print",
-		"--output-format", "json",
-		"--no-session-persistence",
-		"--append-system-prompt", noToolSuffix,
-	}
-	// 工具模式映射（同 claude）。
-	tools := toolsOrDefault(req.Tools)
-	switch {
-	case tools.IsOff():
-		args = append(args, "--tools", "")
-	case tools.IsOn():
-		args = append(args, "-y") // --dangerously-skip-permissions
-	default:
-		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "-y")
-	}
-	if m := stripModelPrefix(req.Model); m != "" {
-		args = append(args, "--model", m)
-	} else {
-		// 默认模型 hy3；空串 = CLI 自身默认（几乎不用，保底语义）。
-		if DefaultCodeBuddyModel != "" {
-			args = append(args, "--model", DefaultCodeBuddyModel)
-		}
-	}
-	args = append(args, prompt)
+	args := e.buildArgs(req)
 
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
@@ -140,6 +111,105 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 		Text:    text,
 		Model:   req.Model,
 		Latency: time.Since(start),
+	}, nil
+}
+
+// buildArgs 构造 codebuddy CLI 参数（Complete 与 Stream 共用）。
+func (e *CodeBuddyEngine) buildArgs(req Request) []string {
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
+	args := []string{
+		"--print",
+		"--output-format", "json",
+		"--no-session-persistence",
+		"--append-system-prompt", noToolSuffix,
+	}
+	// 工具模式映射（同 claude）。
+	tools := toolsOrDefault(req.Tools)
+	switch {
+	case tools.IsOff():
+		args = append(args, "--tools", "")
+	case tools.IsOn():
+		args = append(args, "-y") // --dangerously-skip-permissions
+	default:
+		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "-y")
+	}
+	if m := stripModelPrefix(req.Model); m != "" {
+		args = append(args, "--model", m)
+	} else {
+		// 默认模型 hy3；空串 = CLI 自身默认（几乎不用，保底语义）。
+		if DefaultCodeBuddyModel != "" {
+			args = append(args, "--model", DefaultCodeBuddyModel)
+		}
+	}
+	args = append(args, prompt)
+	return args
+}
+
+// Stream 实现 Streamer：流式调用 codebuddy CLI。
+// 协议与 claude 同源（CodeBuddy Code 系 stream-json）；本环境该 CLI
+// 单次调用长期不返回，实现按同源协议 + fake CLI 测试保障。
+func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	start := time.Now()
+	bin := e.bin()
+	if bin == "" {
+		return StreamResult{}, fmt.Errorf("codebuddy CLI not found; set MAGIC_AGENT_CODEBUDDY_BIN")
+	}
+
+	args := e.buildArgs(req)
+	for i := range args {
+		if args[i] == "--output-format" {
+			args[i+1] = "stream-json"
+			break
+		}
+	}
+	args = append(args, "--include-partial-messages", "--verbose")
+
+	acc := &streamAccumulator{OnEvent: onEvent}
+	var fin struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		IsError bool   `json:"is_error"`
+		Result  string `json:"result"`
+		Model   string `json:"model"`
+	}
+	seenResult := false
+
+	err := runStreamCLI(ctx, bin, args, func(line string) error {
+		isResult, perr := acc.handleNDJSONLine(line)
+		if perr != nil {
+			return perr
+		}
+		if isResult {
+			_ = json.Unmarshal([]byte(line), &fin)
+			seenResult = true
+		}
+		return nil
+	})
+	if err != nil {
+		return StreamResult{}, err
+	}
+	if !seenResult {
+		return StreamResult{}, fmt.Errorf("codebuddy CLI stream ended without result line")
+	}
+	if fin.IsError {
+		return StreamResult{}, fmt.Errorf("codebuddy CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
+	}
+
+	text := stripUserQueryEcho(fin.Result)
+	if strings.TrimSpace(text) == "" {
+		text = strings.TrimSpace(acc.Text.String())
+	}
+	if strings.TrimSpace(text) == "" {
+		return StreamResult{}, fmt.Errorf("codebuddy CLI 返回内容仅为请求回显（无模型正文）")
+	}
+	return StreamResult{
+		Response: Response{
+			Engine:  e.Name(),
+			Text:    text,
+			Model:   fin.Model,
+			Latency: time.Since(start),
+		},
+		Thinking: acc.Thinking.String(),
 	}, nil
 }
 

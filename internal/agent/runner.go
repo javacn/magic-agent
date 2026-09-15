@@ -61,6 +61,8 @@ func (r *Runner) defaultTimeout() time.Duration {
 		return DefaultCodeBuddyTimeout
 	case *TraeEngine:
 		return DefaultTraeTimeout
+	case *LLMEngine:
+		return DefaultLLMTimeout
 	}
 	return 5 * time.Minute
 }

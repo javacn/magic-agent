@@ -17,6 +17,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -124,6 +125,38 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 		prompt += noToolSuffix
 	}
 
+	args := e.buildArgs(req, prompt)
+
+	stdout, stderr, err := runCLI(ctx, bin, args...)
+	if err != nil {
+		return Response{}, wrapCliError("trae", stdout, stderr, err)
+	}
+
+	text := strings.TrimSpace(stdout)
+	if text == "" {
+		return Response{}, fmt.Errorf("trae CLI returned empty output")
+	}
+
+	modelLabel := stripModelPrefix(req.Model)
+	if modelLabel == "" {
+		modelLabel = e.Model
+	}
+	if modelLabel == "" {
+		if m := TraeDefaultModel(); m != "" {
+			modelLabel = m
+		} else {
+			modelLabel = "cli-default"
+		}
+	}
+	return Response{
+		Text:    text,
+		Model:   modelLabel,
+		Latency: time.Since(start),
+	}, nil
+}
+
+// buildArgs 构造 trae-cli 参数（Complete 与 Stream 共用）。
+func (e *TraeEngine) buildArgs(req Request, prompt string) []string {
 	args := []string{"-p"}
 	// 模型：显式值 > 引擎注入值；都为空则用 CLI 自身默认。
 	model := e.Model
@@ -162,18 +195,73 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 		args = append(args, "--query-timeout", "600s")
 	}
 	args = append(args, prompt)
+	return args
+}
 
-	stdout, stderr, err := runCLI(ctx, bin, args...)
+// Stream 实现 Streamer：流式调用 trae-cli。
+// trae 的 stream-json 用 delta.content 直出正文增量；
+// 模型侧不开 reasoning，无 thinking 通道（Thinking 恒为空）。
+func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	start := time.Now()
+	bin := e.bin()
+	if bin == "" {
+		return StreamResult{}, fmt.Errorf("trae CLI not found; set MAGIC_AGENT_TRAE_BIN")
+	}
+
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, true)
+	if prompt == "" {
+		return StreamResult{}, fmt.Errorf("trae: empty prompt")
+	}
+	if req.SystemPrompt == "" {
+		prompt += noToolSuffix
+	}
+
+	args := e.buildArgs(req, prompt)
+	args = append(args, "--output-format", "stream-json", "--include-partial-messages")
+
+	acc := &streamAccumulator{OnEvent: onEvent}
+	var fin struct {
+		Type      string `json:"type"`
+		Subtype   string `json:"subtype"`
+		IsError   bool   `json:"is_error"`
+		Result    string `json:"result"`
+		SessionID string `json:"session_id"`
+	}
+	seenResult := false
+
+	err := runStreamCLI(ctx, bin, args, func(line string) error {
+		isResult, perr := acc.handleNDJSONLine(line)
+		if perr != nil {
+			return perr
+		}
+		if isResult {
+			_ = json.Unmarshal([]byte(line), &fin)
+			seenResult = true
+		}
+		return nil
+	})
 	if err != nil {
-		return Response{}, wrapCliError("trae", stdout, stderr, err)
+		return StreamResult{}, err
+	}
+	if !seenResult {
+		return StreamResult{}, fmt.Errorf("trae CLI stream ended without result line")
+	}
+	if fin.IsError {
+		return StreamResult{}, fmt.Errorf("trae CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
 	}
 
-	text := strings.TrimSpace(stdout)
+	text := fin.Result
 	if text == "" {
-		return Response{}, fmt.Errorf("trae CLI returned empty output")
+		text = strings.TrimSpace(acc.Text.String())
+	}
+	if text == "" {
+		return StreamResult{}, fmt.Errorf("trae CLI returned empty result")
 	}
 
-	modelLabel := model
+	modelLabel := stripModelPrefix(req.Model)
+	if modelLabel == "" {
+		modelLabel = e.Model
+	}
 	if modelLabel == "" {
 		if m := TraeDefaultModel(); m != "" {
 			modelLabel = m
@@ -181,9 +269,14 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 			modelLabel = "cli-default"
 		}
 	}
-	return Response{
-		Text:    text,
-		Model:   modelLabel,
-		Latency: time.Since(start),
+	return StreamResult{
+		Response: Response{
+			Engine:    e.Name(),
+			Text:      text,
+			Model:     modelLabel,
+			SessionID: fin.SessionID,
+			Latency:   time.Since(start),
+		},
+		Thinking: acc.Thinking.String(),
 	}, nil
 }

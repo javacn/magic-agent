@@ -56,6 +56,7 @@ npm pack           # 产出 magic-agent-<version>.tgz
 | claude | Claude Code | `/opt/homebrew/bin/claude` → PATH → `MAGIC_AGENT_CLAUDE_BIN` |
 | codebuddy | WorkBuddy 内置 CLI | `WorkBuddy.app/.../cli/bin/codebuddy` → PATH → `MAGIC_AGENT_CODEBUDDY_BIN` |
 | trae | trae-cli | `~/.local/bin/trae-cli` → PATH → `MAGIC_AGENT_TRAE_BIN` |
+| llm | 无（读 `~/.magic-agent/models.json`） | 配置缺失即不可用；`MAGIC_AGENT_MODELS` 可换路径 |
 
 ```bash
 $ magic-agent --engines
@@ -63,6 +64,7 @@ ENGINE     STATUS  CLI
 claude     ✓       /opt/homebrew/bin/claude
 codebuddy  ✓       /Applications/WorkBuddy.app/.../cli/bin/codebuddy
 trae       ✓       /Users/you/.local/bin/trae-cli
+llm        ✓       /Users/you/.magic-agent/models.json (2 providers, default=minimax/MiniMax-M3)
 ```
 
 ## 用法
@@ -85,6 +87,12 @@ magic-agent -e codebuddy "写一首俳句"            # codebuddy 默认 hy3
 magic-agent -e codebuddy -m glm-5.3 "写一首俳句"
 magic-agent -e trae "总结这篇文档"               # trae 用自身配置的默认模型
 magic-agent -e trae -m My-MiniMax-M3 "..."      # -c model.name= 覆盖
+
+# 直连 LLM（读 ~/.magic-agent/models.json，见下节）
+magic-agent -e llm -m minimax/MiniMax-M3 "问题"   # 显式 provider/model
+magic-agent -e llm -m MiniMax-M3 "问题"           # 裸模型名，按声明顺序匹配
+magic-agent -e llm "问题"                         # 用配置里的 default
+magic-agent -e llm -m local/qwen2.5:0.5b "问题"   # ollama 本地模型
 
 # 工具开关（默认 off = 纯 chat；on = agent 模式；或白名单）
 magic-agent -e claude --tools on -p "看看当前目录有什么"
@@ -113,8 +121,8 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 
 | Flag | 默认 | 说明 |
 |------|------|------|
-| `-e, --engine` | `codebuddy` | 引擎：`claude` \| `codebuddy` \| `trae` |
-| `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`）。trae 无 `--model`，内部转 `-c model.name=<m>` |
+| `-e, --engine` | `codebuddy` | 引擎：`claude` \| `codebuddy` \| `trae` \| `llm` |
+| `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`；llm 引擎读 models.json）。trae 无 `--model`，内部转 `-c model.name=<m>` |
 | `-s, --system` | 空 | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
 | `-p, --prompt` | 空 | 提示词 |
 | `-f, --file` | 空 | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
@@ -128,6 +136,57 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 | `-v, --verbose` | `false` | 重试过程打印到 stderr |
 
 prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道（stdin 非 TTY 且无其他输入时自动读）。
+
+## llm 引擎与 models.json
+
+`-e llm` 直接按配置调 LLM，不依赖任何外部 agent CLI。配置读取顺序（先命中先用）：
+
+1. `$MAGIC_AGENT_MODELS` 指定的路径
+2. `~/.magic-agent/models.json`
+3. `~/.magic-video/config.json`（兜底复用已有的 `models.default`，免重录密钥）
+
+配置文件格式：
+
+```json
+{
+  "default": "minimax/MiniMax-M3",
+  "providers": [
+    {
+      "name": "minimax",
+      "api": "openai-completions",
+      "baseUrl": "https://api.minimaxi.com/v1",
+      "apiKey": "sk-...",
+      "timeout": 600,
+      "models": [{ "id": "MiniMax-M3", "input": ["text", "image"] }],
+      "extraBody": { "thinking": { "type": "disabled" } }
+    },
+    { "name": "local",   "api": "ollama",        "models": [{ "id": "qwen2.5:0.5b" }] },
+    { "name": "codebuddy", "api": "codebuddy-cli", "models": [{ "id": "hy3" }, { "id": "hy3-x" }] }
+  ]
+}
+```
+
+`provider.api` 决定路由：
+
+| api | 行为 |
+|-----|------|
+| `openai-completions`（默认） | 内置 HTTP 客户端打 `{baseUrl}/chat/completions`。`extraBody` 原样并入请求体 |
+| `ollama` | shell 调 `ollama run <model>`（本地模型，无需 API key） |
+| `codebuddy-cli` | 委托给已生产验证的 codebuddy 引擎 |
+| `trae-cli` | 委托给 trae 引擎 |
+| `claude-cli` | 委托给 claude 引擎 |
+
+`-m` 的写法：
+
+```bash
+-m provider/model      # 显式指定 provider（精确名匹配，忽略大小写）
+-m model               # 裸名：按 providers 声明顺序取首个包含它的
+# 不给 -m              # 用顶层 default；无 default 则回退 llm.textModels[0]，再回退首个模型的 id
+```
+
+`extraBody` 是**必须保留**的字段：推理模型（如 MiniMax-M3）不关思维链时长文本生成会被推理吃光 token 预算、正文为空。HTTP 客户端另外固定发 `reasoning_split: true`，让 thinking 走 `reasoning_content`，并对 content 里残留的思维链标签做兜底剥离。
+
+配置里含 API key，建议 `chmod 600 ~/.magic-agent/models.json`。
 
 ## 输出格式
 
@@ -183,14 +242,14 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae)
 
 ## 引擎差异说明
 
-| | claude | codebuddy | trae |
-|---|---|---|---|
-| 非交互模式 | `-p --output-format json` | `--print --output-format json` | `-p`（纯文本） |
-| 模型指定 | `--model <m>` | `--model <m>` | `-c model.name=<m>`（无 --model flag） |
-| 默认模型 | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` |
-| system 注入 | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 |
-| 工具禁用 | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） |
-| 超时联动 | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） |
+| | claude | codebuddy | trae | llm |
+|---|---|---|---|---|
+| 非交互模式 | `-p --output-format json` | `--print --output-format json` | `-p`（纯文本） | HTTP / 委托 |
+| 模型指定 | `--model <m>` | `--model <m>` | `-c model.name=<m>`（无 --model flag） | `-m <provider>/<model>` |
+| 默认模型 | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` | models.json 的 `default` |
+| system 注入 | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 | HTTP 走 messages[0] |
+| 工具禁用 | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） | 不适用（纯 chat） |
+| 超时联动 | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） | HTTP client timeout / 委托同左 |
 
 所有引擎都以独立**进程组**运行：超时/取消时 `kill(-pgid)` 杀掉整个进程树，CLI 内部 spawn 的 node worker 不会残留（有回归测试保障）。
 
@@ -200,11 +259,14 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae)
 cmd/magic-agent/main.go     入口
 internal/cli/               cobra 命令层（无子命令、参数校验、退出码）
 internal/agent/
-  engine.go                 Engine 接口 + Request/Response + 注册表
+  engine.go                 Engine 接口 + Request/Response + 注册表（含 llm）
   prompt.go                 多轮消息扁平化 + noToolSuffix 约束
   claude.go                 Claude Code 引擎
   codebuddy.go              CodeBuddy 引擎（envelope 多形态解析 + 回显剥离）
   trae.go                   Trae 引擎（模型覆盖 + query-timeout 映射）
+  models.go                 models.json 加载 + 模型解析（兼容 magic-video 形状）
+  openai_client.go          OpenAI 兼容 HTTP 客户端（extraBody 透传、思维链剥离）
+  llmengine.go              llm 引擎：按 api 路由到 HTTP / ollama / 委托 CLI 引擎
   runner.go                 超时 + 重试编排（错误分类、指数退避、可取消）
   runcmd.go                 进程组感知执行（平台无关调度）
   runcmd_unix.go            Setpgid + kill(-pgid)（darwin/linux）
@@ -219,13 +281,20 @@ npm/
 tests/                      （预留）跨包集成测试
 ```
 
-测试：`go test ./...`（fake CLI 脚本，不依赖真实安装；真实引擎冒烟见下方）。
+测试：`go test ./...`（fake CLI 脚本 + httptest server，不依赖真实安装；真实引擎冒烟见下方）。
 
 ## 已验证（2026-09-15，本机）
 
 - claude 引擎：真实调用成功（text + json + stdin 管道）
 - trae 引擎：真实调用成功（默认模型 + query-timeout 映射）
 - codebuddy 引擎：CLI 探测/参数构造正确；本环境该 CLI 单次调用 20 分钟不返回（与 magic-video 时代一致），超时 + 进程组清理验证通过（超时后 0 残留进程）
+- **llm 引擎**（真实调用）：
+  - HTTP 路由：`-m minimax-nothink/MiniMax-M3` → `{"engine":"llm",...,"text":"你好"}`，约 1s 返回
+  - 裸模型名 `-m MiniMax-M3` → 正确命中（忽略大小写，回填规范大小写）
+  - 默认模型（不给 `-m`）→ 走 `default`；兼容 magic-video 形状时回退 `llm.textModels[0]`
+  - ollama 路由：`-m local/qwen2.5:0.5b` → 本地模型正常返回
+  - 委托路由：`-m codebuddy/hy3` → 错误信息同时点明 provider 与被委托引擎
+  - 错误 envelope：`reason` 为根因摘要，含可用模型清单与配置路径
 - npm 分发：5 平台交叉编译通过；全局 `npm install -g ./magic-agent-0.1.0.tgz` 后 `magic-agent` 可直接调用；stdin 管道、json 输出、退出码 0/1/2、超时杀进程组均验证通过（`go test ./...` 全绿）
 
 ## 平台支持

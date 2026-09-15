@@ -162,6 +162,7 @@ func initEngines() {
 	Register(&ClaudeEngine{})
 	Register(&CodeBuddyEngine{})
 	Register(&TraeEngine{})
+	Register(&LLMEngine{})
 }
 
 // toolsOrDefault nil ToolsMode 视为 ToolsOff。

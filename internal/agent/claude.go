@@ -99,29 +99,7 @@ func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, err
 		return Response{}, fmt.Errorf("claude: empty prompt")
 	}
 
-	// 工具模式映射：
-	//	off        --tools ""
-	//	on         不传 --tools（引擎默认全工具）+ --dangerously-skip-permissions
-	//	allowlist  --tools <names> + --dangerously-skip-permissions
-	tools := toolsOrDefault(req.Tools)
-	args := []string{"-p", "--output-format", "json", "--no-session-persistence"}
-	switch {
-	case tools.IsOff():
-		args = append(args, "--tools", "")
-	case tools.IsOn():
-		args = append(args, "--dangerously-skip-permissions")
-	default: // allowlist
-		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "--dangerously-skip-permissions")
-	}
-	if m := stripModelPrefix(req.Model); m != "" {
-		args = append(args, "--model", m)
-	} else {
-		args = append(args, "--model", DefaultClaudeModel)
-	}
-	if req.SystemPrompt != "" {
-		args = append(args, "--append-system-prompt", req.SystemPrompt)
-	}
-	args = append(args, prompt)
+	args := e.buildArgs(req, prompt)
 
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
@@ -153,6 +131,108 @@ func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, err
 		Model:     env.Model,
 		SessionID: env.SessionID,
 		Latency:   time.Since(start),
+	}, nil
+}
+
+// buildArgs 构造 claude CLI 参数（Complete 与 Stream 共用）。
+// outputFormat："json"（单结果 envelope）或 "stream-json"（流式 NDJSON）。
+func (e *ClaudeEngine) buildArgs(req Request, prompt string) []string {
+	// 工具模式映射：
+	//	off        --tools ""
+	//	on         不传 --tools（引擎默认全工具）+ --dangerously-skip-permissions
+	//	allowlist  --tools <names> + --dangerously-skip-permissions
+	tools := toolsOrDefault(req.Tools)
+	args := []string{"-p", "--output-format", "json", "--no-session-persistence"}
+	switch {
+	case tools.IsOff():
+		args = append(args, "--tools", "")
+	case tools.IsOn():
+		args = append(args, "--dangerously-skip-permissions")
+	default: // allowlist
+		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "--dangerously-skip-permissions")
+	}
+	if m := stripModelPrefix(req.Model); m != "" {
+		args = append(args, "--model", m)
+	} else {
+		args = append(args, "--model", DefaultClaudeModel)
+	}
+	if req.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", req.SystemPrompt)
+	}
+	args = append(args, prompt)
+	return args
+}
+
+// Stream 实现 Streamer：流式调用 claude CLI（stream-json NDJSON）。
+func (e *ClaudeEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	start := time.Now()
+	bin := e.bin()
+	if bin == "" {
+		return StreamResult{}, fmt.Errorf("claude CLI not found; set MAGIC_AGENT_CLAUDE_BIN")
+	}
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
+	if prompt == "" {
+		return StreamResult{}, fmt.Errorf("claude: empty prompt")
+	}
+
+	args := e.buildArgs(req, prompt)
+	// json → stream-json：替换 --output-format 值并追加流式 flags。
+	for i := range args {
+		if args[i] == "--output-format" {
+			args[i+1] = "stream-json"
+			break
+		}
+	}
+	args = append(args, "--include-partial-messages", "--verbose")
+
+	acc := &streamAccumulator{OnEvent: onEvent}
+	var fin struct {
+		Type      string `json:"type"`
+		Subtype   string `json:"subtype"`
+		IsError   bool   `json:"is_error"`
+		Result    string `json:"result"`
+		SessionID string `json:"session_id"`
+		Model     string `json:"model"`
+	}
+	seenResult := false
+
+	err := runStreamCLI(ctx, bin, args, func(line string) error {
+		isResult, perr := acc.handleNDJSONLine(line)
+		if perr != nil {
+			return perr
+		}
+		if isResult {
+			_ = json.Unmarshal([]byte(line), &fin)
+			seenResult = true
+		}
+		return nil
+	})
+	if err != nil {
+		return StreamResult{}, err
+	}
+	if !seenResult {
+		return StreamResult{}, fmt.Errorf("claude CLI stream ended without result line")
+	}
+	if fin.IsError {
+		return StreamResult{}, fmt.Errorf("claude CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
+	}
+
+	text := fin.Result
+	if text == "" {
+		text = strings.TrimSpace(acc.Text.String())
+	}
+	if text == "" {
+		return StreamResult{}, fmt.Errorf("claude CLI returned empty result")
+	}
+	return StreamResult{
+		Response: Response{
+			Engine:    e.Name(),
+			Text:      text,
+			Model:     fin.Model,
+			SessionID: fin.SessionID,
+			Latency:   time.Since(start),
+		},
+		Thinking: acc.Thinking.String(),
 	}, nil
 }
 
