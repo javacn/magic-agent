@@ -310,13 +310,19 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae, llm)
 
 | `--tools` | CLI 参数（codebuddy） | noToolSuffix | 效果 |
 |---|---|---|---|
-| `off`（默认） | `--tools ""` | 注入 | 纯 chat，模型不调工具；后缀额外压制「伪工具调用」 |
+| `off`（默认） | `--tools ""` | 注入 | 纯 chat，模型不调工具；后缀额外压制「伪工具调用」与「伪造工具返回」 |
 | `on` | `-y` | 不注入 | 全工具可用（含 `WebSearch` / `WebFetch`） |
 | `WebSearch,WebFetch` | `--tools WebSearch,WebFetch -y` | 不注入 | 仅白名单工具可用 |
 
 > ⚠️ `noToolSuffix` 明文写着「严禁使用任何工具」。它**只在 `off` 模式注入** ——
 > 若在 `on`/白名单下也注入，就会出现「CLI 侧工具已开、system prompt 却在
 > 压制调用」的自相矛盾，表现为**启用了工具却没有网络搜索**。
+
+`noToolSuffix` 里的约束分两层，缺一不可：
+
+1. **严禁调用工具** —— 否则 off 模式下模型会输出 `<tool_calls:xxxx>` 假标签。
+2. **严禁伪造工具返回** —— 否则被要求「输出工具抓到的内容」时，模型会凭空
+   编造一份看似真实的返回体（实测约 1/6，见下）。仅禁「调用」堵不住编造。
 
 实测（2026-09-15，本机 codebuddy 2.137.1）：
 
@@ -325,6 +331,21 @@ magic-agent -e codebuddy --tools on -o text "用 WebSearch 查今天的日期"  
 magic-agent -e codebuddy --tools WebSearch -o text "用 WebSearch 查今天日期" # ✅
 magic-agent -e codebuddy --tools off -o text "用 WebSearch 查今天的日期"     # 返回 NO_TOOLS（符合预期）
 ```
+
+**硬证据（非模型自述）**：让 `WebFetch` 抓取 `https://httpbin.org/anything?proof=<随机 nonce>`，
+然后解析 CLI 的 `--output-format json` 原始消息数组：
+
+- 出现 `type=="function_call"`（name=`WebFetch`）+ `type=="function_call_result"`（status=`completed`）；
+- 该随机 nonce（模型不可能预知）出现在 **`function_call_result.output`** 里。
+
+满足这两条即证明发生了**真实网络请求**，而非模型编造。
+
+**off 模式防伪造效果**（`--tools off`，重复 8 次）：
+
+| | 编造返回体 | 结果 |
+|---|---|---|
+| 加固前 | 1/6 | 一次输出伪造的 httpbin JSON |
+| 加固后 | 0/8 | 7 次 `NO_TOOLS`，1 次明确拒绝 |
 
 ## 在 WorkBuddy / CodeBuddy 会话内使用（重要）
 

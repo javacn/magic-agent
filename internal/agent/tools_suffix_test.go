@@ -143,3 +143,30 @@ func TestToolsIsOffDefaultsToOff(t *testing.T) {
 		t.Error("白名单不应判定为 off")
 	}
 }
+
+// noToolSuffix 必须显式禁止「伪造工具返回」。
+//
+// 背景：off 模式下模型被要求「输出工具抓到的内容」时会编造返回体
+// （实测约 1/6），仅禁「调用工具」堵不住，必须有一条明文禁止伪造。
+func TestNoToolSuffixForbidsFabricatedToolOutput(t *testing.T) {
+	if !strings.Contains(noToolSuffix, "伪造工具返回") {
+		t.Errorf("noToolSuffix 缺少「禁止伪造工具返回」约束: %q", noToolSuffix)
+	}
+	// 该约束要能经 FlattenPrompt 落到 system prompt 里。
+	got := FlattenPrompt("你是助手", nil, true)
+	if !strings.Contains(got, "伪造工具返回") {
+		t.Errorf("伪造工具返回约束未进入 prompt: %q", got)
+	}
+	// 且 off 模式下 codebuddy 参数里能看到。
+	cli, argsOf := argLogger(t)
+	e := &CodeBuddyEngine{BinPath: cli}
+	if _, err := e.Complete(context.Background(), Request{
+		Tools:    ToolsOff,
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !strings.Contains(argsOf(), "伪造工具返回") {
+		t.Errorf("codebuddy off 模式 args 未带伪造约束: %q", argsOf())
+	}
+}
