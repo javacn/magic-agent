@@ -18,8 +18,12 @@ package agent
 //
 // CLI 调用形式（两种模式共用 buildArgs）：
 //
-//	Complete: llm prompt -n --no-stream [-m MODEL] [-s SYSTEM] PROMPT
-//	Stream:   llm prompt -n            [-m MODEL] [-s SYSTEM] PROMPT
+//	Complete: llm prompt -n --no-stream --json [-m MODEL] [-s SYSTEM] \
+//	          [-o max_tokens N] [-o temperature T] PROMPT
+//	Stream:   llm prompt -n            [-m MODEL] [-s SYSTEM] \
+//	          [-o max_tokens N] [-o temperature T] PROMPT
+//
+// Complete 额外带 --json：同时拿正文与 token 计数（见下方 parseLLMJSONEntry）。
 //
 // 流式输出是**纯文本 stdout**（非 NDJSON）。MiniMax 等推理模型会把思维链
 // 以标签形式直接混在正文里；本引擎用 thinkSplitter 状态机把标签块路由到
@@ -31,9 +35,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -104,6 +110,14 @@ func (e *LLMEngine) Detect() (bool, string) {
 
 // buildArgs 构造 llm prompt 参数（Complete 与 Stream 共用）。
 // Complete 模式额外追加 --no-stream。
+//
+// 模型选项经 simonw llm 的 `-o key value` 透传：
+//
+//	--max-tokens N   → -o max_tokens N
+//	--temperature T  → -o temperature T
+//
+// 具体选项名由模型插件决定；未注册该选项时 llm 会报错，属于调用方
+// 传错参数，不在这里静默吞掉。
 func (e *LLMEngine) buildArgs(req Request, prompt string) []string {
 	args := []string{"prompt", "-n"}
 	if m := stripModelPrefix(req.Model); m != "" {
@@ -112,10 +126,50 @@ func (e *LLMEngine) buildArgs(req Request, prompt string) []string {
 	if req.SystemPrompt != "" {
 		args = append(args, "-s", req.SystemPrompt)
 	}
+	if req.MaxTokens > 0 {
+		args = append(args, "-o", "max_tokens", strconv.Itoa(req.MaxTokens))
+	}
+	if req.Temperature != nil {
+		args = append(args, "-o", "temperature", formatTemperature(*req.Temperature))
+	}
 	return append(args, prompt)
 }
 
-// Complete 实现 Engine：llm prompt --no-stream，一次性拿全文。
+// formatTemperature 把温度格式化为最短十进制表示（去掉多余的尾零）。
+func formatTemperature(t float64) string {
+	return strconv.FormatFloat(t, 'f', -1, 64)
+}
+
+// encodeJSONSchemaInline 把 JSONSchema 序列化成给 simonw llm 的
+// `--schema` 接受的 JSON Schema DSL。
+//
+// simonw llm 的 --schema 既支持 DSL（如 "name str, age int, bio: 简介"）
+// 也支持完整 JSON Schema。我们直接传 JSON Schema 字符串，让 llm 解析。
+func encodeJSONSchemaInline(s *JSONSchema) (string, bool) {
+	if s == nil || !strings.EqualFold(s.Type, "object") {
+		return "", false
+	}
+	// 顶层仅保留 type / properties / required 三键，剔除冗余字段。
+	doc := map[string]any{
+		"type":       "object",
+		"properties": s.Properties,
+	}
+	if len(s.Required) > 0 {
+		doc["required"] = s.Required
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// Complete 实现 Engine：llm prompt --json --no-stream，一次性拿全文 + token 计数。
+//
+// 为什么加 --json：纯文本模式下 llm 不吐 token 数，上游（如 magic-video）
+// 靠 output_tokens 判断「输出撞了 max_tokens 上限、正文可能被截断」。
+// --json 输出同 `llm logs --json` 的结构（数组，每项含 response /
+// input_tokens / output_tokens），解析失败时退回纯文本路径，不引入新的失败点。
 func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
 	bin := e.bin()
@@ -128,7 +182,14 @@ func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error)
 		return Response{}, fmt.Errorf("llm: empty prompt")
 	}
 
-	args := append(e.buildArgs(req, prompt), "--no-stream")
+	args := append(e.buildArgs(req, prompt), "--no-stream", "--json")
+	// 注意：simonw llm CLI 不为 OpenAI Chat 类模型提供原生 schema 约束
+	//（实测 minimax-m3 报 "does not support schemas"）。所以 magic-agent
+	// **不在 CLI 层透传** schema —— 上游（magic-video）已经渲染进
+	// system prompt 作为提示词约束，llm 引擎这里只做 response 后处理
+	//（见下方 extractJSONObjectStrict）。其他引擎（codebuddy）有自己的
+	// --json-schema flag，由 magic-agent 各自的 Complete 实现处理。
+	_ = req.JSONSchema
 	stdout, stderr, err := runCLI(ctx, bin, args...)
 	if err != nil {
 		return Response{}, wrapCliError("llm", stdout, stderr, err)
@@ -139,9 +200,38 @@ func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error)
 		return Response{}, fmt.Errorf("llm CLI returned empty output")
 	}
 
+	if entry, ok := parseLLMJSONEntry(raw); ok {
+		text, _ := splitThinkingTags(entry.Response)
+		if strings.TrimSpace(text) == "" {
+			// 全是思维链、无正文：原样返回（可能模型把答案写在思维链里）。
+			text = entry.Response
+		}
+		// schema 严格匹配后处理：把 model 字符串化的 JSON 对象压平为
+		// 紧凑串，便于上游 json.Unmarshal 一次成功。
+		if req.JSONSchema != nil {
+			if extracted, ok := extractJSONObjectStrict(text, req.JSONSchema); ok {
+				text = extracted
+			}
+		}
+		model := entry.Model
+		if model == "" {
+			model = stripModelPrefix(req.Model)
+		}
+		total := entry.InputTokens + entry.OutputTokens
+		return Response{
+			Engine:       e.Name(),
+			Text:         strings.TrimSpace(text),
+			Model:        model,
+			Latency:      time.Since(start),
+			InputTokens:  entry.InputTokens,
+			OutputTokens: entry.OutputTokens,
+			TotalTokens:  total,
+		}, nil
+	}
+
+	// 兜底：--json 解析不出来（llm 版本差异 / 输出被污染）时按纯文本处理。
 	text, _ := splitThinkingTags(raw)
 	if strings.TrimSpace(text) == "" {
-		// 全是思维链、无正文：原样返回（可能模型把答案写在思维链里）。
 		text = raw
 	}
 	return Response{
@@ -150,6 +240,32 @@ func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error)
 		Model:   stripModelPrefix(req.Model),
 		Latency: time.Since(start),
 	}, nil
+}
+
+// llmJSONEntry 是 `llm prompt --json` 数组里一项的所需子集。
+type llmJSONEntry struct {
+	Model        string `json:"model"`
+	Response     string `json:"response"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+}
+
+// parseLLMJSONEntry 解析 `llm prompt --json` 输出，取最后一项有正文的条目。
+//
+// 单次 prompt 通常只有一项；带工具链（tools chain）时会有多项，最终答复
+// 在最后一项，所以从后往前找第一个 response 非空的。
+// 输出不是 JSON 数组时返回 ok=false，调用方走纯文本兜底。
+func parseLLMJSONEntry(raw string) (llmJSONEntry, bool) {
+	var entries []llmJSONEntry
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return llmJSONEntry{}, false
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if strings.TrimSpace(entries[i].Response) != "" {
+			return entries[i], true
+		}
+	}
+	return llmJSONEntry{}, false
 }
 
 // Stream 实现 Streamer：llm prompt 默认流式，逐行读纯文本 stdout，

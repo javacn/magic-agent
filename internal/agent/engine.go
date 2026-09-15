@@ -121,9 +121,9 @@ type Request struct {
 // 故意保持极简：只覆盖本项目实际用到（type=object + 顶层 Required）。
 // 需要更多字段时再按需扩展。
 type JSONSchema struct {
-	Type       string         // "object"
-	Properties map[string]any // field name -> 描述字典（不深解析）
-	Required   []string       // 顶层必填字段名
+	Type       string                    // "object"
+	Properties map[string]map[string]any // field name -> 字段描述 {type, ...}
+	Required   []string                  // 顶层必填字段名
 }
 
 // Response 是一次成功调用的结果。

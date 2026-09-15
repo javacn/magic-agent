@@ -53,6 +53,10 @@ type JSONResult struct {
 	Attempts  int    `json:"attempts"`
 	LatencyMS int64  `json:"latency_ms"`
 	Text      string `json:"text"`
+	// token 计数（尽力而为，引擎不上报时省略）。
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
+	TotalTokens  int `json:"total_tokens,omitempty"`
 }
 
 // JSONError json 失败 envelope。
@@ -133,12 +137,15 @@ func reasonOf(err error) string {
 func WriteOutput(w io.Writer, format OutputFormat, resp Response) error {
 	if format == FormatJSON {
 		out := JSONResult{
-			Engine:    resp.Engine,
-			Model:     resp.Model,
-			SessionID: resp.SessionID,
-			Attempts:  resp.Attempts,
-			LatencyMS: resp.Latency.Milliseconds(),
-			Text:      resp.Text,
+			Engine:       resp.Engine,
+			Model:        resp.Model,
+			SessionID:    resp.SessionID,
+			Attempts:     resp.Attempts,
+			LatencyMS:    resp.Latency.Milliseconds(),
+			Text:         resp.Text,
+			InputTokens:  resp.InputTokens,
+			OutputTokens: resp.OutputTokens,
+			TotalTokens:  resp.TotalTokens,
 		}
 		data, err := json.Marshal(out)
 		if err != nil {

@@ -77,9 +77,12 @@ func (s *streamingEngine) Stream(ctx context.Context, req agent.Request, onEvent
 
 // capturingEngine 捕获收到的 prompt 与 tools 模式，供组合输入断言。
 type capturingEngine struct {
-	name       string
-	lastPrompt string
-	lastTools  agent.ToolsMode
+	name         string
+	lastPrompt   string
+	lastTools    agent.ToolsMode
+	lastSchema   *agent.JSONSchema
+	lastMaxTok   int
+	lastTemp     *float64
 }
 
 func (c *capturingEngine) Name() string           { return c.name }
@@ -89,6 +92,9 @@ func (c *capturingEngine) Complete(ctx context.Context, req agent.Request) (agen
 		c.lastPrompt = req.Messages[len(req.Messages)-1].Content
 	}
 	c.lastTools = req.Tools
+	c.lastSchema = req.JSONSchema
+	c.lastMaxTok = req.MaxTokens
+	c.lastTemp = req.Temperature
 	return agent.Response{Text: "captured", Model: "fake-model", Latency: 1_000_000}, nil
 }
 
@@ -347,6 +353,61 @@ func TestAskEmptyPrompt(t *testing.T) {
 	}
 	if _, ok := err.(*usageError); !ok {
 		t.Errorf("error should be usageError, got %T", err)
+	}
+}
+
+// --json-schema 解析 + 透传到 Request.JSONSchema。
+func TestJSONSchemaPassesThrough(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-schema"}
+	registerFake(capEng)
+
+	schema := `{"type":"object","properties":{"score":{"type":"integer"}},"required":["score","issues"]}`
+	_, _, err := runAskCmd(t, "", "-e", "fake-schema", "--json-schema", schema, "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastSchema == nil {
+		t.Fatal("lastSchema is nil")
+	}
+	if !strings.EqualFold(capEng.lastSchema.Type, "object") {
+		t.Errorf("Type = %q", capEng.lastSchema.Type)
+	}
+	if len(capEng.lastSchema.Required) != 2 ||
+		capEng.lastSchema.Required[0] != "score" || capEng.lastSchema.Required[1] != "issues" {
+		t.Errorf("Required = %v", capEng.lastSchema.Required)
+	}
+}
+
+// --json-schema 非合法 JSON → usage 错误。
+func TestJSONSchemaRejectsBadJSON(t *testing.T) {
+	_, _, err := runAskCmd(t, "", "-e", "claude", "--json-schema", "not json", "hi")
+	if _, ok := err.(*usageError); !ok {
+		t.Errorf("expected usageError, got %T: %v", err, err)
+	}
+}
+
+// --json-schema type!=object → 拒绝。
+func TestJSONSchemaRejectsNonObject(t *testing.T) {
+	_, _, err := runAskCmd(t, "", "-e", "claude", "--json-schema", `{"type":"array","items":{"type":"string"}}`, "hi")
+	if _, ok := err.(*usageError); !ok {
+		t.Errorf("expected usageError, got %T: %v", err, err)
+	}
+}
+
+// --max-tokens / --temperature 透传到 Request。
+func TestModelOptionsPassThrough(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-opts"}
+	registerFake(capEng)
+
+	_, _, err := runAskCmd(t, "", "-e", "fake-opts", "--max-tokens", "32000", "--temperature", "0.3", "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastMaxTok != 32000 {
+		t.Errorf("MaxTokens = %d want 32000", capEng.lastMaxTok)
+	}
+	if capEng.lastTemp == nil || *capEng.lastTemp != 0.3 {
+		t.Errorf("Temperature = %v want 0.3", capEng.lastTemp)
 	}
 }
 

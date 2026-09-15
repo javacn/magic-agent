@@ -13,6 +13,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +46,77 @@ func TestLLMBuildArgs(t *testing.T) {
 	want = []string{"prompt", "-n", "hi"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+}
+
+// TestLLMBuildArgsModelOptions 模型选项经 -o 透传：
+//
+//	MaxTokens > 0      → -o max_tokens N
+//	Temperature != nil → -o temperature T
+//
+// 缺省（0 / nil）时两个都不出现，避免给模型塞无意义的默认值。
+func TestLLMBuildArgsModelOptions(t *testing.T) {
+	e := &LLMEngine{}
+
+	// 两个都给
+	temp := 0.3
+	got := e.buildArgs(Request{Model: "minimax-m3", MaxTokens: 32000, Temperature: &temp}, "写一集")
+	want := []string{"prompt", "-n", "-m", "minimax-m3", "-o", "max_tokens", "32000", "-o", "temperature", "0.3", "写一集"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 只给 max-tokens
+	got = e.buildArgs(Request{MaxTokens: 8000}, "hi")
+	want = []string{"prompt", "-n", "-o", "max_tokens", "8000", "hi"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 整数温度不留 ".0" 尾巴；0 是合法温度（必须出现）
+	zero := 0.0
+	got = e.buildArgs(Request{Temperature: &zero}, "hi")
+	want = []string{"prompt", "-n", "-o", "temperature", "0", "hi"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q (温度 0 必须透传)", got, want)
+	}
+
+	// 都不给
+	got = e.buildArgs(Request{Model: "minimax-m3"}, "hi")
+	for _, a := range got {
+		if a == "-o" {
+			t.Errorf("buildArgs = %q, want no -o when unset", got)
+		}
+	}
+}
+
+// TestLLMCompletePassesModelOptions --max-tokens / --temperature 真的落到命令行。
+func TestLLMCompletePassesModelOptions(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.log")
+	cli := filepath.Join(dir, "llm")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + log + "\necho 'ok'\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &LLMEngine{BinPath: cli}
+
+	temp := 0.3
+	_, err := e.Complete(context.Background(), Request{
+		Model:       "minimax-m3",
+		MaxTokens:   32000,
+		Temperature: &temp,
+		Messages:    []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	data, _ := os.ReadFile(log)
+	args := string(data)
+	for _, want := range []string{"-o max_tokens 32000", "-o temperature 0.3"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("%q missing in args: %q", want, args)
+		}
 	}
 }
 
@@ -251,6 +323,188 @@ func TestLLMStreamPlainText(t *testing.T) {
 		if ev.Kind != KindText {
 			t.Errorf("all events should be text, got %v", ev.Kind)
 		}
+	}
+}
+
+// TestLLMCompleteParsesJSONUsage --json 路径：正文取自 response（思维链已剥离），
+// token 计数从 input_tokens / output_tokens 读出，model 用 llm 回报的实际模型名。
+func TestLLMCompleteParsesJSONUsage(t *testing.T) {
+	open := llmTag("<", "think", ">")
+	closeTag := llmTag("<", "/", "think", ">")
+	payload := `[{"model":"minimax-m3","input_tokens":192,"output_tokens":38,"response":"` +
+		open + `想一下` + closeTag + `\n\n收到"}]`
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+payload+"\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
+	resp, err := e.Complete(context.Background(), Request{
+		Model:    "llm/minimax-m3",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.Text != "收到" {
+		t.Errorf("Text = %q, want 收到（思维链应被剥离）", resp.Text)
+	}
+	if resp.InputTokens != 192 || resp.OutputTokens != 38 {
+		t.Errorf("tokens = in:%d out:%d, want in:192 out:38", resp.InputTokens, resp.OutputTokens)
+	}
+	if resp.TotalTokens != 230 {
+		t.Errorf("TotalTokens = %d, want 230", resp.TotalTokens)
+	}
+	// llm 回报的 model 优先于请求里的 "llm/minimax-m3"（前缀已剥）。
+	if resp.Model != "minimax-m3" {
+		t.Errorf("Model = %q, want minimax-m3", resp.Model)
+	}
+}
+
+// TestLLMCompleteJSONPicksLastEntry 工具链场景：数组多项时取最后一项的正文。
+func TestLLMCompleteJSONPicksLastEntry(t *testing.T) {
+	payload := `[{"model":"m","response":"中间结果","input_tokens":10,"output_tokens":1},` +
+		`{"model":"m","response":"最终答复","input_tokens":20,"output_tokens":2}]`
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+payload+"\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
+	resp, err := e.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.Text != "最终答复" {
+		t.Errorf("Text = %q, want 最终答复", resp.Text)
+	}
+	if resp.InputTokens != 20 {
+		t.Errorf("InputTokens = %d, want 20（取最终项）", resp.InputTokens)
+	}
+}
+
+// TestParseLLMJSONEntryNonJSON 非 JSON 输出 → ok=false（走纯文本兜底）。
+func TestParseLLMJSONEntryNonJSON(t *testing.T) {
+	if _, ok := parseLLMJSONEntry("就是一段纯文本"); ok {
+		t.Error("plain text should not parse as JSON entry")
+	}
+	if _, ok := parseLLMJSONEntry(`{"response":"对象不是数组"}`); ok {
+		t.Error("JSON object should not parse as entry array")
+	}
+	if _, ok := parseLLMJSONEntry(`[{"model":"m","response":"   "}]`); ok {
+		t.Error("entry with blank response should be skipped")
+	}
+}
+
+// TestLLMCompleteDoesNotPassSchemaToCLI magic-agent 收到 JSONSchema 时**不传**
+// 给 simonw llm CLI（实测 minimax-m3 等 OpenAI Chat 类模型不支持 schema，
+// 会报 "does not support schemas"）。schema 走 system prompt 提示词约束，
+// 引擎里只做 response 后处理（extractJSONObjectStrict）。
+func TestLLMCompleteDoesNotPassSchemaToCLI(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.log")
+	cli := filepath.Join(dir, "llm")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + log + "\nprintf '%s\\n' '[{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":2,\"response\":\"ok\"}]'\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &LLMEngine{BinPath: cli}
+	if _, err := e.Complete(context.Background(), Request{
+		Model:    "minimax-m3",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		JSONSchema: &JSONSchema{
+			Type:     "object",
+			Required: []string{"score"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(log)
+	args := string(data)
+	if strings.Contains(args, "--schema ") {
+		t.Errorf("--schema should NOT be passed to llm CLI (would fail on OpenAI Chat models): %q", args)
+	}
+}
+
+// TestLLMBuildArgsOmitsSchemaWhenUnset 没 JSONSchema 时不带 --schema。
+func TestLLMBuildArgsOmitsSchemaWhenUnset(t *testing.T) {
+	e := &LLMEngine{}
+	got := e.buildArgs(Request{Model: "minimax-m3"}, "hi")
+	for _, a := range got {
+		if a == "--schema" {
+			t.Errorf("--schema should not appear when JSONSchema unset: %q", got)
+		}
+	}
+}
+
+// TestLLMCompleteAppliesJSONSchema 当请求带 JSONSchema 且模型把对象字符串化在
+// response 里时，Complete 路径应把它解析回紧凑 JSON。
+//
+// 模拟真实场景：llm CLI 返回 <response> 字段是「字符串化的 JSON」，
+// 而非已经 parse 好的对象。这是 OpenAI chat/completions 端点的常见形态。
+func TestLLMCompleteAppliesJSONSchema(t *testing.T) {
+	// 用 string 模型构造 envelope，response 是被 json.Marshal 后的对象。
+	obj := map[string]any{
+		"setting": 12, "character": 13, "pacing": 14,
+		"hook": 15, "prose": 12, "density": 13, "style": 12,
+		"issues":      []string{"意象重复"},
+		"suggestions": []string{"替换具体细节"},
+	}
+	objJSON, _ := json.Marshal(obj)
+	payload, _ := json.Marshal([]map[string]any{{
+		"model":        "minimax-m3",
+		"input_tokens": 100,
+		"output_tokens": len(objJSON),
+		"response":     string(objJSON), // ← 这里是「字符串化的 JSON」
+	}})
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+string(payload)+"\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
+	resp, err := e.Complete(context.Background(), Request{
+		Model:    "llm/minimax-m3",
+		Messages: []Message{{Role: "user", Content: "打分"}},
+		JSONSchema: &JSONSchema{
+			Type:     "object",
+			Required: []string{"setting", "character", "pacing", "issues", "suggestions"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	// resp.Text 必须是合法 JSON 字符串，且 Required 顶层字段都在
+	var back map[string]any
+	if err := json.Unmarshal([]byte(resp.Text), &back); err != nil {
+		t.Fatalf("Text not valid JSON: %v (got=%q)", err, resp.Text)
+	}
+	for _, k := range []string{"setting", "issues", "suggestions"} {
+		if _, ok := back[k]; !ok {
+			t.Errorf("missing %q in extracted: %s", k, resp.Text)
+		}
+	}
+	// 紧凑化：不能带多余空白
+	if strings.Contains(resp.Text, "\n") || strings.Contains(resp.Text, "  ") {
+		t.Errorf("extracted JSON should be compact: %q", resp.Text)
+	}
+}
+
+// TestLLMCompleteMissingRequiredKeepsRaw 当 model 输出缺 Required 字段时，
+// 不改写 Response.Text，让上游 base/score 的宽松解析兜底。
+func TestLLMCompleteMissingRequiredKeepsRaw(t *testing.T) {
+	// 注意：payload 的 response 字段直接是 JSON 字符串（这是 llm CLI
+	// 真实行为），所以不需要再次 json.Marshal。
+	payload := `[{"model":"m","input_tokens":1,"output_tokens":2,"response":"{\"setting\":12,\"character\":13}"}]`
+	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+payload+"\nEOF\n")
+	e := &LLMEngine{BinPath: cli}
+
+	resp, err := e.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "打分"}},
+		JSONSchema: &JSONSchema{
+			Type:     "object",
+			Required: []string{"setting", "hook"}, // hook 缺失
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	// Text 保留原始字符串（带原始字段，未经过 extract 改写）
+	if !strings.Contains(resp.Text, `"character":13`) {
+		t.Errorf("Text should keep raw content, got %q", resp.Text)
 	}
 }
 

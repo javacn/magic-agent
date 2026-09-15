@@ -31,21 +31,25 @@ import (
 
 // askOptions 根命令的全部参数。
 type askOptions struct {
-	engine     string
-	model      string
-	system     string
-	prompt     string
-	file       string
-	tools      string
-	timeout    time.Duration
-	retries    int
-	backoff    time.Duration
-	output     string
-	verbose    bool
-	engines    bool
-	jsonOut    bool
-	stream     bool
-	noThinking bool
+	engine      string
+	model       string
+	system      string
+	prompt      string
+	file        string
+	tools       string
+	timeout     time.Duration
+	retries     int
+	backoff     time.Duration
+	output      string
+	verbose     bool
+	engines     bool
+	jsonOut     bool
+	stream      bool
+	noThinking  bool
+	maxTokens   int
+	temperature float64
+	tempSet     bool
+	jsonSchema  string // 内联 JSON Schema（仅 llm 引擎走 --schema）
 }
 
 // newAskOptions 返回带默认值的选项集。
@@ -64,11 +68,14 @@ func newAskOptions() *askOptions {
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
 	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm（默认 codebuddy）")
-	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎按 models.json 的 id 指定）")
+	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎传 llm CLI 注册名，如 minimax-m3）")
 	f.StringVarP(&opts.system, "system", "s", "", "系统提示词")
 	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
 	f.StringVar(&opts.tools, "tools", "off", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)")
+	f.IntVar(&opts.maxTokens, "max-tokens", 0, "输出 token 上限（0=不指定；仅 llm 引擎透传，其余引擎忽略）")
+	f.Float64Var(&opts.temperature, "temperature", -1, "采样温度（-1=不指定；仅 llm 引擎透传，其余引擎忽略）")
+	f.StringVar(&opts.jsonSchema, "json-schema", "", "JSON Schema 内联字符串（仅 llm 引擎；启用结构化输出与 JSON 后处理）")
 	f.DurationVarP(&opts.timeout, "timeout", "t", 600*time.Second, "单次尝试超时（默认 600s=10m）")
 	f.IntVarP(&opts.retries, "retries", "r", 0, "失败重试次数（默认 0）")
 	f.DurationVar(&opts.backoff, "backoff", 2*time.Second, "首次重试退避间隔（指数翻倍，上限 30s）")
@@ -265,6 +272,12 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 	if opts.retries < 0 {
 		return nil, "", agent.Request{}, &usageError{fmt.Errorf("--retries must be >= 0, got %d", opts.retries)}
 	}
+	if opts.maxTokens < 0 {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("--max-tokens must be >= 0, got %d", opts.maxTokens)}
+	}
+	if opts.temperature < -1 {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("--temperature must be >= 0 or omitted, got %v", opts.temperature)}
+	}
 	toolsMode, err := parseToolsMode(opts.tools)
 	if err != nil {
 		return nil, "", agent.Request{}, err
@@ -295,11 +308,53 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 		Model:        opts.model,
 		SystemPrompt: opts.system,
 		Tools:        toolsMode,
+		MaxTokens:    opts.maxTokens,
 		Messages: []agent.Message{
 			{Role: "user", Content: prompt},
 		},
 	}
+	if opts.temperature >= 0 {
+		t := opts.temperature
+		req.Temperature = &t
+	}
+	if s := strings.TrimSpace(opts.jsonSchema); s != "" {
+		schema, err := parseJSONSchemaInline(s)
+		if err != nil {
+			return nil, "", agent.Request{}, &usageError{fmt.Errorf("--json-schema: %w", err)}
+		}
+		req.JSONSchema = schema
+	}
 	return engine, format, req, nil
+}
+
+// parseJSONSchemaInline 把 --json-schema 字符串解析成 agent.JSONSchema。
+//
+// 支持的形态（按宽松顺序）：
+//
+//	1) 完整 JSON Schema 对象：{"type":"object","properties":{...},"required":[...]}
+//	2) 已经预解析的 JSON（任意合法 JSON Schema 顶层对象）
+//
+// 仅当 type=="object" 时返回；其他顶层 type 一律视为不适用并报错。
+func parseJSONSchemaInline(s string) (*agent.JSONSchema, error) {
+	var raw struct {
+		Type       string                    `json:"type"`
+		Properties map[string]map[string]any `json:"properties"`
+		Required   []string                  `json:"required"`
+	}
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if !strings.EqualFold(raw.Type, "object") {
+		return nil, fmt.Errorf("only type=object supported (got %q)", raw.Type)
+	}
+	if len(raw.Required) == 0 && len(raw.Properties) == 0 {
+		return nil, fmt.Errorf("schema must declare at least properties or required")
+	}
+	return &agent.JSONSchema{
+		Type:       "object",
+		Properties: raw.Properties,
+		Required:   raw.Required,
+	}, nil
 }
 
 // collectPrompt 收集 prompt 输入。返回 (parts)：

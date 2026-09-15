@@ -20,6 +20,8 @@ package cli
 //	    --backoff <dur>      首次重试退避（默认 2s，指数翻倍，上限 30s）
 //	-o, --output <format>    输出：json（默认）| text
 //	    --tools <mode>       off（默认）| on | 逗号分隔白名单
+//	    --max-tokens <n>     输出 token 上限（llm 引擎透传 -o max_tokens，其余忽略）
+//	    --temperature <t>    采样温度（llm 引擎透传 -o temperature，其余忽略）
 //	    --engines            列出引擎与 CLI 探测结果（替代原 engines 子命令）
 //	-v, --verbose            重试过程打到 stderr
 //
@@ -63,7 +65,7 @@ func NewRootCommand() *cobra.Command {
   claude     Claude Code CLI（-p --output-format json）
   codebuddy  CodeBuddy / WorkBuddy 内置 CLI（默认 hy3，可切 glm-5.3 等）
   trae       Trae CLI（使用 trae 自身配置的默认模型）
-  llm        按 ~/.magic-agent/models.json 直接调 LLM（OpenAI 兼容 HTTP 端点）
+  llm        simonw/LLM CLI（模型与密钥由 llm models / llm keys 自管）
 
 示例：
   magic-agent -p "用一句话解释什么是熵"            # 直接提问（默认 json 输出）
@@ -74,14 +76,15 @@ func NewRootCommand() *cobra.Command {
   magic-agent -e claude --tools Bash,Read "看看这个目录"  # 工具白名单
   cat doc.md | magic-agent -e claude -f - "总结上文"
   magic-agent -e claude -r 2 "1+1=?"               # 失败重试 2 次
+  magic-agent -e llm -m minimax-m3 --max-tokens 32000 "写一集剧本"
   magic-agent --engines                           # 列出引擎与可用性
   magic-agent --engines --json                    # JSON 形式（可被 jq 解析）
 
-llm 引擎（读 ~/.magic-agent/models.json，扁平数组，首条即默认）：
-  magic-agent -e llm -m MiniMax-M3 "问题"       # 按 id 指定
-  magic-agent -e llm -m minimax-nothink "问题"  # 同模型不同变体（关思维链）
-  magic-agent -e llm "问题"                     # 用首条
-  magic-agent --engines                         # 看条目数与默认 id`,
+llm 引擎（包装 simonw/LLM CLI，模型/密钥由它自管）：
+  magic-agent -e llm -m minimax-m3 "问题"        # 按 llm CLI 注册名指定
+  magic-agent -e llm --max-tokens 32000 "问题"   # 透传 -o max_tokens
+  magic-agent -e llm "问题"                      # 用 llm 的默认模型
+  magic-agent --engines                          # 看条目数与默认 id`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          rejectRemovedSubcommands,
