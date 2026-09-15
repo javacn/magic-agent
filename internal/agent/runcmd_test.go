@@ -1,6 +1,8 @@
+//go:build !windows
+
 package agent
 
-// runcmd_test.go - 进程组杀灭回归测试。
+// runcmd_test.go - 进程组杀灭回归测试（POSIX only：依赖 sh 脚本与进程组信号）。
 //
 // 场景：CLI 脚本 spawn 一个长活后台子进程（模拟 codebuddy 的 node
 // worker），runCLI 超时后整个进程组（含后台子进程）必须被杀干净。

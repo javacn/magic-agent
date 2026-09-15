@@ -297,6 +297,47 @@ func TestCodeBuddyPassesModel(t *testing.T) {
 	}
 }
 
+// 未指定模型时 codebuddy 引擎默认 --model hy3；显式指定时用显式值。
+func TestCodeBuddyDefaultModel(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args.log")
+	cli := filepath.Join(dir, "codebuddy")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + log + "\necho '{\"type\":\"result\",\"result\":\"ok\"}'\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &CodeBuddyEngine{BinPath: cli}
+
+	// 默认：hy3
+	if _, err := e.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	data, _ := os.ReadFile(log)
+	if !strings.Contains(string(data), "--model hy3") {
+		t.Errorf("default model hy3 not passed: %q", string(data))
+	}
+
+	// 显式覆盖：glm-5.3
+	if err := os.WriteFile(log, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Complete(context.Background(), Request{
+		Model:    "glm-5.3",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	data, _ = os.ReadFile(log)
+	if !strings.Contains(string(data), "--model glm-5.3") {
+		t.Errorf("explicit model not passed: %q", string(data))
+	}
+	if strings.Count(string(data), "--model") != 1 {
+		t.Errorf("model flag should appear exactly once: %q", string(data))
+	}
+}
+
 // ── Trae 引擎 ─────────────────────────────────────────────────
 
 func TestTraeCompletePlainText(t *testing.T) {

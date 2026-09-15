@@ -6,11 +6,50 @@
 
 ## 安装
 
+### 方式一：npm（推荐，无需 Go）
+
+包内自带 **darwin-arm64 / darwin-x64 / linux-x64 / linux-arm64 / win32-x64** 五个平台的预编译二进制，安装时按当前平台自动选取。
+
+```bash
+# 全局安装（推荐）
+npm install -g magic-agent
+
+# 或从本地 tgz 安装（离线 / 内网）
+npm install -g ./magic-agent-0.1.0.tgz
+
+# 或装进当前项目
+npm install magic-agent && ./node_modules/.bin/magic-agent version
+```
+
+`magic-agent` 会出现在 PATH 中（全局装时）。
+
+**装到哪个 npm 前缀很重要**：全局安装落在 `npm config get prefix` 指向的 `bin/` 下。如果 `which magic-agent` 找不到，多半是装到了别的 node 环境（比如某个沙箱/工具链自带的 node）。确认并修正：
+
+```bash
+npm config get prefix          # 看你的真实前缀，通常 /opt/homebrew
+which -a npm node              # 确认用的是哪个 npm
+```
+
+用你登录 shell 里那个 npm 安装（例如 `/opt/homebrew/bin/npm install -g ./magic-agent-0.1.0.tgz`），装完新开一个终端即可用。
+
+### 方式二：从源码构建
+
 ```bash
 go build -o bin/magic-agent ./cmd/magic-agent
 ```
 
-依赖：Go 1.26+。三个 CLI 按需安装，未安装的引擎自动探测失败但不影响其他引擎：
+### 打包发布（维护者）
+
+```bash
+npm run build      # 交叉编译全部 5 个平台 -> npm/dist/
+npm pack           # 产出 magic-agent-<version>.tgz
+```
+
+`npm run build:current` 只编译当前平台（本地开发更快）。版本号由 `npm build` 从 `package.json` 经 ldflags 注入 `internal/cli.Version`，无需手改源码。
+
+> 平台不支持或产物缺失时，`postinstall` 会尝试用本机 Go 现场编译；两者都没有则只告警，不阻断安装。
+
+依赖：Go 1.26+（仅源码构建需要）。三个 CLI 按需安装，未安装的引擎自动探测失败但不影响其他引擎：
 
 | 引擎 | CLI | 探测路径 / 环境变量 |
 |------|-----|---------------------|
@@ -29,57 +68,74 @@ trae       ✓       /Users/you/.local/bin/trae-cli
 ## 用法
 
 ```bash
-# 基本提问（默认 claude 引擎）
-magic-agent ask "用一句话解释什么是熵"
+# 版本
+magic-agent --version          # 等价于 magic-agent version
+
+# 基本提问：根命令直接给 prompt（默认 json 输出）
+magic-agent -p "用一句话解释什么是熵"
+magic-agent "1+1=?"            # 位置参数等价
+magic-agent ask "1+1=?"        # ask 子命令等价
+
+# 人看用 text
+magic-agent -o text -p "用一句话解释什么是熵"
 
 # 切引擎、切模型
-magic-agent ask -e codebuddy -m hy3 "写一首俳句"
-magic-agent ask -e trae "总结这篇文档"          # trae 用自身配置的默认模型
-magic-agent ask -e trae -m My-MiniMax-M3 "..."  # -c model.name= 覆盖
+magic-agent -e codebuddy "写一首俳句"            # codebuddy 默认 hy3
+magic-agent -e codebuddy -m glm-5.3 "写一首俳句"
+magic-agent -e trae "总结这篇文档"               # trae 用自身配置的默认模型
+magic-agent -e trae -m My-MiniMax-M3 "..."      # -c model.name= 覆盖
+
+# 工具开关（默认 off = 纯 chat；on = agent 模式；或白名单）
+magic-agent -e claude --tools on -p "看看当前目录有什么"
+magic-agent -e claude --tools Bash,Read -p "读一下 README"
 
 # 超时 + 重试（单次尝试 3 分钟，最多额外重试 2 次，指数退避）
-magic-agent ask -e claude -t 3m -r 2 --verbose "复杂的分析任务"
+magic-agent -e claude -t 3m -r 2 --verbose -o text "复杂的分析任务"
 
 # 系统提示词
-magic-agent ask -e claude -s "你是严谨的翻译官，只输出译文" "Hello, world"
+magic-agent -e claude -s "你是严谨的翻译官，只输出译文" -o text "Hello, world"
 
 # 管道输入
-cat doc.md | magic-agent ask -e claude -f - "总结上文"
-magic-agent ask -e claude -f context.md "基于这个文件回答：……"
+cat doc.md | magic-agent -e claude -o text -f - "总结上文"
+magic-agent -e claude -f context.md "基于这个文件回答：……"
 
 # 固定 JSON 输出（单行 envelope，适合 jq / 程序解析）
-magic-agent ask -e claude -o json "1+1=?"
+magic-agent -e claude "1+1=?"
 # {"engine":"claude","model":"","session_id":"...","attempts":1,"latency_ms":534,"text":"2"}
 
 # 引擎可用性（支持 --json）
 magic-agent engines --json
 ```
 
-## Flags（ask）
+## Flags（ask / 根命令共用）
 
-| Flag | 说明 |
-|------|------|
-| `-e, --engine` | 引擎：`claude` \| `codebuddy` \| `trae`（默认 claude） |
-| `-m, --model` | 模型（空 = 引擎默认）。trae 无 `--model`，内部转 `-c model.name=<m>` |
-| `-s, --system` | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
-| `-f, --file` | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
-| `-t, --timeout` | 单次尝试超时（如 `90s` / `3m`；默认 claude/codebuddy 5m、trae 10m） |
-| `-r, --retries` | 失败重试次数（默认 0；总尝试 = 1 + retries） |
-| `--backoff` | 首次重试退避（默认 2s，指数翻倍，上限 30s，带抖动） |
-| `-o, --output` | `text`（默认）\| `json` |
-| `-v, --verbose` | 重试过程打印到 stderr |
+flags 注册在根命令的 persistent flags 上，`ask` 子命令自动继承。
 
-prompt 输入优先级：位置参数 > `--file` > stdin 管道（stdin 非 TTY 且无其他输入时自动读）。
+| Flag | 默认 | 说明 |
+|------|------|------|
+| `-e, --engine` | `claude` | 引擎：`claude` \| `codebuddy` \| `trae` |
+| `-m, --model` | 空 | 模型（空 = 引擎默认；codebuddy 默认 `hy3`）。trae 无 `--model`，内部转 `-c model.name=<m>` |
+| `-s, --system` | 空 | 系统提示词（claude/codebuddy 走 `--append-system-prompt`，trae 拼进 prompt） |
+| `-p, --prompt` | 空 | 提示词（根命令直接提问用） |
+| `-f, --file` | 空 | 从文件读 prompt（`-` = stdin）；与位置参数可组合，文件在前 |
+| `--tools` | `off` | `off`（纯 chat）\| `on`（agent 模式）\| 逗号分隔白名单（如 `Bash,Read`） |
+| `-t, --timeout` | 按引擎 | 单次尝试超时（如 `90s` / `3m`；claude/codebuddy 5m、trae 10m） |
+| `-r, --retries` | `0` | 失败重试次数（总尝试 = 1 + retries） |
+| `--backoff` | `2s` | 首次重试退避（指数翻倍，上限 30s，带抖动） |
+| `-o, --output` | `json` | 输出格式：`json` \| `text` |
+| `-v, --verbose` | `false` | 重试过程打印到 stderr |
+
+prompt 输入优先级：`-p/--prompt` > 位置参数 > `--file` > stdin 管道（stdin 非 TTY 且无其他输入时自动读）。
 
 ## 输出格式
 
-**text**（默认）：stdout 只含模型正文 + 尾换行。
-
-**json**：stdout 单行 envelope：
+**json**（默认）：stdout 单行 envelope：
 
 ```json
 {"engine":"claude","model":"claude-sonnet-4-6","session_id":"...","attempts":1,"latency_ms":534,"text":"..."}
 ```
+
+**text**（`-o text`）：stdout 只含模型正文 + 尾换行。
 
 失败时 stdout 为空，stderr 输出错误 envelope，退出码非 0：
 
@@ -106,8 +162,8 @@ prompt 输入优先级：位置参数 > `--file` > stdin 管道（stdin 非 TTY 
 | | claude | codebuddy | trae |
 |---|---|---|---|
 | 非交互模式 | `-p --output-format json` | `--print --output-format json` | `-p`（纯文本） |
-| 模型指定 | `--model <m>` | `--model <m>`（hy3 等） | `-c model.name=<m>`（无 --model flag） |
-| 默认模型 | CLI 配置 | CLI 配置 | `~/.trae/trae_cli.yaml` 的 `model.name` |
+| 模型指定 | `--model <m>` | `--model <m>` | `-c model.name=<m>`（无 --model flag） |
+| 默认模型 | CLI 配置 | `hy3`（可 `-m` 覆盖） | `~/.trae/trae_cli.yaml` 的 `model.name` |
 | system 注入 | `--append-system-prompt` | `--append-system-prompt` | 拼进 prompt 头 |
 | 工具禁用 | `--tools ""` | `--tools ""` | `--disallowed-tool`（Bash/Edit/… 逐个） |
 | 超时联动 | 进程组 kill | 进程组 kill | 另透传 `--query-timeout`（上限 600s） |
@@ -126,8 +182,16 @@ internal/agent/
   codebuddy.go              CodeBuddy 引擎（envelope 多形态解析 + 回显剥离）
   trae.go                   Trae 引擎（模型覆盖 + query-timeout 映射）
   runner.go                 超时 + 重试编排（错误分类、指数退避、可取消）
-  runcmd.go                 进程组感知执行（超时杀整树，防孤儿）
+  runcmd.go                 进程组感知执行（平台无关调度）
+  runcmd_unix.go            Setpgid + kill(-pgid)（darwin/linux）
+  runcmd_windows.go         CREATE_NEW_PROCESS_GROUP + taskkill /T /F
   output.go                 固定 text/json 输出
+npm/
+  bin/magic-agent.js        npm bin 转发层（spawnSync + stdio inherit）
+  lib/platform.js           平台 -> Go 目标 / 产物路径映射
+  build.js                  交叉编译 5 平台 + 版本号注入
+  install.js                postinstall 兜底（缺产物时现场编译）
+  dist/                     构建产物（gitignore）
 tests/                      （预留）跨包集成测试
 ```
 
@@ -138,6 +202,15 @@ tests/                      （预留）跨包集成测试
 - claude 引擎：真实调用成功（text + json + stdin 管道）
 - trae 引擎：真实调用成功（默认模型 + query-timeout 映射）
 - codebuddy 引擎：CLI 探测/参数构造正确；本环境该 CLI 单次调用 20 分钟不返回（与 magic-video 时代一致），超时 + 进程组清理验证通过（超时后 0 残留进程）
+- npm 分发：5 平台交叉编译通过；全局 `npm install -g ./magic-agent-0.1.0.tgz` 后 `magic-agent` 可直接调用；stdin 管道、json 输出、退出码 0/1/2、超时杀进程组均验证通过（`go test ./...` 全绿）
+
+## 平台支持
+
+| 平台 | 产物目录 | 进程组实现 |
+|------|---------|-----------|
+| macOS arm64 / x64 | `npm/dist/darwin-arm64` / `darwin-x64` | `Setpgid` + `kill(-pgid, SIGKILL)` |
+| Linux x64 / arm64 | `npm/dist/linux-x64` / `linux-arm64` | 同上 |
+| Windows x64 | `npm/dist/win32-x64` | `CREATE_NEW_PROCESS_GROUP` + `taskkill /T /F` |
 
 ## License
 

@@ -39,6 +39,10 @@ func (e *ClaudeEngine) Name() string { return "claude" }
 // DefaultClaudeTimeout 单次尝试默认超时。
 const DefaultClaudeTimeout = 5 * time.Minute
 
+// DefaultClaudeModel claude 引擎的默认模型（Claude Code CLI 默认即主模型，
+// 显式传空串别名让 CLI 自己决定，不在代理层硬编码具体版本号）。
+const DefaultClaudeModel = ""
+
 // defaultClaudeBin 探测 claude CLI 路径。
 func (e *ClaudeEngine) bin() string {
 	if e.BinPath != "" {
@@ -95,14 +99,24 @@ func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, err
 		return Response{}, fmt.Errorf("claude: empty prompt")
 	}
 
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--tools", "",
-		"--no-session-persistence",
+	// 工具模式映射：
+	//	off        --tools ""
+	//	on         不传 --tools（引擎默认全工具）+ --dangerously-skip-permissions
+	//	allowlist  --tools <names> + --dangerously-skip-permissions
+	tools := toolsOrDefault(req.Tools)
+	args := []string{"-p", "--output-format", "json", "--no-session-persistence"}
+	switch {
+	case tools.IsOff():
+		args = append(args, "--tools", "")
+	case tools.IsOn():
+		args = append(args, "--dangerously-skip-permissions")
+	default: // allowlist
+		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "--dangerously-skip-permissions")
 	}
 	if m := stripModelPrefix(req.Model); m != "" {
 		args = append(args, "--model", m)
+	} else {
+		args = append(args, "--model", DefaultClaudeModel)
 	}
 	if req.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", req.SystemPrompt)

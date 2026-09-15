@@ -133,14 +133,24 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 	if model != "" {
 		args = append(args, "-c", "model.name="+model)
 	}
-	args = append(args,
-		"--disallowed-tool", "Bash",
-		"--disallowed-tool", "Edit",
-		"--disallowed-tool", "Replace",
-		"--disallowed-tool", "Glob",
-		"--disallowed-tool", "Grep",
-		"--disallowed-tool", "Read",
-	)
+	// 工具模式映射：trae 用 --allowed-tool / --disallowed-tool 表达。
+	//	off        逐个 disallow 内置工具（Bash/Edit/Replace/Glob/Grep/Read）
+	//	on         -y（yolo，跳过权限检查，全工具可用）
+	//	allowlist  --allowed-tool <names> + -y
+	tools := toolsOrDefault(req.Tools)
+	switch {
+	case tools.IsOff():
+		for _, t := range []string{"Bash", "Edit", "Replace", "Glob", "Grep", "Read"} {
+			args = append(args, "--disallowed-tool", t)
+		}
+	case tools.IsOn():
+		args = append(args, "-y")
+	default:
+		for _, t := range tools.Allowlist() {
+			args = append(args, "--allowed-tool", t)
+		}
+		args = append(args, "-y")
+	}
 	// 把外层超时透传给 CLI 的 query-timeout（取上限 600s，CLI 单查询上限）。
 	if req.Timeout > 0 {
 		qt := req.Timeout

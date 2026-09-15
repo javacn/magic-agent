@@ -25,6 +25,47 @@ type Message struct {
 	Content string
 }
 
+// ToolsMode 工具开关模式。
+//
+//	ToolsOff      禁用全部工具（默认）：纯 chat 一次成型，输出可解析。
+//	ToolsOn       引擎默认工具集 + 权限旁路：真 agent 模式，模型可执行
+//	              工具调用（读文件、跑命令等），代价是输出可能是工具痕迹。
+//	ToolsAllowlist 白名单：仅允许列出的工具 + 权限旁路。
+//
+// 判定方法一律导出：Engine 实现与本包外的调用方（如 CLI 层测试）
+// 都要能检视模式；非导出方法的接口无法被跨包断言。
+type ToolsMode interface {
+	// IsOff 是否为「禁用全部工具」模式。
+	IsOff() bool
+	// IsOn 是否为「引擎默认工具集 + 权限旁路」模式。
+	IsOn() bool
+	// Allowlist 白名单模式下的工具名；非白名单模式返回 nil。
+	Allowlist() []string
+}
+
+// toolsModeImpl 统一实现载体。
+type toolsModeImpl struct {
+	off       bool
+	on        bool
+	allowlist []string
+}
+
+// ToolsOff / ToolsOn 预置模式。
+var (
+	ToolsOff = toolsModeImpl{off: true}
+	ToolsOn  = toolsModeImpl{on: true}
+)
+
+// ToolsAllowlist 构造白名单模式。
+func ToolsAllowlist(names []string) ToolsMode {
+	return toolsModeImpl{allowlist: names}
+}
+
+// IsOff / IsOn / Allowlist 实现 ToolsMode。
+func (t toolsModeImpl) IsOff() bool         { return t.off }
+func (t toolsModeImpl) IsOn() bool          { return t.on }
+func (t toolsModeImpl) Allowlist() []string { return t.allowlist }
+
 // Request 是一次 agent 调用的完整输入。
 type Request struct {
 	// Engine 引擎名（"claude" | "codebuddy" | "trae"），由 Runner 填充，
@@ -36,8 +77,11 @@ type Request struct {
 	Model string
 
 	// SystemPrompt 可选系统提示词。各引擎自行决定注入方式
-	//（claude/codebuddy 用 --append-system-prompt，trae 拼进 prompt 头）。
+	//（claude/codebuddy用 --append-system-prompt，trae 拼进 prompt 头）。
 	SystemPrompt string
+
+	// Tools 工具开关模式（默认 ToolsOff）。
+	Tools ToolsMode
 
 	// Messages 对话消息；CLI 引擎会扁平化为单条 prompt。
 	Messages []Message
@@ -119,6 +163,21 @@ func initEngines() {
 	Register(&CodeBuddyEngine{})
 	Register(&TraeEngine{})
 }
+
+// toolsOrDefault nil ToolsMode 视为 ToolsOff。
+// 返回接口（而非具体实现）：判定一律走 ToolsMode 的导出方法。
+func toolsOrDefault(t ToolsMode) ToolsMode {
+	if t == nil {
+		return ToolsOff
+	}
+	return t
+}
+
+// ToolsIsOff / ToolsIsOn / ToolsAllowlistOf 跨包检视 ToolsMode 的便捷包装。
+// 与 ToolsMode 的导出方法等价，保留为语义化入口。
+func ToolsIsOff(t ToolsMode) bool           { return toolsOrDefault(t).IsOff() }
+func ToolsIsOn(t ToolsMode) bool            { return toolsOrDefault(t).IsOn() }
+func ToolsAllowlistOf(t ToolsMode) []string { return toolsOrDefault(t).Allowlist() }
 
 // equalFold 简易 ASCII 大小写不敏感比较。
 func equalFold(a, b string) bool {

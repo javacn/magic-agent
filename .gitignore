@@ -1,4 +1,6 @@
 bin/
+npm/dist/
+*.tgz
 *.test
 *.out
 .idea/

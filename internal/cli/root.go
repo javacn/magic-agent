@@ -7,7 +7,7 @@ package cli
 //	magic-agent                  显示帮助
 //	magic-agent ask <prompt>     单次提问（核心命令）
 //	magic-agent engines          列出引擎与可用性
-//	magic-agent version          版本信息
+//	magic-agent version          版本信息（等价于 --version）
 //
 // ask 的关键 flags：
 //
@@ -36,10 +36,22 @@ import (
 var Version = "0.1.0"
 
 // NewRootCommand 构建 CLI 根命令。
+//
+// 根命令本身可直接提问（ask 的简写形态）：
+//
+//	magic-agent -p "问题"          （-p/--prompt 提示词）
+//	magic-agent "问题"             （位置参数同样有效）
+//	magic-agent -e codebuddy -m hy3 "问题"
+//
+// 实现方式：ask 的全部 flags 注册为 root 的 persistent flags，
+// 子命令共享同一份绑定变量；root 无子命令名时直接执行 ask 主流程。
+// 注意 -p 在 claude 语境里是 --print，这里统一让位给 --prompt。
 func NewRootCommand() *cobra.Command {
+	opts := newAskOptions()
 	root := &cobra.Command{
-		Use:   "magic-agent",
-		Short: "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae 引擎",
+		Use:     "magic-agent [flags] [prompt...]",
+		Short:   "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae 引擎",
+		Version: Version,
 		Long: `magic-agent - agent CLI 代理工具
 
 把 claude / codebuddy（WorkBuddy）/ trae 三家 CLI 的非交互调用
@@ -48,21 +60,31 @@ func NewRootCommand() *cobra.Command {
 
 引擎：
   claude     Claude Code CLI（-p --output-format json）
-  codebuddy  CodeBuddy / WorkBuddy 内置 CLI（hy3 等免费模型）
+  codebuddy  CodeBuddy / WorkBuddy 内置 CLI（默认 hy3，可切 glm-5.3 等）
   trae       Trae CLI（使用 trae 自身配置的默认模型）
 
 示例：
-  magic-agent ask "用一句话解释什么是熵"
-  magic-agent ask -e codebuddy -m hy3 "写一首俳句"
-  magic-agent ask -e trae -t 10m "总结这篇文档"
-  cat doc.md | magic-agent ask -e claude -f - "总结上文"
-  magic-agent ask -e claude -o json -r 2 "1+1=?"`,
+  magic-agent -p "用一句话解释什么是熵"            # 根命令直接提问（默认 json 输出）
+  magic-agent ask "问题"                           # ask 子命令等价
+  magic-agent -e codebuddy "写一首俳句"            # codebuddy 默认 hy3
+  magic-agent -e codebuddy -m glm-5.3 "写一首俳句"
+  magic-agent -e trae -t 10m "总结这篇文档"        # 默认关工具；--tools on 可开
+  magic-agent -e claude --tools Bash,Read "看看这个目录"  # 工具白名单
+  cat doc.md | magic-agent -e claude -f - "总结上文"
+  magic-agent -e claude -r 2 "1+1=?"               # 失败重试 2 次`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAsk(cmd, args, opts)
+		},
 	}
-	root.AddCommand(newAskCommand())
+	bindAskFlags(root, opts)
+	root.AddCommand(newAskCommand(opts))
 	root.AddCommand(newEnginesCommand())
 	root.AddCommand(newVersionCommand())
+	// --version 输出与 version 子命令一致（"magic-agent <ver>"，不带 "version " 前缀）。
+	root.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 	return root
 }
 

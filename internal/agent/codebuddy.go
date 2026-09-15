@@ -41,6 +41,10 @@ func (e *CodeBuddyEngine) Name() string { return "codebuddy" }
 // DefaultCodeBuddyTimeout 单次尝试默认超时。
 const DefaultCodeBuddyTimeout = 5 * time.Minute
 
+// DefaultCodeBuddyModel codebuddy 引擎的默认模型。
+// 未显式 -m 指定时使用 hy3（与 magic-video 的 DefaultCreativeModel 一致）。
+const DefaultCodeBuddyModel = "hy3"
+
 // defaultCodeBuddyBin 探测 codebuddy CLI 路径。
 func (e *CodeBuddyEngine) bin() string {
 	if e.BinPath != "" {
@@ -70,7 +74,7 @@ func (e *CodeBuddyEngine) Detect() (bool, string) {
 	if p == "" {
 		return false, "codebuddy CLI not found (install WorkBuddy.app or set MAGIC_AGENT_CODEBUDDY_BIN)"
 	}
-	return true, p
+	return true, p + " (default model: " + DefaultCodeBuddyModel + ")"
 }
 
 // Complete 实现 Engine：单次调用 codebuddy CLI。
@@ -89,12 +93,26 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 	args := []string{
 		"--print",
 		"--output-format", "json",
-		"--tools", "",
 		"--no-session-persistence",
 		"--append-system-prompt", noToolSuffix,
 	}
+	// 工具模式映射（同 claude）。
+	tools := toolsOrDefault(req.Tools)
+	switch {
+	case tools.IsOff():
+		args = append(args, "--tools", "")
+	case tools.IsOn():
+		args = append(args, "-y") // --dangerously-skip-permissions
+	default:
+		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","), "-y")
+	}
 	if m := stripModelPrefix(req.Model); m != "" {
 		args = append(args, "--model", m)
+	} else {
+		// 默认模型 hy3；空串 = CLI 自身默认（几乎不用，保底语义）。
+		if DefaultCodeBuddyModel != "" {
+			args = append(args, "--model", DefaultCodeBuddyModel)
+		}
 	}
 	args = append(args, prompt)
 

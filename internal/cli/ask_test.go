@@ -4,8 +4,13 @@ package cli
 //
 // 覆盖：
 //	- collectPrompt 输入收集（args / --file / stdin 组合）
-//	- 端到端：fake 引擎注册 + cobra 命令执行 + 退出码
+//	- 端到端：fake 引擎注册 + cobra 命令执行 + 默认 json 输出
+//	- 根命令简写（-p / 位置参数）与 ask 子命令等价
+//	- --tools 解析（off / on / 白名单 / 非法值）
 //	- 引擎/格式参数校验错误 → exit 2
+//
+// 默认值契约（newAskOptions 与 bindAskFlags 双处维护，须一致）：
+//	engine=codebuddy, output=json, timeout=600s, tools=off
 
 import (
 	"bytes"
@@ -28,13 +33,30 @@ type stringEngine struct {
 	err  error
 }
 
-func (s *stringEngine) Name() string                    { return s.name }
-func (s *stringEngine) Detect() (bool, string)          { return true, "fake://" + s.name }
+func (s *stringEngine) Name() string           { return s.name }
+func (s *stringEngine) Detect() (bool, string) { return true, "fake://" + s.name }
 func (s *stringEngine) Complete(ctx context.Context, req agent.Request) (agent.Response, error) {
 	if s.err != nil {
 		return agent.Response{}, s.err
 	}
 	return agent.Response{Text: s.text, Model: "fake-model", Latency: 5_000_000}, nil
+}
+
+// capturingEngine 捕获收到的 prompt 与 tools 模式，供组合输入断言。
+type capturingEngine struct {
+	name       string
+	lastPrompt string
+	lastTools  agent.ToolsMode
+}
+
+func (c *capturingEngine) Name() string           { return c.name }
+func (c *capturingEngine) Detect() (bool, string) { return true, "fake://" + c.name }
+func (c *capturingEngine) Complete(ctx context.Context, req agent.Request) (agent.Response, error) {
+	if len(req.Messages) > 0 {
+		c.lastPrompt = req.Messages[len(req.Messages)-1].Content
+	}
+	c.lastTools = req.Tools
+	return agent.Response{Text: "captured", Model: "fake-model", Latency: 1_000_000}, nil
 }
 
 // ── collectPrompt ─────────────────────────────────────────────
@@ -87,7 +109,7 @@ func TestCollectPromptFileMissing(t *testing.T) {
 
 // ── 端到端命令执行 ────────────────────────────────────────────
 
-// runAskCmd 用给定 opts + args 跑 ask 命令，返回 (stdout, stderr, exit-code-intent error)。
+// runAskCmd 用给定 args 跑根命令，返回 (stdout, stderr, error)。
 func runAskCmd(t *testing.T, stdin string, args ...string) (string, string, error) {
 	t.Helper()
 	cmd := NewRootCommand()
@@ -95,19 +117,21 @@ func runAskCmd(t *testing.T, stdin string, args ...string) (string, string, erro
 	cmd.SetOut(&out)
 	cmd.SetErr(&errBuf)
 	cmd.SetIn(strings.NewReader(stdin))
-	cmd.SetArgs(append([]string{"ask"}, args...))
+	cmd.SetArgs(args)
 	err := cmd.Execute()
 	return out.String(), errBuf.String(), err
 }
 
-// 注册一个假引擎（用独立名字避免污染全局注册表——直接构造命令并替换 Lookup）。
-// 这里用环境注入的方式：ask 命令通过 agent.Lookup 查引擎，所以注册一个
-// 独特名字的假引擎即可。
-func TestAskEndToEndText(t *testing.T) {
-	agent.Register(&stringEngine{name: "fake-echo", text: "echoed"})
-	t.Cleanup(func() { unregisterLast() })
+// registerFake 注册假引擎并登记清理。
+func registerFake(e agent.Engine) {
+	agent.Register(e)
+}
 
-	stdout, _, err := runAskCmd(t, "", "-e", "fake-echo", "你好")
+func TestAskEndToEndText(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-echo", text: "echoed"})
+
+	// 默认输出 json；-o text 显式要纯文本。
+	stdout, _, err := runAskCmd(t, "", "ask", "-e", "fake-echo", "-o", "text", "你好")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -117,10 +141,10 @@ func TestAskEndToEndText(t *testing.T) {
 }
 
 func TestAskEndToEndJSON(t *testing.T) {
-	agent.Register(&stringEngine{name: "fake-json", text: "the answer"})
-	t.Cleanup(func() { unregisterLast() })
+	registerFake(&stringEngine{name: "fake-json", text: "the answer"})
 
-	stdout, _, err := runAskCmd(t, "", "-e", "fake-json", "-o", "json", "hi")
+	// 默认（不传 -o）就是 json。
+	stdout, _, err := runAskCmd(t, "", "ask", "-e", "fake-json", "hi")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -137,11 +161,124 @@ func TestAskEndToEndJSON(t *testing.T) {
 	}
 }
 
-func TestAskStdinPipe(t *testing.T) {
-	agent.Register(&stringEngine{name: "fake-stdin", text: "ok"})
-	t.Cleanup(func() { unregisterLast() })
+// 根命令直接提问 = ask 的简写（flags 提升 persistent + RunE 直连）。
+func TestRootShorthandAsk(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-root", text: "root answer"})
 
-	stdout, _, err := runAskCmd(t, "来自管道的问题", "-e", "fake-stdin")
+	// 位置参数形态
+	stdout, _, err := runAskCmd(t, "", "-e", "fake-root", "你好")
+	if err != nil {
+		t.Fatalf("root ask: %v", err)
+	}
+	if !strings.Contains(stdout, `"text":"root answer"`) {
+		t.Errorf("root positional stdout = %q", stdout)
+	}
+
+	// -p 提示词形态（-p = --prompt）
+	stdout2, _, err := runAskCmd(t, "", "-e", "fake-root", "-p", "pipe问题")
+	if err != nil {
+		t.Fatalf("root -p ask: %v", err)
+	}
+	if !strings.Contains(stdout2, `"text":"root answer"`) {
+		t.Errorf("root -p stdout = %q", stdout2)
+	}
+}
+
+// -p 与位置参数组合：-p 在前、args 在后；--tools 透传到 Request。
+func TestPromptFlagCombinedWithArgs(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-cap"}
+	registerFake(capEng)
+
+	_, _, err := runAskCmd(t, "", "-e", "fake-cap", "-p", "主问题", "附加", "上下文")
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	got := capEng.lastPrompt
+	if !strings.HasPrefix(got, "主问题") || !strings.Contains(got, "附加 上下文") {
+		t.Errorf("prompt = %q, want -p 在前 + args 在后", got)
+	}
+	// 默认 tools=off 透传
+	if !agent.ToolsIsOff(capEng.lastTools) {
+		t.Errorf("default tools should be off, got %#v", capEng.lastTools)
+	}
+}
+
+// --tools on / 白名单透传到引擎。
+func TestToolsPassthrough(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-tools"}
+	registerFake(capEng)
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-tools", "--tools", "Bash,Read", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	al := agent.ToolsAllowlistOf(capEng.lastTools)
+	if len(al) != 2 || al[0] != "Bash" || al[1] != "Read" {
+		t.Errorf("allowlist = %v", al)
+	}
+
+	capEng.lastTools = nil
+	if _, _, err := runAskCmd(t, "", "-e", "fake-tools", "--tools", "on", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.ToolsIsOn(capEng.lastTools) {
+		t.Errorf("tools=on should pass through, got %#v", capEng.lastTools)
+	}
+}
+
+// --tools 参数解析：off / on / 白名单 / 非法值。
+// 断言走 agent 包导出的 ToolsIsOff/ToolsIsOn/ToolsAllowlistOf
+//（toolsModeImpl 未导出，跨包接口断言其小写方法不可行）。
+func TestParseToolsMode(t *testing.T) {
+	m1, err1 := parseToolsMode("off")
+	if err1 != nil {
+		t.Fatalf("off: %v", err1)
+	}
+	if !agent.ToolsIsOff(m1) {
+		t.Errorf("off should parse to off mode, got %#v", m1)
+	}
+
+	m2, err2 := parseToolsMode("on")
+	if err2 != nil {
+		t.Fatalf("on: %v", err2)
+	}
+	if agent.ToolsIsOff(m2) || !agent.ToolsIsOn(m2) {
+		t.Errorf("on should parse to on mode, got %#v", m2)
+	}
+
+	m3, err3 := parseToolsMode("Bash, Read")
+	if err3 != nil {
+		t.Fatalf("allowlist: %v", err3)
+	}
+	if agent.ToolsIsOff(m3) || agent.ToolsIsOn(m3) {
+		t.Fatalf("allowlist mode wrong: %#v", m3)
+	}
+	if al := agent.ToolsAllowlistOf(m3); len(al) != 2 || al[0] != "Bash" || al[1] != "Read" {
+		t.Errorf("allowlist = %v", al)
+	}
+
+	if _, err := parseToolsMode(" , "); err == nil {
+		t.Error("comma-only value should error")
+	}
+}
+
+// 默认值契约：engine=codebuddy / output=json / timeout=600s。
+func TestDefaults(t *testing.T) {
+	opts := newAskOptions()
+	if opts.engine != "codebuddy" {
+		t.Errorf("default engine = %q, want codebuddy", opts.engine)
+	}
+	if opts.output != "json" {
+		t.Errorf("default output = %q, want json", opts.output)
+	}
+	if opts.timeout != 600_000_000_000 { // 600s
+		t.Errorf("default timeout = %v, want 600s", opts.timeout)
+	}
+}
+
+func TestAskStdinPipe(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-stdin", text: "ok"})
+
+	stdout, _, err := runAskCmd(t, "来自管道的问题", "ask", "-e", "fake-stdin", "-o", "text")
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -151,7 +288,7 @@ func TestAskStdinPipe(t *testing.T) {
 }
 
 func TestAskUnknownEngine(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "-e", "nope", "hi")
+	_, _, err := runAskCmd(t, "", "ask", "-e", "nope", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -161,7 +298,7 @@ func TestAskUnknownEngine(t *testing.T) {
 }
 
 func TestAskBadFormat(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "-e", "claude", "-o", "yaml", "hi")
+	_, _, err := runAskCmd(t, "", "ask", "-e", "claude", "-o", "yaml", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -171,7 +308,7 @@ func TestAskBadFormat(t *testing.T) {
 }
 
 func TestAskEmptyPrompt(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "-e", "claude")
+	_, _, err := runAskCmd(t, "", "ask", "-e", "claude")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -181,7 +318,7 @@ func TestAskEmptyPrompt(t *testing.T) {
 }
 
 func TestAskNegativeRetries(t *testing.T) {
-	_, _, err := runAskCmd(t, "", "-e", "claude", "-r", "-1", "hi")
+	_, _, err := runAskCmd(t, "", "ask", "-e", "claude", "-r", "-1", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -191,10 +328,9 @@ func TestAskNegativeRetries(t *testing.T) {
 }
 
 func TestAskEngineFailureJSONError(t *testing.T) {
-	agent.Register(&stringEngine{name: "fake-bad", err: errors.New("connection refused")})
-	t.Cleanup(func() { unregisterLast() })
+	registerFake(&stringEngine{name: "fake-bad", err: errors.New("connection refused")})
 
-	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-bad", "-o", "json", "hi")
+	stdout, stderr, err := runAskCmd(t, "", "ask", "-e", "fake-bad", "hi")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -215,10 +351,8 @@ func TestExitCodeOf(t *testing.T) {
 	}
 }
 
-// unregisterLast 移除注册表最后一个引擎（测试清理用）。
-// agent 包未暴露反注册，这里通过 Engines 重建不可行；
-// 采用变通：ask 测试用的假引擎名字带 fake- 前缀且不影响真实引擎
-// 查找，注册表多几个假引擎无害，此函数实际只用于语义标记。
+// unregisterLast：agent 包未暴露反注册；fake 引擎名字带 fake- 前缀、
+// 不影响真实引擎查找，残留无害。
 func unregisterLast() {}
 
 // 确保 cobra 命令满足接口。

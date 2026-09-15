@@ -1,0 +1,35 @@
+{
+  "name": "magic-agent",
+  "version": "0.1.0",
+  "description": "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae 引擎",
+  "license": "MIT",
+  "bin": {
+    "magic-agent": "npm/bin/magic-agent.js"
+  },
+  "scripts": {
+    "build": "node npm/build.js",
+    "build:current": "node npm/build.js --current",
+    "prepack": "node npm/build.js",
+    "postinstall": "node npm/install.js"
+  },
+  "files": [
+    "npm/bin/",
+    "npm/lib/",
+    "npm/dist/",
+    "npm/install.js",
+    "cmd/",
+    "internal/",
+    "go.mod",
+    "go.sum",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}
