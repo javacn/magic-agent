@@ -31,20 +31,20 @@ import (
 
 // askOptions 根命令的全部参数。
 type askOptions struct {
-	engine  string
-	model   string
-	system  string
-	prompt  string
-	file    string
-	tools   string
-	timeout time.Duration
-	retries int
-	backoff time.Duration
-	output  string
-	verbose bool
-	engines bool
-	jsonOut bool
-	stream  bool
+	engine     string
+	model      string
+	system     string
+	prompt     string
+	file       string
+	tools      string
+	timeout    time.Duration
+	retries    int
+	backoff    time.Duration
+	output     string
+	verbose    bool
+	engines    bool
+	jsonOut    bool
+	stream     bool
 	noThinking bool
 }
 
@@ -64,7 +64,7 @@ func newAskOptions() *askOptions {
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
 	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm（默认 codebuddy）")
-	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎读 models.json）")
+	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎按 models.json 的 id 指定）")
 	f.StringVarP(&opts.system, "system", "s", "", "系统提示词")
 	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")

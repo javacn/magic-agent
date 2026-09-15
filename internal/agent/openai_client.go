@@ -12,6 +12,9 @@ package agent
 //     content 只含实际回答。
 //   - content 里残留的思维链标签做兜底剥离。
 //
+// 端点 URL 由 ModelEntry.Endpoint() 产出（已处理的补全 / 透传规则），
+// 本文件不再无条件拼 "/chat/completions"。
+//
 // 单次调用；超时与重试由 Runner 在外层编排（与 CLI 引擎一致）。
 
 import (
@@ -26,32 +29,32 @@ import (
 	"time"
 )
 
-// httpClientFor 按 provider 超时构造 HTTP 客户端。
-func httpClientFor(p Provider) *http.Client {
-	timeout := p.HTTPTimeout()
+// httpClientFor 按模型条目超时构造 HTTP 客户端。
+func httpClientFor(m ModelEntry) *http.Client {
+	timeout := m.HTTPTimeout()
 	if timeout == 0 {
 		timeout = 300 * time.Second
 	}
 	return &http.Client{Timeout: timeout}
 }
 
-// chatComplete 向 provider 发一次 chat completion，返回正文。
+// chatComplete 向模型端点发一次 chat completion，返回正文。
 //
 // system 非空时作为首条 system 消息；messages 依序跟随。
-func chatComplete(ctx context.Context, hc *http.Client, p Provider, model, system string, messages []Message) (string, error) {
-	payload := buildChatPayload(p, model, system, messages)
+func chatComplete(ctx context.Context, hc *http.Client, m ModelEntry, model, system string, messages []Message) (string, error) {
+	payload := buildChatPayload(m, model, system, messages)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}
 	// extraBody 透传：merge 到顶层，覆盖同名键。
-	if len(p.ExtraBody) > 0 {
+	if len(m.ExtraBody) > 0 {
 		var merged map[string]any
 		if err := json.Unmarshal(body, &merged); err != nil {
 			return "", fmt.Errorf("merge extraBody (unmarshal): %w", err)
 		}
-		for k, v := range p.ExtraBody {
+		for k, v := range m.ExtraBody {
 			merged[k] = v
 		}
 		if body, err = json.Marshal(merged); err != nil {
@@ -59,14 +62,14 @@ func chatComplete(ctx context.Context, hc *http.Client, p Provider, model, syste
 		}
 	}
 
-	url := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+	url := m.Endpoint()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	if m.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+m.APIKey)
 	}
 
 	resp, err := hc.Do(req)
@@ -107,21 +110,22 @@ type chatMsg struct {
 }
 
 // buildChatPayload 组装请求体（system 在前，随后按输入顺序）。
-func buildChatPayload(p Provider, model, system string, messages []Message) chatRequest {
+func buildChatPayload(m ModelEntry, model, system string, messages []Message) chatRequest {
 	msgs := make([]chatMsg, 0, len(messages)+1)
 	if s := strings.TrimSpace(system); s != "" {
 		msgs = append(msgs, chatMsg{Role: "system", Content: s})
 	}
-	for _, m := range messages {
-		role := m.Role
+	for _, msg := range messages {
+		role := msg.Role
 		if role == "" {
 			role = "user"
 		}
-		msgs = append(msgs, chatMsg{Role: role, Content: m.Content})
+		msgs = append(msgs, chatMsg{Role: role, Content: msg.Content})
 	}
 	return chatRequest{
 		Model:          model,
 		Messages:       msgs,
+		Temperature:    m.Temperature,
 		ReasoningSplit: true,
 		// 显式 false：magic-agent 只要一次性结果，不要 SSE 流。
 		Stream: false,
@@ -136,20 +140,20 @@ func buildChatPayload(p Provider, model, system string, messages []Message) chat
 //	delta.reasoning_content  → KindThinking（MiniMax 思维链通道）
 //
 // 返回收尾汇总（全文 = 正文增量拼接，兜底 stripThinkingTags）。
-func chatStream(ctx context.Context, hc *http.Client, p Provider, model, system string, messages []Message, onEvent func(StreamEvent)) (StreamResult, error) {
-	payload := buildChatPayload(p, model, system, messages)
+func chatStream(ctx context.Context, hc *http.Client, m ModelEntry, model, system string, messages []Message, onEvent func(StreamEvent)) (StreamResult, error) {
+	payload := buildChatPayload(m, model, system, messages)
 	payload.Stream = true // 覆盖非流式默认
 
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return StreamResult{}, fmt.Errorf("marshal payload: %w", err)
 	}
-	if len(p.ExtraBody) > 0 {
+	if len(m.ExtraBody) > 0 {
 		var merged map[string]any
 		if err := json.Unmarshal(body, &merged); err != nil {
 			return StreamResult{}, fmt.Errorf("merge extraBody (unmarshal): %w", err)
 		}
-		for k, v := range p.ExtraBody {
+		for k, v := range m.ExtraBody {
 			merged[k] = v
 		}
 		if body, err = json.Marshal(merged); err != nil {
@@ -157,15 +161,15 @@ func chatStream(ctx context.Context, hc *http.Client, p Provider, model, system 
 		}
 	}
 
-	url := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+	url := m.Endpoint()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return StreamResult{}, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	if p.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	if m.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+m.APIKey)
 	}
 
 	resp, err := hc.Do(req)

@@ -1,23 +1,21 @@
 package agent
 
-// models.go - ~/.magic-agent/models.json 的配置模型与加载/解析。
+// models.go - ~/.magic-agent/models.json 的加载与解析。
 //
-// 这是一个与引擎无关的「模型清单」：每个 provider 声明自己的 api 类型
-// （openai-completions / ollama / codebuddy-cli / trae-cli / claude-cli）
-// 与它下面的模型 id。llmengine.go 据此把 -m <model> 路由到对应后端。
+// 这是一个「模型清单」：**扁平 JSON 数组**，每条自带完整的 url + apiKey，
+// 与 WorkBuddy / CodeBuddy CLI 的 LanguageModel 格式互为超集
+// （本工具多出 timeout / extraBody / temperature 三个扩展字段，
+// 对方的条目直接拿来也能读）。
 //
 // 加载顺序（先命中先用）：
 //  1. $MAGIC_AGENT_MODELS           显式指定路径
 //  2. ~/.magic-agent/models.json    本工具自己的配置
-//  3. ~/.magic-video/config.json    兜底复用 magic-video 的 models.default
 //
-// 第 3 条让已有 magic-video apiKey 的用户开箱可用，无需重录密钥。
-// 三种来源都接受两种形状：
+// 数组**首条即默认模型**，因此不需要 default 包装字段。
+// 上层只需调用 LoadModels / ResolveModel。
 //
-//	本工具形状      {"default":"minimax/MiniMax-M3","providers":[...]}
-//	magic-video 形状 {"models":{"default":[...]}}
-//
-// 兼容逻辑集中在 effectiveProviders()，上层只需调用 LoadModels/ResolveModel。
+// 每条恒为 OpenAI 兼容 HTTP 端点（本工具不再支持 api 字段路由与
+// 委托其他引擎；ollama 用 http://localhost:11434/v1/chat/completions 表达）。
 
 import (
 	"encoding/json"
@@ -29,90 +27,57 @@ import (
 	"time"
 )
 
-// api 类型常量。空值按 openai-completions 处理（最常见的默许语义）。
-const (
-	// APIOpenAI OpenAI 兼容的 /chat/completions HTTP 接口。
-	APIOpenAI = "openai-completions"
-	// APIOllama 本地 ollama：shell 调用 `ollama run <model>`。
-	APIOllama = "ollama"
-	// APICodeBuddy 委托 WorkBuddy 内置 codebuddy CLI（复用 CodeBuddyEngine）。
-	APICodeBuddy = "codebuddy-cli"
-	// APITrae 委托 trae-cli（复用 TraeEngine）。
-	APITrae = "trae-cli"
-	// APIClaude 委托 Claude Code CLI（复用 ClaudeEngine）。
-	APIClaude = "claude-cli"
-)
-
-// ModelSpec 是 provider 下的一个模型。
-type ModelSpec struct {
-	ID            string   `json:"id"`
-	Input         []string `json:"input,omitempty"`         // 支持的输入模态，空 = text
-	ContextWindow int      `json:"contextWindow,omitempty"` // 可选上下文窗口
-}
-
-// Provider 是 models.json 中的一个后端。
+// ModelEntry 是 models.json 数组里的一条模型。
 //
-// 字段与 magic-video 的 ProviderEntry 对齐（name/baseUrl/apiKey/api/timeout/
-// models/extraBody），因此同一份配置两处通用。
-type Provider struct {
-	Name      string         `json:"name"`
-	API       string         `json:"api,omitempty"`     // 空 = openai-completions
-	BaseURL   string         `json:"baseUrl,omitempty"` // HTTP 类必填
-	APIKey    string         `json:"apiKey,omitempty"`
-	Timeout   int            `json:"timeout,omitempty"` // 秒；0 = 默认 300s
-	Models    []ModelSpec    `json:"models,omitempty"`
-	ExtraBody map[string]any `json:"extraBody,omitempty"` // 原样并入请求体（厂商私有开关）
-}
+// 字段对齐 WorkBuddy / CodeBuddy CLI 的 LanguageModel，并追加三个扩展
+// （Timeout / ExtraBody / Temperature）。
+type ModelEntry struct {
+	// ── 身份 ──
 
-// ModelsFile 是 models.json 的顶层结构。
-type ModelsFile struct {
-	// Default 默认模型标识，"provider/model" 或裸 "model"。
-	// 空 = 取 magic-video 的 llm.textModels[0]，仍为空则取第一个 provider 的首个模型。
-	Default string `json:"default,omitempty"`
+	// ID 调用方标识（-m 用）。必填，且在文件内唯一（忽略大小写）。
+	ID string `json:"id"`
+	// Model 发往 API 的真实模型名；空 = 用 ID。
+	//
+	// 用途：同一个真实模型要在配置里出现多次时（不同 key / 不同开关），
+	// 用 ID 区分调用方视角，用 Model 指定线上模型名。例如：
+	//
+	//	{"id":"minimax-nothink","model":"MiniMax-M3","extraBody":{...}}
+	Model string `json:"model,omitempty"`
+	// Name 展示名（--engines 用）；空 = 用 ID。
+	Name string `json:"name,omitempty"`
+	// Vendor 供应商名（展示用）。
+	Vendor string `json:"vendor,omitempty"`
 
-	// Providers 按声明顺序排列（顺序即裸模型名的解析优先级）。
-	Providers []Provider `json:"providers,omitempty"`
+	// ── 连接 ──
 
-	// LLM 兼容 magic-video 的 {"llm":{"textModels":[...]}} 形状，
-	// 其 textModels[0] 作为默认模型。
-	LLM *struct {
-		TextModels  []string `json:"textModels,omitempty"`
-		ImageModels []string `json:"imageModels,omitempty"`
-		VideoModels []string `json:"videoModels,omitempty"`
-	} `json:"llm,omitempty"`
+	// URL 完整 API 端点。必填。支持 ${ENV_VAR} 引用。
+	URL string `json:"url"`
+	// APIKey Bearer 认证密钥。支持 ${ENV_VAR} 引用。
+	// 本地端点（如 ollama）可留空。
+	APIKey string `json:"apiKey,omitempty"`
+	// UseCustomProtocol 为 true 时 URL 原样透传，不补 /chat/completions。
+	UseCustomProtocol bool `json:"useCustomProtocol,omitempty"`
 
-	// Models 兼容 magic-video 的 {"models":{"default":[...]}} 形状。
-	Models *struct {
-		Default []Provider `json:"default,omitempty"`
-	} `json:"models,omitempty"`
-}
+	// ── 能力标记（仅展示/校验用，不参与请求构造）──
 
-// DefaultModel 返回生效的默认模型标识。
-// 优先级：顶层 default > magic-video 的 llm.textModels[0] > 空。
-func (m ModelsFile) DefaultModel() string {
-	if s := strings.TrimSpace(m.Default); s != "" {
-		return s
-	}
-	if m.LLM != nil {
-		for _, s := range m.LLM.TextModels {
-			if t := strings.TrimSpace(s); t != "" {
-				return t
-			}
-		}
-	}
-	return ""
-}
+	SupportsToolCall  bool `json:"supportsToolCall,omitempty"`
+	SupportsImages    bool `json:"supportsImages,omitempty"`
+	SupportsReasoning bool `json:"supportsReasoning,omitempty"`
+	MaxInputTokens    int  `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens   int  `json:"maxOutputTokens,omitempty"`
 
-// effectiveProviders 返回实际参与解析的 provider 列表。
-// 本工具形状（providers）优先；否则取 magic-video 形状（models.default）。
-func (m ModelsFile) effectiveProviders() []Provider {
-	if len(m.Providers) > 0 {
-		return m.Providers
-	}
-	if m.Models != nil {
-		return m.Models.Default
-	}
-	return nil
+	// ── magic-agent 扩展 ──
+
+	// Timeout 单次 HTTP 超时（秒）；0 = 调用方默认（300s）。
+	Timeout int `json:"timeout,omitempty"`
+	// ExtraBody 原样并入请求体顶层，用于厂商私有开关。
+	//
+	// 这是**必须保留**的字段：推理模型（如 MiniMax-M3）不关思维链时
+	// 长文本生成会被推理吃光 token 预算、正文为空。
+	// 典型值：{"thinking":{"type":"disabled"}}
+	ExtraBody map[string]any `json:"extraBody,omitempty"`
+	// Temperature 采样温度；nil = 不发该字段。
+	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 // HomeDir 返回 ~/.magic-agent 目录（不创建）。
@@ -127,14 +92,11 @@ func HomeDir() string {
 // modelsCandidates 返回按优先级排列的候选配置文件。
 func modelsCandidates() []string {
 	var out []string
-	if env := os.Getenv("MAGIC_AGENT_MODELS"); env != "" {
+	if env := strings.TrimSpace(os.Getenv("MAGIC_AGENT_MODELS")); env != "" {
 		out = append(out, env)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		out = append(out,
-			filepath.Join(home, ".magic-agent", "models.json"),
-			filepath.Join(home, ".magic-video", "config.json"),
-		)
+		out = append(out, filepath.Join(home, ".magic-agent", "models.json"))
 	}
 	return out
 }
@@ -142,11 +104,12 @@ func modelsCandidates() []string {
 // ErrModelsNotFound 所有候选路径都不存在。
 var ErrModelsNotFound = errors.New("models config not found")
 
-// LoadModels 从候选路径读取模型配置，返回 (配置, 实际使用的路径)。
+// LoadModels 从候选路径读取模型清单，返回 (条目, 实际使用的路径)。
 //
 // 首个存在的文件生效；文件存在但解析失败时直接报错（不静默跳过），
-// 避免用户改了 models.json 却以为生效了。
-func LoadModels() (ModelsFile, string, error) {
+// 避免用户改了 models.json 却以为生效了。加载后立即做 ${ENV_VAR}
+// 展开与结构校验。
+func LoadModels() ([]ModelEntry, string, error) {
 	var tried []string
 	for _, p := range modelsCandidates() {
 		data, err := os.ReadFile(p)
@@ -155,153 +118,150 @@ func LoadModels() (ModelsFile, string, error) {
 				tried = append(tried, p)
 				continue
 			}
-			return ModelsFile{}, p, fmt.Errorf("read models config %s: %w", p, err)
+			return nil, p, fmt.Errorf("read models config %s: %w", p, err)
 		}
-		var mf ModelsFile
-		if err := json.Unmarshal(data, &mf); err != nil {
-			return ModelsFile{}, p, fmt.Errorf("parse models config %s: %w", p, err)
+		var entries []ModelEntry
+		if err := json.Unmarshal(data, &entries); err != nil {
+			return nil, p, fmt.Errorf("parse models config %s: %w (want a JSON array of model entries)", p, err)
 		}
-		if len(mf.effectiveProviders()) == 0 {
-			return ModelsFile{}, p, fmt.Errorf("models config %s defines no providers", p)
+		if len(entries) == 0 {
+			return nil, p, fmt.Errorf("models config %s defines no models", p)
 		}
-		return mf, p, nil
+		if err := validateEntries(entries); err != nil {
+			return nil, p, fmt.Errorf("models config %s: %w", p, err)
+		}
+		// ${ENV_VAR} 展开：key 与 url 都支持，便于把密钥留在环境里。
+		for i := range entries {
+			entries[i].URL = expandEnv(entries[i].URL)
+			entries[i].APIKey = expandEnv(entries[i].APIKey)
+		}
+		return entries, p, nil
 	}
-	return ModelsFile{}, "", fmt.Errorf("%w (tried: %s); create ~/.magic-agent/models.json", ErrModelsNotFound, strings.Join(tried, ", "))
+	return nil, "", fmt.Errorf("%w (tried: %s); create ~/.magic-agent/models.json",
+		ErrModelsNotFound, strings.Join(tried, ", "))
 }
 
-// ResolveModel 把模型标识解析为 (provider, 裸模型 id)。
+// validateEntries 结构校验：每条必须有 id 与 url，且 id 唯一。
+//
+// 直接回应「必须有完整的 baseurl 和 key 才行」：缺 url 直接拒绝加载。
+// apiKey 允许为空（本地端点无需密钥），仅在 --engines 里提示无 key。
+func validateEntries(entries []ModelEntry) error {
+	seen := make(map[string]int, len(entries))
+	for i, m := range entries {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			return fmt.Errorf("entry #%d: missing \"id\"", i+1)
+		}
+		if strings.TrimSpace(m.URL) == "" {
+			return fmt.Errorf("entry %q: missing \"url\" (each model needs a full endpoint)", id)
+		}
+		key := strings.ToLower(id)
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("duplicate id %q (entries #%d and #%d); use distinct \"id\" values and set \"model\" to the wire model name if they point at the same model",
+				id, prev+1, i+1)
+		}
+		seen[key] = i
+	}
+	return nil
+}
+
+// expandEnv 展开 ${VAR} / $VAR；未设置的变量**保持原样**（不报错、不置空）。
+//
+// 保留占位符而非静默置空：让问题在真正发请求时以 401/404 暴露，
+// 比加载期就把 key 清空更好定位。与 WorkBuddy 行为一致。
+func expandEnv(s string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	return os.Expand(s, func(k string) string {
+		if v, ok := os.LookupEnv(k); ok {
+			return v
+		}
+		return "${" + k + "}"
+	})
+}
+
+// ResolveModel 按 query 找一条模型。
 //
 // 接受形式：
 //
-//	"provider/model"  显式指定 provider（精确名匹配）
-//	"model"           裸名，按 providers 声明顺序取首个包含它的
-//	""                取配置的 default；default 为空则取第一个 provider 的首个模型
+//	""      首条（数组顺序即优先级，首条即默认）
+//	"id"    忽略大小写匹配 ID；命中后回填声明的规范大小写
 //
-// provider 名与模型 id 的匹配均忽略大小写。
-func ResolveModel(mf ModelsFile, model string) (Provider, string, error) {
-	provs := mf.effectiveProviders()
-	if len(provs) == 0 {
-		return Provider{}, "", fmt.Errorf("models config defines no providers")
+// 未命中时返回错误并列出全部可用 id。
+func ResolveModel(entries []ModelEntry, query string) (ModelEntry, error) {
+	if len(entries) == 0 {
+		return ModelEntry{}, fmt.Errorf("models config defines no models")
 	}
-
-	model = strings.TrimSpace(model)
-
-	// 空 → 配置的 default（含 magic-video 的 llm.textModels 兜底）。
-	if model == "" {
-		model = mf.DefaultModel()
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return entries[0], nil
 	}
-	// default 也为空 → 第一个 provider 的首个模型。
-	if model == "" {
-		for _, p := range provs {
-			if len(p.Models) > 0 {
-				return p, p.Models[0].ID, nil
-			}
-		}
-		return Provider{}, "", fmt.Errorf("no model specified and no provider declares any model")
-	}
-
-	// "provider/model" 显式形式。
-	if i := strings.Index(model, "/"); i > 0 {
-		name, bare := model[:i], model[i+1:]
-		for _, p := range provs {
-			if equalFold(p.Name, name) {
-				if !providerHasModel(p, bare) {
-					return Provider{}, "", fmt.Errorf("provider %q has no model %q (available: %s)",
-						name, bare, strings.Join(modelIDs(p), ", "))
-				}
-				// 回填 provider 声明的规范大小写。
-				return p, canonicalID(p, bare), nil
-			}
-		}
-		return Provider{}, "", fmt.Errorf("provider %q not found (available: %s)", name, strings.Join(providerNames(provs), ", "))
-	}
-
-	// 裸模型名 → 按声明顺序取首个命中的 provider。
-	// 命中后回填 provider 声明的规范大小写（用户可能传 "minimax-m3"）。
-	for _, p := range provs {
-		if providerHasModel(p, model) {
-			return p, canonicalID(p, model), nil
+	for _, m := range entries {
+		if equalFold(m.ID, query) {
+			return m, nil
 		}
 	}
-	return Provider{}, "", fmt.Errorf("model %q not found in any provider (available: %s)",
-		model, strings.Join(allModelIDs(provs), ", "))
+	return ModelEntry{}, fmt.Errorf("model %q not found (available: %s)", query, strings.Join(entryIDs(entries), ", "))
 }
 
-// providerHasModel 判断 provider 是否声明了该模型（忽略大小写）。
-// provider 未声明 models 时视为「接受任意模型」（透传语义）。
-func providerHasModel(p Provider, bare string) bool {
-	if len(p.Models) == 0 {
-		return true
-	}
-	for _, m := range p.Models {
-		if equalFold(m.ID, bare) {
-			return true
-		}
-	}
-	return false
-}
-
-// canonicalID 返回 provider 中该模型的规范大小写形式；未声明时原样返回。
-func canonicalID(p Provider, bare string) string {
-	for _, m := range p.Models {
-		if equalFold(m.ID, bare) {
-			return m.ID
-		}
-	}
-	return bare
-}
-
-// EffectiveAPI 返回 provider 的 api 类型（空 = openai-completions）。
-func (p Provider) EffectiveAPI() string {
-	api := strings.TrimSpace(p.API)
-	if api == "" {
-		return APIOpenAI
-	}
-	return api
-}
-
-// HTTPTimeout 返回 provider 配置的超时；0 = 调用方默认。
-func (p Provider) HTTPTimeout() time.Duration {
-	if p.Timeout > 0 {
-		return time.Duration(p.Timeout) * time.Second
-	}
-	return 0
-}
-
-// DisplayName 返回展示用的 provider 名（空名回退 "<unnamed>"）。
-func (p Provider) DisplayName() string {
-	if s := strings.TrimSpace(p.Name); s != "" {
-		return s
-	}
-	return "<unnamed>"
-}
-
-func modelIDs(p Provider) []string {
-	out := make([]string, 0, len(p.Models))
-	for _, m := range p.Models {
+// entryIDs 返回全部 id（供错误提示）。
+func entryIDs(entries []ModelEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, m := range entries {
 		out = append(out, m.ID)
 	}
 	return out
 }
 
-func providerNames(ps []Provider) []string {
-	out := make([]string, 0, len(ps))
-	for _, p := range ps {
-		out = append(out, p.DisplayName())
+// WireModel 返回发往 API 的模型名：配了 model 用 model，否则用 id。
+func (m ModelEntry) WireModel() string {
+	if s := strings.TrimSpace(m.Model); s != "" {
+		return s
 	}
-	return out
+	return m.ID
 }
 
-// allModelIDs 返回 "provider/model" 形式的全量清单（供错误提示）。
-func allModelIDs(ps []Provider) []string {
-	var out []string
-	for _, p := range ps {
-		for _, m := range p.Models {
-			out = append(out, p.DisplayName()+"/"+m.ID)
-		}
+// Endpoint 产出最终请求 URL。
+//
+//	UseCustomProtocol = true      原样返回（仅去尾部斜杠）
+//	已以 /chat/completions 结尾    原样返回（避免重复追加）
+//	其余                          去尾部斜杠后补 /chat/completions
+//
+// 补全规则与 WorkBuddy 一致（日志实证：
+// https://ark.cn-beijing.volces.com/api/coding/v3 →
+// .../api/coding/v3/chat/completions）。
+func (m ModelEntry) Endpoint() string {
+	u := strings.TrimRight(strings.TrimSpace(m.URL), "/")
+	if u == "" || m.UseCustomProtocol {
+		return u
 	}
-	if len(out) == 0 {
-		return providerNames(ps)
+	if strings.HasSuffix(u, "/chat/completions") {
+		return u
 	}
-	return out
+	return u + "/chat/completions"
+}
+
+// HTTPTimeout 返回配置的超时；0 = 调用方默认。
+func (m ModelEntry) HTTPTimeout() time.Duration {
+	if m.Timeout > 0 {
+		return time.Duration(m.Timeout) * time.Second
+	}
+	return 0
+}
+
+// DisplayName 返回展示用名字：name → id → "<unnamed>"。
+func (m ModelEntry) DisplayName() string {
+	if s := strings.TrimSpace(m.Name); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(m.ID); s != "" {
+		return s
+	}
+	return "<unnamed>"
+}
+
+// HasAPIKey 是否配了密钥（本地端点可以没有）。
+func (m ModelEntry) HasAPIKey() bool {
+	return strings.TrimSpace(m.APIKey) != ""
 }

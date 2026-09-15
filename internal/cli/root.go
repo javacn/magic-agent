@@ -11,7 +11,7 @@ package cli
 // 关键 flags：
 //
 //	-e, --engine <name>      引擎：claude | codebuddy | trae | llm（默认 codebuddy）
-//	-m, --model <name>       模型（空 = 引擎默认；llm 引擎读 models.json）
+//	-m, --model <name>       模型（空 = 引擎默认；llm 引擎读 models.json 的 id）
 //	-s, --system <prompt>    系统提示词
 //	-p, --prompt <text>      提示词
 //	-f, --file <path>        从文件读 prompt（- 读 stdin）
@@ -63,7 +63,7 @@ func NewRootCommand() *cobra.Command {
   claude     Claude Code CLI（-p --output-format json）
   codebuddy  CodeBuddy / WorkBuddy 内置 CLI（默认 hy3，可切 glm-5.3 等）
   trae       Trae CLI（使用 trae 自身配置的默认模型）
-  llm        按 ~/.magic-agent/models.json 直接调 LLM（HTTP / ollama / 委托其他引擎）
+  llm        按 ~/.magic-agent/models.json 直接调 LLM（OpenAI 兼容 HTTP 端点）
 
 示例：
   magic-agent -p "用一句话解释什么是熵"            # 直接提问（默认 json 输出）
@@ -77,11 +77,11 @@ func NewRootCommand() *cobra.Command {
   magic-agent --engines                           # 列出引擎与可用性
   magic-agent --engines --json                    # JSON 形式（可被 jq 解析）
 
-llm 引擎（读 ~/.magic-agent/models.json）：
-  magic-agent -e llm -m minimax/MiniMax-M3 "问题"   # 显式 provider/model
-  magic-agent -e llm -m MiniMax-M3 "问题"           # 裸模型名（按声明顺序匹配）
-  magic-agent -e llm "问题"                         # 用配置里的 default
-  magic-agent -e llm --engines                      # 看配置来源与 provider 数`,
+llm 引擎（读 ~/.magic-agent/models.json，扁平数组，首条即默认）：
+  magic-agent -e llm -m MiniMax-M3 "问题"       # 按 id 指定
+  magic-agent -e llm -m minimax-nothink "问题"  # 同模型不同变体（关思维链）
+  magic-agent -e llm "问题"                     # 用首条
+  magic-agent --engines                         # 看条目数与默认 id`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          rejectRemovedSubcommands,

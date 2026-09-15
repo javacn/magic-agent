@@ -269,109 +269,143 @@ func TestAsStreamerNonStreamer(t *testing.T) {
 	}
 }
 
-// ── llm 引擎 openai-completions SSE 流式 ─────────────────────
+// ── llm 引擎（HTTP SSE）流式 ────────────────────────────────
 
-func TestLLMStreamOpenAISSE(t *testing.T) {
-	// 起 SSE 假服务器：reasoning_content（thinking）+ content（text）增量。
-	srv := httptest.NewServer(httptestSSEHandler(`data: {"choices":[{"delta":{"reasoning_content":"先想"}}]}
+// sseServer 起一个回放给定 SSE 数据行的 httptest 服务，并把 models.json
+// 指向它（单条 id=m 的条目）。
+func sseServer(t *testing.T, body string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
+}
 
-data: {"choices":[{"delta":{"reasoning_content":"清楚"}}]}
+// reasoning_content 增量 → thinking 通道；content 增量 → text 通道。
+func TestLLMStreamSplitsReasoningAndText(t *testing.T) {
+	sseServer(t, strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"先想一下"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":"，答案是 2"}}]}`,
+		`data: {"choices":[{"delta":{"content":"答案"}}]}`,
+		`data: {"choices":[{"delta":{"content":"是 2"}}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
 
-data: {"choices":[{"delta":{"content":"答案"}}]}
-
-data: {"choices":[{"delta":{"content":"是2"}}]}
-
-data: [DONE]
-
-`))
-	defer srv.Close()
-
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("MAGIC_AGENT_MODELS", writeModelsJSON(t, home, srv.URL))
-
-	e := &LLMEngine{}
 	events, onEvent := collectEvents()
-	res, err := e.Stream(context.Background(), Request{
+	res, err := (&LLMEngine{}).Stream(context.Background(), Request{
+		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "1+1"}},
 	}, onEvent)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if res.Text != "答案是2" {
-		t.Errorf("Text = %q", res.Text)
+	if res.Text != "答案是 2" {
+		t.Errorf("Text = %q, want 答案是 2", res.Text)
 	}
-	if res.Thinking != "先想清楚" {
+	if res.Thinking != "先想一下，答案是 2" {
 		t.Errorf("Thinking = %q", res.Thinking)
 	}
+	if res.Model != "m" {
+		t.Errorf("Model = %q, want m", res.Model)
+	}
+	if res.Engine != "llm" {
+		t.Errorf("Engine = %q, want llm", res.Engine)
+	}
 	if len(*events) != 4 {
-		t.Errorf("events = %d, want 4", len(*events))
+		t.Fatalf("events = %d, want 4", len(*events))
+	}
+	if (*events)[0].Kind != KindThinking || (*events)[2].Kind != KindText {
+		t.Errorf("event kinds = %v, want thinking…text…", *events)
 	}
 }
 
-// SSE 中途 HTTP 错误 → 报错。
+// 无思维链的普通模型：全部走 text 通道。
+func TestLLMStreamPlainText(t *testing.T) {
+	sseServer(t, strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"普通回答第一行\n"}}]}`,
+		`data: {"choices":[{"delta":{"content":"第二行"}}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	events, onEvent := collectEvents()
+	res, err := (&LLMEngine{}).Stream(context.Background(), Request{
+		Model:    "m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}, onEvent)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if res.Text != "普通回答第一行\n第二行" {
+		t.Errorf("Text = %q", res.Text)
+	}
+	if res.Thinking != "" {
+		t.Errorf("Thinking = %q, want empty", res.Thinking)
+	}
+	if len(*events) != 2 {
+		t.Errorf("events = %d, want 2", len(*events))
+	}
+}
+
+// 正文通道为空、思维链里混着 think 标签 → 兜底剥离后作为正文。
+func TestLLMStreamThinkTagFallback(t *testing.T) {
+	open := tagLT + tagWord + tagGT
+	closeTag := tagLT + tagSlash + tagWord + tagGT
+	sseServer(t, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\""+
+		open+"推理过程"+closeTag+"兜底答案\"}}]}\n"+
+		"data: [DONE]\n\n")
+
+	res, err := (&LLMEngine{}).Stream(context.Background(), Request{
+		Model:    "m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if res.Text != "兜底答案" {
+		t.Errorf("Text = %q, want think 块被剥离后的正文", res.Text)
+	}
+}
+
+// 流式 4xx 错误带状态码。
 func TestLLMStreamHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(429)
-		_, _ = w.Write([]byte(`{"error":{"message":"rate limit"}}`))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
 
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("MAGIC_AGENT_MODELS", writeModelsJSON(t, home, srv.URL))
-
-	e := &LLMEngine{}
-	_, err := e.Stream(context.Background(), Request{
+	_, err := (&LLMEngine{}).Stream(context.Background(), Request{
+		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	}, nil)
-	if err == nil {
-		t.Fatal("expected error for HTTP 429")
-	}
-	if !strings.Contains(err.Error(), "429") {
-		t.Errorf("error should mention status: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("error = %v, want it to mention 401", err)
 	}
 }
 
-// ollama 后端 → 流式明确报错。
-func TestLLMStreamOllamaUnsupported(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	cfg := `{"default":"local/qwen","providers":[{"name":"local","api":"ollama","models":[{"id":"qwen"}]}]}`
-	path := filepath.Join(home, "models.json")
-	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("MAGIC_AGENT_MODELS", path)
+// Complete：正文里残留的 think 标签被剥离。
+func TestLLMCompleteStripsThinking(t *testing.T) {
+	open := tagLT + tagWord + tagGT
+	closeTag := tagLT + tagSlash + tagWord + tagGT
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + open + `思考过程` + closeTag + `正文答案"}}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	withModels(t, `[{"id":"m","url":"`+srv.URL+`/chat/completions","apiKey":"k"}]`)
 
-	e := &LLMEngine{}
-	_, err := e.Stream(context.Background(), Request{
-		Model:    "local/qwen",
+	resp, err := (&LLMEngine{}).Complete(context.Background(), Request{
+		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, nil)
-	if err == nil {
-		t.Fatal("expected error for ollama streaming")
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
 	}
-	if !strings.Contains(err.Error(), "ollama") {
-		t.Errorf("error should mention ollama: %v", err)
+	if resp.Text != "正文答案" {
+		t.Errorf("Text = %q, want think 块被剥离", resp.Text)
 	}
-}
-
-// httptestSSEHandler 返回固定 SSE body 的 handler。
-func httptestSSEHandler(body string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(body))
-	}
-}
-
-// writeModelsJSON 写一个指向 baseURL 的 openai-completions 配置。
-func writeModelsJSON(t *testing.T, home, baseURL string) string {
-	t.Helper()
-	cfg := `{"default":"mini/MiniMax-M3","providers":[{"name":"mini","api":"openai-completions","baseUrl":"` + baseURL + `","apiKey":"test-key","models":[{"id":"MiniMax-M3"}]}]}`
-	path := filepath.Join(home, "models.json")
-	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
