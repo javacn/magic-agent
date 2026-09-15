@@ -44,6 +44,37 @@ func (s *stringEngine) Complete(ctx context.Context, req agent.Request) (agent.R
 	return agent.Response{Text: s.text, Model: "fake-model", Latency: 5_000_000}, nil
 }
 
+// streamingEngine 同时实现 Engine + Streamer 的假引擎。
+type streamingEngine struct {
+	name     string
+	text     string
+	thinking string
+	err      error
+}
+
+func (s *streamingEngine) Name() string           { return s.name }
+func (s *streamingEngine) Detect() (bool, string) { return true, "fake://" + s.name }
+func (s *streamingEngine) Complete(ctx context.Context, req agent.Request) (agent.Response, error) {
+	if s.err != nil {
+		return agent.Response{}, s.err
+	}
+	return agent.Response{Text: s.text, Model: "fake-model", Latency: 5_000_000}, nil
+}
+
+func (s *streamingEngine) Stream(ctx context.Context, req agent.Request, onEvent func(agent.StreamEvent)) (agent.StreamResult, error) {
+	if s.err != nil {
+		return agent.StreamResult{}, s.err
+	}
+	if s.thinking != "" {
+		onEvent(agent.StreamEvent{Kind: agent.KindThinking, Text: s.thinking})
+	}
+	onEvent(agent.StreamEvent{Kind: agent.KindText, Text: s.text})
+	return agent.StreamResult{
+		Response: agent.Response{Engine: s.name, Text: s.text, Model: "fake-model", Latency: 5_000_000},
+		Thinking: s.thinking,
+	}, nil
+}
+
 // capturingEngine 捕获收到的 prompt 与 tools 模式，供组合输入断言。
 type capturingEngine struct {
 	name       string
@@ -444,6 +475,106 @@ func TestSubcommandsRemoved(t *testing.T) {
 			names = append(names, s.Name())
 		}
 		t.Errorf("root should have no subcommands, got %v", names)
+	}
+}
+
+// ── --stream 流式 ─────────────────────────────────────────────
+
+// json 模式：NDJSON 事件流 + result 收尾行。
+func TestStreamJSONMode(t *testing.T) {
+	registerFake(&streamingEngine{name: "fake-stream", text: "答案", thinking: "思考"})
+
+	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-stream", "--stream", "1+1")
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("stdout lines = %d, want 3 (thinking + text + result): %q", len(lines), stdout)
+	}
+	if !strings.Contains(lines[0], `"type":"thinking"`) || !strings.Contains(lines[0], "思考") {
+		t.Errorf("line0 = %q, want thinking event", lines[0])
+	}
+	if !strings.Contains(lines[1], `"type":"text"`) || !strings.Contains(lines[1], "答案") {
+		t.Errorf("line1 = %q, want text event", lines[1])
+	}
+	if !strings.Contains(lines[2], `"type":"result"`) || !strings.Contains(lines[2], `"text":"答案"`) {
+		t.Errorf("line2 = %q, want result envelope", lines[2])
+	}
+	if !strings.Contains(lines[2], `"thinking":"思考"`) {
+		t.Errorf("result envelope missing thinking: %q", lines[2])
+	}
+	if stderr != "" {
+		t.Errorf("json 模式 stderr 应为空, got %q", stderr)
+	}
+}
+
+// text 模式：正文 → stdout，思考 → stderr。
+func TestStreamTextMode(t *testing.T) {
+	registerFake(&streamingEngine{name: "fake-stream-t", text: "正文", thinking: "思考过程"})
+
+	stdout, stderr, err := runAskCmd(t, "", "-e", "fake-stream-t", "--stream", "-o", "text", "hi")
+	if err != nil {
+		t.Fatalf("stream text: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "正文" {
+		t.Errorf("stdout = %q, want 正文", stdout)
+	}
+	if !strings.Contains(stderr, "思考过程") {
+		t.Errorf("stderr missing thinking: %q", stderr)
+	}
+}
+
+// --no-thinking：思考增量不转发。
+func TestStreamNoThinking(t *testing.T) {
+	registerFake(&streamingEngine{name: "fake-stream-nt", text: "答案", thinking: "思考"})
+
+	// json 模式：无 thinking 事件行，result envelope 不含 thinking 字段
+	stdout, _, err := runAskCmd(t, "", "-e", "fake-stream-nt", "--stream", "--no-thinking", "hi")
+	if err != nil {
+		t.Fatalf("stream no-thinking: %v", err)
+	}
+	if strings.Contains(stdout, `"type":"thinking"`) {
+		t.Errorf("stdout should not contain thinking events: %q", stdout)
+	}
+	if strings.Contains(stdout, `"thinking":"思考"`) {
+		t.Errorf("result envelope should omit thinking: %q", stdout)
+	}
+
+	// text 模式：stderr 无思考
+	_, stderr, err := runAskCmd(t, "", "-e", "fake-stream-nt", "--stream", "--no-thinking", "-o", "text", "hi")
+	if err != nil {
+		t.Fatalf("stream no-thinking text: %v", err)
+	}
+	if strings.Contains(stderr, "思考") {
+		t.Errorf("stderr should not contain thinking: %q", stderr)
+	}
+}
+
+// 不支持流式的引擎 → usage error（exit 2）。
+func TestStreamUnsupportedEngine(t *testing.T) {
+	registerFake(&stringEngine{name: "fake-nostream", text: "x"})
+
+	_, _, err := runAskCmd(t, "", "-e", "fake-nostream", "--stream", "hi")
+	if err == nil {
+		t.Fatal("expected error for non-streaming engine")
+	}
+	if _, ok := err.(*usageError); !ok {
+		t.Errorf("error should be usageError (exit 2), got %T: %v", err, err)
+	}
+}
+
+// 流式失败：json 模式 stdout 只含已发出的增量事件，无 result 行；
+// 错误 envelope 不重复打印（reportedError）。
+func TestStreamFailureJSON(t *testing.T) {
+	registerFake(&streamingEngine{name: "fake-stream-bad", err: errors.New("connection refused")})
+
+	stdout, _, err := runAskCmd(t, "", "-e", "fake-stream-bad", "--stream", "hi")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(stdout, `"type":"result"`) {
+		t.Errorf("failed stream should not emit result line: %q", stdout)
 	}
 }
 

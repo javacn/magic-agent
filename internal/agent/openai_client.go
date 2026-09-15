@@ -15,6 +15,7 @@ package agent
 // 单次调用；超时与重试由 Runner 在外层编排（与 CLI 引擎一致）。
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -125,6 +126,136 @@ func buildChatPayload(p Provider, model, system string, messages []Message) chat
 		// 显式 false：magic-agent 只要一次性结果，不要 SSE 流。
 		Stream: false,
 	}
+}
+
+// chatStream 发起 SSE 流式 chat completion，增量实时回调。
+//
+// 事件分流（OpenAI 兼容 + MiniMax reasoning_split 扩展）：
+//
+//	delta.content            → KindText
+//	delta.reasoning_content  → KindThinking（MiniMax 思维链通道）
+//
+// 返回收尾汇总（全文 = 正文增量拼接，兜底 stripThinkingTags）。
+func chatStream(ctx context.Context, hc *http.Client, p Provider, model, system string, messages []Message, onEvent func(StreamEvent)) (StreamResult, error) {
+	payload := buildChatPayload(p, model, system, messages)
+	payload.Stream = true // 覆盖非流式默认
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return StreamResult{}, fmt.Errorf("marshal payload: %w", err)
+	}
+	if len(p.ExtraBody) > 0 {
+		var merged map[string]any
+		if err := json.Unmarshal(body, &merged); err != nil {
+			return StreamResult{}, fmt.Errorf("merge extraBody (unmarshal): %w", err)
+		}
+		for k, v := range p.ExtraBody {
+			merged[k] = v
+		}
+		if body, err = json.Marshal(merged); err != nil {
+			return StreamResult{}, fmt.Errorf("merge extraBody (marshal): %w", err)
+		}
+	}
+
+	url := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return StreamResult{}, fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return StreamResult{}, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return StreamResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(strings.TrimSpace(string(respBody)), 500))
+	}
+
+	var textBuf, thinkBuf strings.Builder
+	emit := func(kind StreamEventKind, s string) {
+		switch kind {
+		case KindThinking:
+			thinkBuf.WriteString(s)
+		case KindText:
+			textBuf.WriteString(s)
+		}
+		if onEvent != nil {
+			onEvent(StreamEvent{Kind: kind, Text: s})
+		}
+	}
+
+	// SSE 解析：data: {...} 行；data: [DONE] 收尾。
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sawDone := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue // 心跳注释行
+		}
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		data = strings.TrimSpace(data)
+		if data == "[DONE]" {
+			sawDone = true
+			break
+		}
+		var ev struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Error *struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			continue // 非 JSON data 行忽略
+		}
+		if ev.Error != nil && ev.Error.Message != "" {
+			return StreamResult{}, fmt.Errorf("provider error (%s): %s", ev.Error.Type, ev.Error.Message)
+		}
+		if len(ev.Choices) == 0 {
+			continue
+		}
+		d := ev.Choices[0].Delta
+		if d.ReasoningContent != "" {
+			emit(KindThinking, d.ReasoningContent)
+		}
+		if d.Content != "" {
+			emit(KindText, d.Content)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return StreamResult{}, fmt.Errorf("read sse: %w", err)
+	}
+	_ = sawDone // 部分厂商不发 [DONE] 直接断流，不作为硬性要求
+
+	text := strings.TrimSpace(textBuf.String())
+	if text == "" {
+		// 正文增量缺失时兜底：也许全部混在 thinking 通道（reasoning_split 未生效）。
+		text = stripThinkingTags(thinkBuf.String())
+		if text == "" {
+			return StreamResult{}, fmt.Errorf("stream produced no content")
+		}
+	}
+	return StreamResult{
+		Response: Response{Text: stripThinkingTags(text)},
+		Thinking: thinkBuf.String(),
+	}, nil
 }
 
 // parseChatResponse 从响应体里取第一条 choice 的正文。

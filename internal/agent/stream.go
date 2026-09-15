@@ -73,16 +73,18 @@ func AsStreamer(e Engine) Streamer {
 	return s
 }
 
-// streamArgsFor 返回引擎的流式 CLI flags（与 Complete 的差异部分）。
-// 返回空切片表示该引擎不支持流式。
+// streamArgsFor 返回引擎的流式支持标记（用于 SupportsStream 快速判定）。
+// 返回 nil 表示该引擎不支持流式。
 func streamArgsFor(e Engine) []string {
 	switch e.(type) {
 	case *ClaudeEngine:
-		return []string{"--output-format", "stream-json", "--include-partial-messages", "--verbose"}
+		return []string{"stream-json"}
 	case *CodeBuddyEngine:
-		return []string{"--output-format", "stream-json", "--include-partial-messages", "--verbose"}
+		return []string{"stream-json"}
 	case *TraeEngine:
-		return []string{"--output-format", "stream-json", "--include-partial-messages"}
+		return []string{"stream-json"}
+	case *LLMEngine:
+		return []string{"sse"} // openai-completions SSE / CLI 委托；ollama 运行时报错
 	}
 	return nil
 }

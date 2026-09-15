@@ -145,6 +145,95 @@ func completeViaCLIEngine(ctx context.Context, p Provider, model string, req Req
 	return resp, nil
 }
 
+// Stream 实现 Streamer：按 provider 路由。
+//
+//	openai-completions  SSE 流（reasoning_content → thinking 增量）
+//	codebuddy/trae/claude-cli  委托子引擎 Stream（零改动复用）
+//	ollama              不支持（CLI 无流式协议）→ 明确报错
+func (e *LLMEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	start := time.Now()
+
+	mf, path, err := LoadModels()
+	if err != nil {
+		return StreamResult{}, err
+	}
+	provider, bareModel, err := ResolveModel(mf, req.Model)
+	if err != nil {
+		return StreamResult{}, fmt.Errorf("%w (config: %s)", err, path)
+	}
+
+	switch provider.EffectiveAPI() {
+	case APIOllama:
+		return StreamResult{}, fmt.Errorf("provider %q: ollama 后端暂不支持流式（api=ollama），请去掉 --stream 或换 openai-completions 后端",
+			provider.DisplayName())
+
+	case APICodeBuddy, APITrae, APIClaude:
+		return streamViaCLIEngine(ctx, provider, bareModel, req, onEvent)
+
+	case APIOpenAI:
+		if strings.TrimSpace(provider.BaseURL) == "" {
+			return StreamResult{}, fmt.Errorf("provider %q: baseUrl is required for api=%s",
+				provider.DisplayName(), APIOpenAI)
+		}
+		res, err := chatStream(ctx, httpClientFor(provider), provider, bareModel, req.SystemPrompt, req.Messages, onEvent)
+		if err != nil {
+			return StreamResult{}, fmt.Errorf("%s: %w", provider.DisplayName(), err)
+		}
+		if strings.TrimSpace(res.Text) == "" {
+			return StreamResult{}, fmt.Errorf("provider %q returned empty content", provider.DisplayName())
+		}
+		res.Response.Engine = e.Name()
+		res.Response.Model = provider.DisplayName() + "/" + bareModel
+		res.Response.Latency = time.Since(start)
+		return res, nil
+
+	default:
+		return StreamResult{}, fmt.Errorf("provider %q: unsupported api %q for streaming",
+			provider.DisplayName(), provider.API)
+	}
+}
+
+// streamViaCLIEngine 流式委托给子引擎。
+func streamViaCLIEngine(ctx context.Context, p Provider, model string, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	var inner Engine
+	switch p.EffectiveAPI() {
+	case APICodeBuddy:
+		inner = &CodeBuddyEngine{}
+	case APITrae:
+		inner = &TraeEngine{}
+	case APIClaude:
+		inner = &ClaudeEngine{}
+	default:
+		return StreamResult{}, fmt.Errorf("provider %q: cannot delegate api %q", p.DisplayName(), p.API)
+	}
+	streamer, ok := inner.(Streamer)
+	if !ok {
+		return StreamResult{}, fmt.Errorf("provider %q: engine %s does not support streaming", p.DisplayName(), inner.Name())
+	}
+	if ok, note := inner.Detect(); !ok {
+		return StreamResult{}, fmt.Errorf("provider %q delegates to %s engine which is unavailable: %s",
+			p.DisplayName(), inner.Name(), note)
+	}
+	sub := Request{
+		Engine:       inner.Name(),
+		Model:        model,
+		SystemPrompt: req.SystemPrompt,
+		Tools:        req.Tools,
+		Messages:     req.Messages,
+		Timeout:      req.Timeout,
+	}
+	res, err := streamer.Stream(ctx, sub, onEvent)
+	if err != nil {
+		return StreamResult{}, fmt.Errorf("provider %q (%s): %w", p.DisplayName(), inner.Name(), err)
+	}
+	res.Response.Engine = e2Name(p, inner)
+	res.Response.Model = p.DisplayName() + "/" + model
+	return res, nil
+}
+
+// e2Name 返回 llm 引擎名（streamViaCLIEngine 里统一标识）。
+func e2Name(_ Provider, _ Engine) string { return "llm" }
+
 // completeOllama 走本地 ollama：`ollama run <model> <prompt>`。
 //
 // ollama 无 system/多轮参数（除 /api/chat 外），因此把 system 与消息

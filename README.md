@@ -112,10 +112,42 @@ magic-agent -e claude -f context.md "基于这个文件回答：……"
 magic-agent -e claude "1+1=?"
 # {"engine":"claude","model":"","session_id":"...","attempts":1,"latency_ms":534,"text":"2"}
 
+# 流式输出（正文/思考实时增量；--no-thinking 关思考）
+magic-agent --stream -e claude -o text "复杂问题"          # 正文→stdout，思考→stderr
+cat doc.md | magic-agent --stream -e claude - "总结"        # json NDJSON 事件流 + result 收尾行
+magic-agent --stream --no-thinking -e claude "问题"        # 只要正文增量
+
 # 引擎可用性
 magic-agent --engines          # text 表格
 magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 ```
+
+## 流式模式（--stream）
+
+三家引擎都走 CLI 原生 `stream-json` 协议，增量实时转发，无缓冲等待：
+
+| | claude / codebuddy | trae |
+|---|---|---|
+| 协议 | `stream_event` + `content_block_delta` | `stream_event` + `delta.content` |
+| 思考过程 | ✅ `thinking_delta`（模型开 reasoning 时） | ❌（模型侧无 reasoning 通道） |
+| 收尾 | `result` 行（全文以此为准） | 同左 |
+
+**text 模式**：正文增量 → stdout 实时打印；思考增量 → stderr（`…` 前缀），
+`2>/dev/null` 静音或 `2>&1 | tee` 保留都由你控制。
+
+**json 模式**（默认）：每条增量一行 NDJSON，收尾一行汇总 envelope：
+
+```json
+{"type":"thinking","text":"用户在做加法..."}
+{"type":"text","text":"2"}
+{"type":"result","engine":"claude","model":"...","attempts":1,"latency_ms":1211,"thinking":"...","text":"2"}
+```
+
+`jq -c 'select(.type != "result")'` 逐事件消费，或 `tail -1` 取 result 全文。
+
+**语义差异**（相对非流式）：流式不做自动重试（增量已实时发出，重放会重复消费），
+`-r` 被忽略；超时照常生效（杀整个 CLI 进程组）。codebuddy 引擎本环境单次调用
+长期不返回（与非流式行为一致），流式实现按同源协议提供。
 
 ## Flags
 
@@ -131,6 +163,8 @@ magic-agent --engines --json   # 单行 JSON 数组（jq 友好）
 | `-r, --retries` | `0` | 失败重试次数（总尝试 = 1 + retries） |
 | `--backoff` | `2s` | 首次重试退避（指数翻倍，上限 30s，带抖动） |
 | `-o, --output` | `json` | 输出格式：`json` \| `text` |
+| `--stream` | 关 | 流式输出：增量实时打到 stdout（text 模式思考走 stderr） |
+| `--no-thinking` | 关 | 流式模式下不转发思考过程增量 |
 | `--engines` | 关 | 列出引擎与本机 CLI 可用性（替代原 `engines` 子命令） |
 | `--json` | 关 | `--engines` 的 JSON 输出开关 |
 | `-v, --verbose` | `false` | 重试过程打印到 stderr |
@@ -257,13 +291,14 @@ magic-agent: unknown engine "nope" (available: claude, codebuddy, trae)
 
 ```
 cmd/magic-agent/main.go     入口
-internal/cli/               cobra 命令层（无子命令、参数校验、退出码）
+internal/cli/               cobra 命令层（无子命令、参数校验、退出码、流式分流）
 internal/agent/
   engine.go                 Engine 接口 + Request/Response + 注册表（含 llm）
+  stream.go                 Streamer 接口 + StreamEvent + NDJSON 流解析
   prompt.go                 多轮消息扁平化 + noToolSuffix 约束
-  claude.go                 Claude Code 引擎
-  codebuddy.go              CodeBuddy 引擎（envelope 多形态解析 + 回显剥离）
-  trae.go                   Trae 引擎（模型覆盖 + query-timeout 映射）
+  claude.go                 Claude Code 引擎（非流式 + 流式）
+  codebuddy.go              CodeBuddy 引擎（envelope 多形态解析 + 回显剥离 + 流式）
+  trae.go                   Trae 引擎（模型覆盖 + query-timeout 映射 + 流式）
   models.go                 models.json 加载 + 模型解析（兼容 magic-video 形状）
   openai_client.go          OpenAI 兼容 HTTP 客户端（extraBody 透传、思维链剥离）
   llmengine.go              llm 引擎：按 api 路由到 HTTP / ollama / 委托 CLI 引擎
