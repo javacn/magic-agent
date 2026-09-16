@@ -131,6 +131,95 @@ func TestTraeToolModeSuffix(t *testing.T) {
 	}
 }
 
+// TestTraeToolModeMapping 固化 trae 的工具模式契约（2026-09-16 真机验证）。
+//
+// trae-cli 的权限开关实测语义：
+//   - --allowed-tool 只做「自动批准」，不裁剪工具集（--allowed-tool WebFetch
+//     仍下发全部 18 个工具）；
+//   - --disallowed-tool 才真正做减法；
+//   - -y 跳过全部权限检查 ⇒ 全工具可用。
+//
+// 因此白名单模式在 trae 上定义为「默认开启所有工具」：走 -y 全放行，
+// 不再输出 --allowed-tool（它既不能收窄，全放行后也毫无作用，只会造成
+// 「allowlist 被 -y 架空」的错觉）。
+func TestTraeToolModeMapping(t *testing.T) {
+	cases := []struct {
+		name         string
+		tools        ToolsMode
+		wantArgs     []string
+		absentArgs   []string
+		wantDisallow bool // 是否出现任何 --disallowed-tool
+	}{
+		{
+			name:         "off 逐个真名禁用且不全放行",
+			tools:        ToolsOff,
+			wantArgs:     []string{"Bash", "Edit", "Write", "Glob", "Grep", "Read"},
+			absentArgs:   []string{"-y", "Replace"},
+			wantDisallow: true,
+		},
+		{
+			name:         "on 全放行不做减法",
+			tools:        ToolsOn,
+			wantArgs:     []string{"-y"},
+			wantDisallow: false,
+		},
+		{
+			name:         "allowlist 默认开启所有工具（全放行、不收窄）",
+			tools:        ToolsAllowlist([]string{"WebFetch", "Bash"}),
+			wantArgs:     []string{"-y"},
+			absentArgs:   []string{"--allowed-tool"},
+			wantDisallow: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cli, argsOf := argLogger(t)
+			e := &TraeEngine{BinPath: cli}
+			if _, err := e.Complete(context.Background(), Request{
+				Tools:    tc.tools,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			}); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			args := argsOf()
+
+			for _, a := range tc.wantArgs {
+				if !hasArgToken(args, a) {
+					t.Errorf("缺少参数 %q: %q", a, args)
+				}
+			}
+			for _, a := range tc.absentArgs {
+				if strings.Contains(args, a) {
+					t.Errorf("不应包含 %q: %q", a, args)
+				}
+			}
+			// off 必须逐个用 --disallowed-tool 列出真名；on/白名单必须是纯全放行。
+			gotDisallow := strings.Contains(args, "--disallowed-tool")
+			if gotDisallow != tc.wantDisallow {
+				t.Errorf("--disallowed-tool 出现 = %v, want %v\nargs=%q", gotDisallow, tc.wantDisallow, args)
+			}
+			if tc.wantDisallow {
+				for _, a := range traeOffDisableTools {
+					if !strings.Contains(args, "--disallowed-tool "+a) {
+						t.Errorf("off 模式漏禁 %q: %q", a, args)
+					}
+				}
+			}
+		})
+	}
+}
+
+// hasArgToken 判断命令行里是否出现某个完整参数（避免 "-y" 被别的串误命中）。
+func hasArgToken(args, want string) bool {
+	for _, f := range strings.Fields(args) {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
 // nil ToolsMode 必须按 off 处理（默认关工具，向后兼容）。
 func TestToolsIsOffDefaultsToOff(t *testing.T) {
 	if !toolsIsOff(Request{}) {
