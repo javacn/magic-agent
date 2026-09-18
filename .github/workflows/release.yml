@@ -1,0 +1,200 @@
+# GitHub Actions — magic-agent 跨平台构建 + 发布到 npmjs.org
+#
+# 触发：
+#   - push tag v*.*.*       （正式发布；版本号取 tag 名）
+#   - workflow_dispatch    （手动跑，默认 dry-run 模式：发布 0.0.0-rc.<run_id>，npm 不会拒覆盖但也不会污染主版本）
+#
+# 链路（与 magic-stock 同款思路，但 magic-agent 只有一个 npm 包）：
+#   1) build job（5 平台矩阵: ubuntu/macos-arm64/macos-x64/windows-2022 + linux-arm64 QEMU 交叉编译）：
+#        - setup-go 走 go.mod
+#        - npm ci（拉前端 npm wrapper 依赖）
+#        - npm run build（→ npm/build.js 交叉编译，prepack 默认走这条）
+#        - 上传 artifact: magic-agent-<plat>
+#   2) publish job（依赖 build，单 runner ubuntu-22.04）：
+#        - 下载 5 个 artifact，把二进制合并到 npm/dist/<plat>/magic-agent[.exe]
+#        - 从 tag 解析版本号，写回 package.json
+#        - npm publish --access public --ignore-scripts
+#
+# 前置（GitHub repo secrets）：
+#   - NPM_TOKEN: npm Automation token（带 publish 作用域）
+#     生成：https://www.npmjs.com/settings/<your-name>/tokens → "Generate New Token" → "Automation"
+#
+# ⚠️ 本 workflow 不发布 GitHub Release asset，只发 npm。
+#    想要 GitHub Release：在 publish job 末尾追加 softprops/action-gh-release@v2 即可。
+
+name: release-npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # 1) 交叉编译 5 平台产物
+  # ============================================================
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x64
+            apt: ''
+          - os: ubuntu-22.04
+            label: linux-arm64
+            use-cross: true
+          - os: macos-13
+            label: darwin-x64
+          - os: macos-14
+            label: darwin-arm64
+          - os: windows-2022
+            label: win32-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Enable QEMU for cross-compile (linux-arm64 on amd64 runner)
+        if: matrix.use-cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
+
+      - name: npm ci
+        run: npm ci || npm install
+
+      - name: Build prebuilt for ${{ matrix.label }}
+        run: npm run build -- --current
+
+      - name: Verify binary produced
+        run: |
+          if [ "${{ matrix.label }}" = "win32-x64" ]; then
+            ls -la npm/dist/win32-x64/magic-agent.exe
+          else
+            ls -la npm/dist/${{ matrix.label }}/magic-agent
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-agent-${{ matrix.label }}
+          path: npm/dist/${{ matrix.label }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ============================================================
+  # 2) Publish npm 包
+  # ============================================================
+  publish-npm:
+    name: Publish to npmjs.org
+    needs: build
+    runs-on: ubuntu-22.04
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve target version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # workflow_dispatch 默认 dry-run: 用 0.0.0-rc.<run_id>
+            # npm 接受 prerelease 但不会污染主版本号
+            VERSION="0.0.0-rc.${GITHUB_RUN_ID}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+
+      - name: Sync version into package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = './package.json';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            j.version = '${{ steps.version.outputs.version }}';
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+            console.log('package.json version →', j.version);
+          "
+
+      - name: Download all 5 platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Stage prebuilt binaries into npm/dist/
+        run: |
+          mkdir -p npm/dist
+          declare -A MAP=(
+            [darwin-arm64]=magic-agent-darwin-arm64
+            [darwin-x64]=magic-agent-darwin-x64
+            [linux-x64]=magic-agent-linux-x64
+            [linux-arm64]=magic-agent-linux-arm64
+            [win32-x64]=magic-agent-win32-x64
+          )
+          for plat in "${!MAP[@]}"; do
+            src="artifacts/${MAP[$plat]}"
+            if [ ! -d "$src" ]; then
+              echo "::error::Missing artifact for $plat ($src)"
+              exit 1
+            fi
+            dest="npm/dist/${plat}"
+            mkdir -p "$dest"
+            cp -r "$src"/* "$dest/"
+            echo "→ staged $plat ($(du -sh $dest | cut -f1))"
+          done
+          echo ""
+          echo "=== final npm/dist layout ==="
+          ls -la npm/dist/
+
+      - name: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "▶ Dry-run 模式（workflow_dispatch）：npm publish --dry-run，不会真发"
+            npm publish --access public --ignore-scripts --dry-run
+          else
+            echo "▶ 正式发布 v${{ steps.version.outputs.version }} 到 npmjs.org"
+            npm publish --access public --ignore-scripts
+          fi
+
+      - name: Verify npm version (正式发布后)
+        if: github.event_name == 'push'
+        run: |
+          sleep 5
+          VERSION=$(npm view magic-agent version 2>&1 || echo "FETCH_FAILED")
+          echo "npm view magic-agent version → ${VERSION}"
+          if [ "${VERSION}" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::npm 上版本 ${VERSION} 与发布的 ${{ steps.version.outputs.version }} 不一致"
+            exit 1
+          fi
+          echo "✓ npmjs.org 上 magic-agent@${VERSION} 已就位"
