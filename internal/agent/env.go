@@ -38,6 +38,14 @@ var envDenylist = map[string]bool{
 	"CODEBUDDY_CONVERSATION_MESSAGE_ID": true,
 	"CODEBUDDY_TOOL_CALL_ID":            true,
 	"CLAUDE_SESSION_ID":                 true,
+
+	// Python 解释器路径注入：宿主环境（如 TRAE 会话）会把 PYTHONHOME 指到
+	// 自带的 Python.framework、PYTHONPATH 指到跨版本 site-packages。
+	// llm CLI 由 venv python 启动，读到这两个变量后 sys.path 错乱，
+	// 直接以 path 配置 dump / "<no Python frame>" 退出（实测 2026-09-16）。
+	// venv 自带隔离，不需要宿主注入；node 系 CLI（claude/codebuddy/trae）不受影响。
+	"PYTHONHOME": true,
+	"PYTHONPATH": true,
 }
 
 // environ 返回供子 CLI 继承的环境变量（已剔除父进程专属项）。

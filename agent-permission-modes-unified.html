@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>五家 AI Agent 权限模式统一分档 · Claude Code / Codex / CodeBuddy / TRAE / OpenClaw</title>
+<style>
+  :root{
+    --bg:#faf8f5;--surface:#fff;--ink:#1c1a17;--ink-2:#4a463f;--ink-3:#7c7568;
+    --line:#e5e0d8;--line-2:#d5cec3;
+    --claude:#c25f3c;--codex:#0f8f6f;--buddy:#2a5fbf;--trae:#6d4aff;--claw:#b45309;
+    --warn:#7c5e00;--warn-soft:#fbf3dd;--ok:#2f7d4f;--ok-soft:#eaf6ee;--no:#a33a2f;--no-soft:#fbeceb;
+    --radius:14px;--shadow:0 1px 2px rgba(28,26,23,.04), 0 8px 24px -12px rgba(28,26,23,.14);
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Noto Sans CJK SC","WenQuanYi Micro Hei","PingFang SC","Hiragino Sans GB","Microsoft YaHei",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    font-size:15.5px;line-height:1.75;letter-spacing:.01em;
+  }
+  .wrap{max-width:1240px;margin:0 auto;padding:56px 32px 96px;}
+  header.top{margin-bottom:44px;}
+  .kicker{
+    display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;
+    letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);
+    border:1px solid var(--line-2);border-radius:999px;padding:5px 13px;margin-bottom:20px;background:var(--surface);
+  }
+  .kicker .dot{width:6px;height:6px;border-radius:50%;background:var(--claude);}
+  h1{font-size:clamp(28px,3.7vw,40px);line-height:1.24;margin:0 0 16px;font-weight:750;letter-spacing:-.02em;}
+  h1 .amp{color:var(--ink-3);font-weight:400;padding:0 .08em;}
+  .sub{font-size:17px;color:var(--ink-2);max-width:78ch;margin:0 0 24px;}
+  .meta{display:flex;flex-wrap:wrap;gap:10px 22px;font-size:13px;color:var(--ink-3);border-top:1px solid var(--line);padding-top:16px;}
+  .meta b{color:var(--ink-2);font-weight:600;}
+  section{margin-top:56px;}
+  h2{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 8px;padding-bottom:10px;border-bottom:2px solid var(--ink);display:inline-block;}
+  h3{font-size:16.5px;font-weight:700;margin:30px 0 10px;}
+  p{margin:0 0 14px;color:var(--ink-2);}
+  code{
+    font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    font-size:.87em;background:#f2eee8;border:1px solid var(--line);
+    border-radius:5px;padding:1px 5px;color:#3d3830;white-space:nowrap;
+  }
+  strong{color:var(--ink);}
+  .hero{
+    background:var(--surface);border:1px solid var(--line);border-radius:18px;
+    padding:28px 30px;box-shadow:var(--shadow);margin:26px 0 10px;border-top:4px solid var(--ink);
+  }
+  .hero .big{font-size:clamp(25px,3.2vw,33px);font-weight:750;letter-spacing:-.02em;line-height:1.3;margin:0 0 12px;}
+  .hero .big em{font-style:normal;color:var(--claude);}
+  .hero p{margin:0;font-size:15.5px;}
+  .tiers{margin:26px 0 10px;display:flex;flex-direction:column;gap:12px;}
+  .tier{
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+    box-shadow:var(--shadow);overflow:hidden;display:grid;grid-template-columns:56px 1fr;
+  }
+  .tier .lv{display:grid;place-items:center;font-weight:800;font-size:19px;color:#fff;letter-spacing:-.02em;}
+  .tier.t1 .lv{background:var(--ok);}
+  .tier.t2 .lv{background:#3d8a68;}
+  .tier.t3 .lv{background:var(--warn);}
+  .tier.t4 .lv{background:var(--no);}
+  .tier .body{padding:16px 20px 17px;}
+  .tier .body h3{margin:0 0 4px;font-size:16.5px;}
+  .tier .body .desc{font-size:14px;color:var(--ink-2);margin:0 0 11px;}
+  .tier .body .map5{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;font-size:12.5px;}
+  .tier .body .map5 div{background:#f7f4ef;border:1px solid var(--line);border-radius:8px;padding:7px 10px;color:var(--ink-2);line-height:1.5;}
+  .tier .body .map5 div b{display:block;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px;}
+  .tier .body .map5 .a b{color:var(--claude);}
+  .tier .body .map5 .b b{color:var(--codex);}
+  .tier .body .map5 .c b{color:var(--buddy);}
+  .tier .body .map5 .d b{color:var(--trae);}
+  .tier .body .map5 .e b{color:var(--claw);}
+  .tier .body .map5 code{font-size:11.5px;}
+  .tier .body .map5 .miss{background:#fbf0ee;border-color:#f0cfcb;color:#8a4b40;}
+  .tablewrap{overflow-x:auto;margin:18px 0 8px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow);}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;}
+  table.w5{min-width:1100px;}
+  table.w4{min-width:860px;}
+  thead th{
+    text-align:left;padding:12px 14px;font-size:12.2px;font-weight:700;letter-spacing:.05em;
+    text-transform:uppercase;color:var(--ink-3);background:#f5f1eb;border-bottom:1px solid var(--line-2);white-space:nowrap;
+  }
+  thead th.c-a{color:var(--claude);} thead th.c-b{color:var(--codex);}
+  thead th.c-c{color:var(--buddy);} thead th.c-d{color:var(--trae);}
+  thead th.c-e{color:var(--claw);}
+  tbody td{padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink-2);line-height:1.6;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover{background:#fdfbf8;}
+  td.dim{font-weight:600;color:var(--ink);}
+  td code{white-space:normal;}
+  .pill{display:inline-block;font-size:11.2px;font-weight:700;line-height:1.5;padding:1px 8px;border-radius:999px;white-space:nowrap;border:1px solid transparent;vertical-align:1px;}
+  .pill.full{background:var(--ok-soft);color:var(--ok);border-color:#cbe6d5;}
+  .pill.part{background:var(--warn-soft);color:var(--warn);border-color:#eadfbb;}
+  .pill.none{background:var(--no-soft);color:var(--no);border-color:#f0cfcb;}
+  .pill.tier{background:#eef2fb;color:#2a5fbf;border-color:#d5e0f5;font-family:ui-monospace,monospace;}
+  .note{border-left:3px solid var(--line-2);background:#f6f3ee;padding:14px 18px;border-radius:0 10px 10px 0;margin:18px 0;font-size:14px;color:var(--ink-2);}
+  .note.warn{border-left-color:var(--warn);background:var(--warn-soft);}
+  .note.key{border-left-color:var(--ink);background:#f1eee8;}
+  .note.ok{border-left-color:var(--ok);background:var(--ok-soft);}
+  .note .lbl{display:block;font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:5px;}
+  ul.clean{margin:0 0 14px;padding-left:0;list-style:none;}
+  ul.clean li{position:relative;padding-left:20px;margin-bottom:9px;color:var(--ink-2);font-size:14.5px;}
+  ul.clean li::before{content:"";position:absolute;left:4px;top:.68em;width:5px;height:5px;border-radius:50%;background:var(--line-2);}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:20px 0;}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);}
+  .panel.a{border-top:3px solid var(--claude);} .panel.b{border-top:3px solid var(--codex);}
+  .panel.c{border-top:3px solid var(--buddy);} .panel.d{border-top:3px solid var(--trae);}
+  .panel.e{border-top:3px solid var(--claw);}
+  .panel h3{margin:0 0 11px;font-size:15px;}
+  .panel h3 span{font-size:11.2px;font-weight:600;color:var(--ink-3);display:block;letter-spacing:.05em;text-transform:uppercase;margin-bottom:4px;}
+  .panel ul.clean li{font-size:13.4px;margin-bottom:7px;}
+  ol.src{list-style:none;counter-reset:s;padding:0;margin:16px 0 0;}
+  ol.src li{counter-increment:s;position:relative;padding:11px 0 11px 42px;border-bottom:1px solid var(--line);font-size:13.3px;color:var(--ink-2);}
+  ol.src li:last-child{border-bottom:none;}
+  ol.src li::before{
+    content:counter(s);position:absolute;left:0;top:11px;width:24px;height:24px;border-radius:7px;
+    background:#f0ece5;border:1px solid var(--line);display:grid;place-items:center;font-size:11.5px;font-weight:700;color:var(--ink-3);
+  }
+  ol.src a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--line-2);word-break:break-all;}
+  ol.src a:hover{border-bottom-color:var(--ink);}
+  ol.src .t{display:block;font-weight:600;color:var(--ink);margin-bottom:2px;}
+  footer{margin-top:64px;padding-top:22px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-3);}
+  @media (max-width:1080px){ .tier .body .map5{grid-template-columns:1fr 1fr;} }
+  @media (max-width:760px){
+    .tier .body .map5{grid-template-columns:1fr;}
+    .grid2{grid-template-columns:1fr;}
+    .wrap{padding:36px 20px 72px;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="kicker"><span class="dot"></span>权限与审批机制 · 五家统一分档研究</div>
+  <h1>Claude Code <span class="amp">×</span> Codex <span class="amp">×</span> CodeBuddy <span class="amp">×</span> TRAE <span class="amp">×</span> OpenClaw<br>权限模式统一分档</h1>
+  <p class="sub">在 Claude Code / Codex / CodeBuddy 三家对比的基础上加入 TRAE 与 OpenClaw，验证一个结论：这五套彼此独立的权限机制，能否收敛到同一套档位模型，以及每家在每一档上分别对应什么配置。</p>
+  <div class="meta">
+    <span><b>数据截止</b> 2026-09-18</span>
+    <span><b>证据来源</b> 五方官方文档站一手内容</span>
+    <span><b>结论可信度</b> 高</span>
+  </div>
+</header>
+
+<section>
+  <h2>核心结论</h2>
+  <div class="hero">
+    <p class="big">4 档模型对五家全部成立，且 <em>OpenClaw 官方文档印证了本报告对 Codex 的映射</em>。</p>
+    <p>五家的全部用户可选模式都能落进同一个 4 档模型。TRAE 与 TraeWork 一样，恰好只有 3 档（手动审批 / 自动审批 / 完全访问），<strong>缺的同样是第 2 档</strong>；OpenClaw 粒度最细，是"沙箱 3 档 × 审批 5 档"的完整二维矩阵。最有意思的是，OpenClaw 的 <code>mode="auto"</code> 官方明确映射到 Codex 的 <code>approvalPolicy=on-request</code> ＋ <code>approvalsReviewer=auto_review</code> ＋ <code>sandbox=workspace-write</code>，与本报告独立推导出的 Codex 第 3 档配置<strong>完全一致</strong>。</p>
+  </div>
+
+  <div class="note key">
+    <span class="lbl">五家的收敛度超出预期</span>
+    沙箱层三家（Claude Code、CodeBuddy、TRAE）都复用 OS 原语，TRAE 甚至明确写出 macOS <code>sandbox-exec</code> / Linux <code>Bubblewrap + User Namespace</code>；审批层四家（Claude Code、CodeBuddy、TRAE、OpenClaw）都有"LLM 判定"档；"完全访问"五家全有且全部标注仅限隔离环境。真正分歧不在"有没有这些档"，而在<strong>默认值</strong>与<strong>第 3 档由什么判定</strong>。
+  </div>
+</section>
+
+<section>
+  <h2>统一分档模型</h2>
+  <p>分档轴只有一条：<strong>哪些动作会被自动放行，以及放行不了时由谁裁决</strong>。四档如下，从最保守到最放开。</p>
+
+  <div class="tiers">
+    <div class="tier t1">
+      <div class="lv">1</div>
+      <div class="body">
+        <h3>手动审批</h3>
+        <p class="desc">沙箱开启。只有只读操作自动放行，改文件、跑命令、访问网络都要用户逐一确认。审批人：<strong>人</strong>。</p>
+        <div class="map5">
+          <div class="a"><b>Claude Code</b><code>default</code>（Manual）</div>
+          <div class="b"><b>Codex</b><code>read-only</code> ＋ <code>untrusted</code></div>
+          <div class="c"><b>CodeBuddy</b><code>default</code></div>
+          <div class="d"><b>TRAE</b>「手动审批」/「手动运行」/ CLI <code>default</code></div>
+          <div class="e"><b>OpenClaw</b><code>exec.mode="ask"</code></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tier t2">
+      <div class="lv">2</div>
+      <div class="body">
+        <h3>自动接受编辑</h3>
+        <p class="desc">沙箱开启。工作区内的文件编辑自动放行，但<strong>命令仍逐条确认</strong>。审批人：<strong>人（仅命令）</strong>。</p>
+        <div class="map5">
+          <div class="a"><b>Claude Code</b><code>acceptEdits</code></div>
+          <div class="b"><b>Codex</b><code>workspace-write</code> ＋ <code>untrusted</code></div>
+          <div class="c"><b>CodeBuddy</b><code>acceptEdits</code></div>
+          <div class="d miss"><b>TRAE</b>无原生对应，需自定义权限模式</div>
+          <div class="e miss"><b>OpenClaw</b>无原生对应，需 <code>sandbox</code> ＋ <code>workspaceAccess:"rw"</code> 近似</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tier t3">
+      <div class="lv">3</div>
+      <div class="body">
+        <h3>自动审批</h3>
+        <p class="desc">沙箱开启。沙箱内的工作自动放行，<strong>越界请求交给非人工机制裁决</strong>（LLM 或确定性规则）。审批人：<strong>LLM / 规则引擎</strong>。</p>
+        <div class="map5">
+          <div class="a"><b>Claude Code</b><code>auto</code>（classifier）</div>
+          <div class="b"><b>Codex</b><code>workspace-write</code> ＋ <code>on-request</code> ＋ <code>auto_review</code></div>
+          <div class="c"><b>CodeBuddy</b><code>auto</code>（分类器）</div>
+          <div class="d"><b>TRAE</b>「自动审批」(LLM Guardian) /「沙箱运行（支持白名单）」(规则，默认档)</div>
+          <div class="e"><b>OpenClaw</b><code>exec.mode="auto"</code></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tier t4">
+      <div class="lv">4</div>
+      <div class="body">
+        <h3>完全访问</h3>
+        <p class="desc">沙箱关闭，命令直接在宿主机执行，文件系统完全读写，不触发审批。审批人：<strong>无</strong>。五家均标注仅限隔离容器 / VM / 无外网环境。</p>
+        <div class="map5">
+          <div class="a"><b>Claude Code</b><code>bypassPermissions</code></div>
+          <div class="b"><b>Codex</b><code>--yolo</code> / <code>danger-full-access</code> ＋ <code>never</code></div>
+          <div class="c"><b>CodeBuddy</b><code>bypassPermissions</code></div>
+          <div class="d"><b>TRAE</b>「完全访问」/「自动运行」/ CLI <code>bypass_permissions</code>（狂飙模式）</div>
+          <div class="e"><b>OpenClaw</b><code>exec.mode="full"</code>（<code>security=full</code> ＋ <code>ask=off</code>，官方称 YOLO）</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="note ok">
+    <span class="lbl">模型稳健性检验</span>
+    五家独立演化、三家（CodeBuddy / TRAE / OpenClaw）与另两家并无血缘关系，却都能无损落进这 4 档，说明这个分档不是对某一家产品的拟合，而是这代 agent 权限设计的<strong>共同收敛点</strong>。唯一普遍缺口是第 2 档：五家里只有三家有原生对应，TRAE 与 OpenClaw 都需要额外配置才能表达。
+  </div>
+</section>
+
+<section>
+  <h2>五家全量模式落档表</h2>
+  <div class="tablewrap">
+    <table class="w4">
+      <thead>
+        <tr><th style="width:15%">产品</th><th style="width:34%">模式 / 配置</th><th style="width:12%">落档</th><th style="width:39%">说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim" rowspan="7">Claude Code</td><td><code>default</code>（Manual）</td><td><span class="pill tier">第 1 档</span></td><td>信任目录内只读放行，其余询问</td></tr>
+        <tr><td><code>acceptEdits</code></td><td><span class="pill tier">第 2 档</span></td><td>工作目录内编辑与常用文件系统命令放行</td></tr>
+        <tr><td><code>auto</code></td><td><span class="pill tier">第 3 档</span></td><td>classifier 二次判定，消费级计划默认</td></tr>
+        <tr><td><code>bypassPermissions</code></td><td><span class="pill tier">第 4 档</span></td><td>跳过权限提示，含受保护路径写入</td></tr>
+        <tr><td><code>dontAsk</code></td><td><span class="pill part">正交 · 锁定</span></td><td>不弹框、直接拒绝未预批准动作</td></tr>
+        <tr><td><code>plan</code></td><td><span class="pill part">正交 · 阶段</span></td><td>委托给进入 plan 前的模式</td></tr>
+        <tr><td>hooks / 子代理模式</td><td><span class="pill part">正交 · 扩展</span></td><td><code>PermissionRequest</code> / <code>PreToolUse</code> 可在弹窗前接管</td></tr>
+
+        <tr><td class="dim" rowspan="5">OpenAI Codex</td><td><code>read-only</code> ＋ <code>untrusted</code></td><td><span class="pill tier">第 1 档</span></td><td>可读文件，但不能编辑或执行命令</td></tr>
+        <tr><td><code>workspace-write</code> ＋ <code>untrusted</code></td><td><span class="pill tier">第 2 档</span></td><td>工作区内可编辑，非已知安全命令仍需批准</td></tr>
+        <tr><td><code>workspace-write</code> ＋ <code>on-request</code> ＋ <code>auto_review</code></td><td><span class="pill tier">第 3 档</span></td><td>越界请求交给独立 reviewer agent</td></tr>
+        <tr><td><code>danger-full-access</code> ＋ <code>never</code> / <code>--yolo</code></td><td><span class="pill tier">第 4 档</span></td><td>无沙箱、无审批</td></tr>
+        <tr><td><code>granular</code> / <code>never</code> 单独使用</td><td><span class="pill part">正交 · 锁定</span></td><td><code>never</code> 在沙箱内即"不弹框直接跑"；<code>granular</code> 为细粒度分流</td></tr>
+
+        <tr><td class="dim" rowspan="8">CodeBuddy</td><td><code>default</code></td><td><span class="pill tier">第 1 档</span></td><td>官方默认档，"默认使用严格的只读权限"</td></tr>
+        <tr><td><code>acceptEdits</code></td><td><span class="pill tier">第 2 档</span></td><td>放行 Edit / Write / MultiEdit / NotebookEdit，Bash 仍询问</td></tr>
+        <tr><td><code>auto</code></td><td><span class="pill tier">第 3 档</span></td><td>分类器自动判定，只接管"最后仍会 ask 的动作"</td></tr>
+        <tr><td><code>bypassPermissions</code> / <code>fullAccess</code></td><td><span class="pill tier">第 4 档</span></td><td><code>fullAccess</code> 由 IDE 协议传入，跳过含 HIGH/CRITICAL 的全部提示</td></tr>
+        <tr><td><code>dontAsk</code></td><td><span class="pill part">正交 · 锁定</span></td><td>不弹框直接拒绝，连 <code>AskUserQuestion</code> 也拒</td></tr>
+        <tr><td><code>plan</code></td><td><span class="pill part">正交 · 阶段</span></td><td>委托给进入前的模式</td></tr>
+        <tr><td><code>delegate</code></td><td><span class="pill part">正交 · 协调</span></td><td>主代理只保留协调类工具</td></tr>
+        <tr><td><code>work</code> / <code>ignore</code></td><td><span class="pill part">正交 · 集成</span></td><td>IDE 集成与子代理继承专用</td></tr>
+
+        <tr><td class="dim" rowspan="9">TRAE</td><td>「手动审批」（新体系）</td><td><span class="pill tier">第 1 档</span></td><td>沙箱开启，需审批的操作由用户逐一确认</td></tr>
+        <tr><td>「手动运行」（旧体系）</td><td><span class="pill tier">第 1 档</span></td><td>所有命令需手动确认后执行</td></tr>
+        <tr><td>CLI <code>permission_mode: default</code></td><td><span class="pill tier">第 1 档</span></td><td>所有非只读工具调用执行前请求授权</td></tr>
+        <tr><td>「自动审批」（新体系）</td><td><span class="pill tier">第 3 档</span></td><td>沙箱开启，由内置 <strong>LLM Guardian</strong> 自动判断是否放行</td></tr>
+        <tr><td>「沙箱运行（支持白名单）」（旧体系，<strong>默认启用</strong>）</td><td><span class="pill tier">第 3 档</span></td><td>命令在沙箱中自动运行并做风险判定；白名单命令跳过沙箱直接运行</td></tr>
+        <tr><td>「完全访问」（新体系）</td><td><span class="pill tier">第 4 档</span></td><td>沙箱关闭，文件系统完全读写，所有安全检查禁用</td></tr>
+        <tr><td>「自动运行」（旧体系）</td><td><span class="pill tier">第 4 档</span></td><td>所有命令自动在沙箱外执行</td></tr>
+        <tr><td>CLI <code>permission_mode: bypass_permissions</code>（狂飙模式）</td><td><span class="pill tier">第 4 档</span></td><td>所有工具调用直接执行，不再提示授权</td></tr>
+        <tr><td>CLI <code>plan</code>；自定义模式 <code>reviewer: always_deny</code></td><td><span class="pill part">正交 · 阶段/锁定</span></td><td><code>plan</code> 为先规划后执行；<code>always_deny</code> 为锁定语义</td></tr>
+
+        <tr><td class="dim" rowspan="6">OpenClaw</td><td><code>exec.mode="ask"</code></td><td><span class="pill tier">第 1 档</span></td><td>白名单直接跑，未命中问人（<code>security=allowlist</code> ＋ <code>ask=on-miss</code>）</td></tr>
+        <tr><td><code>exec.mode="auto"</code></td><td><span class="pill tier">第 3 档</span></td><td>未命中白名单的命令交原生自动审查器裁决</td></tr>
+        <tr><td><code>exec.mode="full"</code></td><td><span class="pill tier">第 4 档</span></td><td>无审批门（<code>security=full</code> ＋ <code>ask=off</code>），官方称 YOLO</td></tr>
+        <tr><td><code>exec.mode="deny"</code></td><td><span class="pill part">正交 · 锁定</span></td><td>完全禁止 host exec</td></tr>
+        <tr><td><code>exec.mode="allowlist"</code></td><td><span class="pill part">正交 · 锁定</span></td><td>只跑白名单命令，未命中静默拒绝</td></tr>
+        <tr><td><code>sandbox.mode</code> = <code>off</code> / <code>non-main</code> / <code>all</code></td><td><span class="pill part">正交 · 沙箱层</span></td><td>沙箱是独立一轴，默认 <code>off</code>；后端默认 Docker</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="lbl">正交维度的四类模式</span>
+    <strong>锁定档</strong>（<code>dontAsk</code>、OpenClaw <code>deny</code> / <code>allowlist</code>、TRAE <code>always_deny</code>）是"不弹框、直接失败"，服务于 CI 与固定白名单代理的确定性要求。<strong>阶段档</strong>（<code>plan</code>）是"先探索再动手"的流程包装。<strong>协调档</strong>（<code>delegate</code>）是任务分工。<strong>沙箱层</strong>在 OpenClaw 里被显式拆成独立一轴（<code>off</code> / <code>non-main</code> / <code>all</code>），在其余四家里则与审批档绑定或由 <code>sandbox.enabled</code> 单独控制。这四类建议在权限 UI 中与四档分开展示。
+  </div>
+</section>
+
+<section>
+  <h2>关键发现</h2>
+
+  <h3>发现一：默认值的差距横跨三档</h3>
+  <p>这是五家最实质的分歧。同样叫"默认"，实际放行强度从第 1 档一直到第 4 档。</p>
+  <div class="tablewrap">
+    <table class="w4">
+      <thead><tr><th style="width:15%">产品</th><th style="width:13%">默认落档</th><th style="width:72%">默认状态</th></tr></thead>
+      <tbody>
+        <tr><td class="dim">OpenClaw</td><td><span class="pill none">第 4 档</span></td><td>沙箱默认 <code>off</code>，且 gateway / node 的 <code>exec.security</code> 默认 <code>full</code>、<code>exec.ask</code> 默认 <code>off</code>。官方原文："No-approval host exec is the default for gateway and node"。</td></tr>
+        <tr><td class="dim">Claude Code</td><td><span class="pill part">第 3 档</span></td><td>消费级计划默认 <code>auto</code>（v2.1.228+）；<code>claude -p</code>、Agent SDK、Bedrock 等场景默认第 1 档。</td></tr>
+        <tr><td class="dim">TRAE</td><td><span class="pill part">第 3 档</span></td><td>旧体系「沙箱运行（支持白名单）」默认启用，命令在沙箱内自动运行。</td></tr>
+        <tr><td class="dim">Codex</td><td><span class="pill part">第 2～3 档之间</span></td><td>默认 <code>workspace-write</code> ＋ <code>on-request</code>：沙箱内自动，越界由<strong>人</strong>审批。</td></tr>
+        <tr><td class="dim">CodeBuddy</td><td><span class="pill full">第 1 档</span></td><td>默认 <code>default</code>，官方表述为"默认使用严格的只读权限"。</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>五家里只有 CodeBuddy 把默认值放在最保守档，OpenClaw 反而默认就在最放开档。若把"默认档位"当作产品安全姿态的代理指标，这五家的排序与它们各自的安全宣传口径并不一致。</p>
+
+  <h3>发现二：第 3 档内部有两类判定器</h3>
+  <p>第 3 档的共性只是"越界不由人裁决"，但"由什么裁决"分成两支，能力与可预期性差异明显。</p>
+  <div class="grid2">
+    <div class="panel">
+      <h3><span>确定性规则 / 白名单</span>可预期，但覆盖窄</h3>
+      <ul class="clean">
+        <li><strong>TRAE</strong>「沙箱运行（支持白名单）」：白名单命令直接放行，其余在沙箱内自动运行并做风险判定，内置 <code>commandAstDangerChecker</code> 语法分析检测 <code>rm -rf /</code>、<code>chmod 777</code> 等</li>
+        <li><strong>OpenClaw</strong> 的 <code>allowlist</code> 语义：白名单直接跑，未命中静默拒绝</li>
+        <li><strong>Codex</strong> 的 <code>untrusted</code>：只自动放行"已知安全"的只读操作</li>
+        <li>优点：行为完全可预期、可审计、无模型不确定性；缺点：覆盖窄，长尾命令仍会弹窗</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3><span>LLM 判定</span>覆盖广，但非确定性保证</h3>
+      <ul class="clean">
+        <li><strong>Claude Code</strong> 的 classifier、<strong>CodeBuddy</strong> 的分类器：读自然语言可信边界，fail-closed</li>
+        <li><strong>Codex</strong> 的 <code>auto_review</code>：独立 reviewer agent，含拒绝熔断</li>
+        <li><strong>TRAE</strong>「自动审批」：内置 LLM Guardian（用自定义模型时由该模型审批）</li>
+        <li><strong>OpenClaw</strong> 的 <code>exec.mode="auto"</code>：交原生自动审查器</li>
+        <li>三家都明确自陈局限：Codex 称"不是确定性的安全保证"，OpenClaw 称"这不是一个完美的安全边界"</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>发现三：OpenClaw 官方印证了 Codex 的映射</h3>
+  <p>本报告对 Codex 第 3 档的映射是 <code>workspace-write</code> ＋ <code>on-request</code> ＋ <code>auto_review</code>。OpenClaw 官方文档在"Codex Guardian mapping"一节中，把它自己的 <code>exec.mode="auto"</code> 明确定义为映射到 Codex 的 <code>approvalPolicy=on-request</code>、<code>approvalsReviewer=auto_review</code>、<code>sandbox=workspace-write</code>。两个独立来源得出同一组合，这既验证了本报告的映射，也说明"<strong>沙箱内自动 ＋ 越界 LLM 复审</strong>"已经成为跨产品的标准第 3 档形态。</p>
+
+  <h3>发现四：OpenClaw 有独一份的"双层取严"机制</h3>
+  <p>OpenClaw 的有效策略由<strong>配置层</strong>（<code>tools.exec.*</code>）与<strong>主机本地审批状态</strong>两处派生，取<strong>更严格</strong>的一方；且审批只能收紧、不能放松配置派生的安全策略。命令获批后会绑定规范执行上下文（cwd、精确 argv、env、可执行文件路径与内容哈希），若审批到执行之间解析发生变化则拒绝运行。这套"配置与本地审批互相制约"的设计，在其余四家的单层配置模型中都没有对应物。</p>
+</section>
+
+<section>
+  <h2>五家能力对比矩阵</h2>
+  <div class="tablewrap">
+    <table class="w5">
+      <thead>
+        <tr>
+          <th style="width:11%">维度</th>
+          <th class="c-a" style="width:17.8%">Claude Code</th>
+          <th class="c-b" style="width:17.8%">Codex</th>
+          <th class="c-c" style="width:17.8%">CodeBuddy</th>
+          <th class="c-d" style="width:17.8%">TRAE</th>
+          <th class="c-e" style="width:17.8%">OpenClaw</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="dim">沙箱技术</td>
+          <td>macOS Seatbelt；Linux bubblewrap ＋ socat（可选 seccomp）。原生 Windows 不支持。</td>
+          <td>macOS Seatbelt；Linux bubblewrap ＋ seccomp（Landlock 回退）；Windows 原生 elevated / unelevated。</td>
+          <td>macOS Seatbelt；Linux bubblewrap。仅 macOS / Linux，Windows 计划中。</td>
+          <td>macOS <code>sandbox-exec</code>；<strong>Windows 自研沙箱 SDK</strong>；WSL2/Linux <code>Bubblewrap + User Namespace</code>，远程 Linux 自动写 sysctl 配置。</td>
+          <td>默认后端 <strong>Docker</strong>（另有 Podman / SSH / OpenShell / Crabbox）。容器默认 <code>network:"none"</code>、<code>readOnlyRoot</code>、<code>capDrop:["ALL"]</code>。</td>
+        </tr>
+        <tr>
+          <td class="dim">网络隔离</td>
+          <td>仅经 Unix domain socket 连沙箱外代理，按域名白名单放行。</td>
+          <td>默认全部关闭；<code>network_access=true</code> 才开；<code>network_proxy</code> 做域级 allow/deny。</td>
+          <td>经沙箱外代理控制，只允许批准域名，覆盖所有子进程。</td>
+          <td><strong>系统内置安全策略不涉及网络访问</strong>；<code>sandbox.json</code> 的网络控制<strong>仅 Windows</strong> 生效。</td>
+          <td>容器网络默认 <code>none</code>；bind mount 危险路径 denylist（<code>/etc</code>、<code>/proc</code>、Docker socket、HOME 凭据子路径等）。</td>
+        </tr>
+        <tr>
+          <td class="dim">用户可选档数</td>
+          <td>6 个（<code>Shift+Tab</code> 循环）</td>
+          <td>3 档沙箱 × 3 档审批，常用 3 个预设</td>
+          <td>6 个 ＋ <code>delegate</code></td>
+          <td>新体系 3 档 ＋ 自定义；旧体系 3 档；CLI 3 档</td>
+          <td>沙箱 3 档 × 审批 5 档，粒度最细</td>
+        </tr>
+        <tr>
+          <td class="dim">第 3 档判定器</td>
+          <td>classifier（LLM），读自然语言 <code>autoMode.environment</code></td>
+          <td>Auto-review（独立 reviewer agent），含拒绝熔断</td>
+          <td>分类器（LLM），5 条接管条件，fail-closed</td>
+          <td><strong>两条并存</strong>：LLM Guardian（新）/ 白名单 ＋ 语法风险检测（旧，默认）</td>
+          <td>原生自动审查器（LLM）；<code>allowlist</code> 为规则支</td>
+        </tr>
+        <tr>
+          <td class="dim">第 4 档残留保护</td>
+          <td><span class="pill part">保留两道</span> <code>deny</code> 规则全模式生效；critical path 的 <code>rm -rf /</code> 一律拒绝</td>
+          <td><span class="pill none">彻底放开</span> <code>--yolo</code> 无任何残留拦截</td>
+          <td><span class="pill part">分两层</span> 保留危险命令确认，需 <code>CODEBUDDY_IS_SANDBOX=1</code> 才跳过</td>
+          <td><span class="pill none">彻底放开</span> 「完全访问」"所有安全检查已禁用，不会触发审批"</td>
+          <td><span class="pill none">彻底放开</span> YOLO 即 <code>security=full</code> ＋ <code>ask=off</code></td>
+        </tr>
+        <tr>
+          <td class="dim">危险命令拦截</td>
+          <td>critical path 硬拒绝；<code>deny</code> 规则（deny → ask → allow）；静态分析放行安全只读命令</td>
+          <td>execpolicy：Starlark <code>prefix_rule()</code> 取最严者；<code>bash -lc</code> 用 tree-sitter 拆链逐条评估</td>
+          <td>9 阶段求值链；复合命令按子命令独立判定，allow 需全部命中</td>
+          <td><code>commandAstDangerChecker</code> 默认开启（语法分析）；<code>shellFileProtection</code> 默认关闭（沙箱关闭时兜底）；企业命令黑名单优先级最高</td>
+          <td><code>strictInlineEval</code>（默认关）可拦截 <code>python -c</code> 等内联求值；拒绝 <code>PATH</code> / <code>LD_*</code> 覆盖</td>
+        </tr>
+        <tr>
+          <td class="dim">文件保护</td>
+          <td>protected paths（<code>.git</code>、<code>.claude</code>）；沙箱 <code>denyRead</code>/<code>denyWrite</code>，窄路径优先</td>
+          <td>可写根内 <code>.git</code>、<code>.agents</code>、<code>.codex</code> 递归只读</td>
+          <td>清单最宽：<code>.git*</code>、shell 配置、包管理配置、<code>.vscode</code>/<code>.idea</code>/<code>.husky</code>、<code>.codebuddy</code>、<code>.mcp.json</code></td>
+          <td>项目目录内 <code>.trae</code>、<code>.vscode</code>、<code>.git</code> 排除读写；根目录 <code>/</code> 默认只读；未声明可写即只读</td>
+          <td>沙箱 bind mount 危险路径 denylist；<code>workspaceAccess</code> = <code>none</code>（默认）/ <code>ro</code> / <code>rw</code></td>
+        </tr>
+        <tr>
+          <td class="dim">默认档位</td>
+          <td>第 3 档（消费级 <code>auto</code>）</td>
+          <td>第 2～3 档之间</td>
+          <td>第 1 档（<code>default</code>）</td>
+          <td>第 3 档（沙箱运行，支持白名单）</td>
+          <td><strong>第 4 档</strong>（沙箱 off ＋ 无审批）</td>
+        </tr>
+        <tr>
+          <td class="dim">组织级管控</td>
+          <td><code>disableBypassPermissionsMode</code> / <code>disableAutoMode</code>；<code>allowManagedHooksOnly</code></td>
+          <td><code>requirements.toml</code> 强制 <code>prefix_rule</code>；<code>guardian_policy_config</code></td>
+          <td>同名前两项 ＋ <code>subagentPermissionMode</code>；企业策略层 <code>policySettings</code></td>
+          <td>企业命令黑名单（旗舰版）、<strong>企业沙箱</strong>（按 OS 下发，优先级高于个人配置）、MCP 白名单。<strong>但新「权限审批」UI 企业版不可用</strong></td>
+          <td>tool policy 五层过滤、<code>tools.elevated.allowFrom</code> 门控、operator roles</td>
+        </tr>
+        <tr>
+          <td class="dim">配置文件</td>
+          <td><code>~/.claude/settings.json</code> ＋ 托管设置</td>
+          <td><code>~/.codex/config.toml</code> ＋ <code>requirements.toml</code></td>
+          <td><code>~/.codebuddy/settings.json</code> ＋ 项目 settings</td>
+          <td><code>~/.trae-cn/sandbox.json</code>；<code>global.json</code> 的 <code>approval.sceneRules</code></td>
+          <td><code>~/.openclaw/openclaw.json</code> ＋ SQLite 审批状态</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>TRAE 专章</h2>
+
+  <h3>它有两套并存的权限体系</h3>
+  <p>这是评估 TRAE 时最容易混淆的一点：新旧两套体系同时存在，且都对外可见。</p>
+  <div class="grid2">
+    <div class="panel d">
+      <h3><span>新体系 · Beta</span>权限审批</h3>
+      <ul class="clean">
+        <li>入口：设置 &gt; Beta &gt; 启用权限系统；启用后出现在设置 &gt; 权限审批</li>
+        <li>三档：<strong>手动审批 / 自动审批 / 完全访问</strong>，另支持自定义权限模式</li>
+        <li>与 TraeWork 的档位命名完全一致，自动审批同样由内置 <strong>LLM Guardian</strong> 判定</li>
+        <li>状态：Beta，默认关闭；官方原文"关闭后将使用旧版自动运行设置"</li>
+        <li><strong>企业版不可用</strong>：功能清单中「权限审批」为个人版可用、企业版不可用</li>
+      </ul>
+    </div>
+    <div class="panel d">
+      <h3><span>旧体系 · 默认生效</span>自动运行</h3>
+      <ul class="clean">
+        <li>入口：设置 &gt; 对话流 &gt; 自动运行</li>
+        <li>三档：<strong>沙箱运行（支持白名单）/ 手动运行 / 自动运行</strong></li>
+        <li>「沙箱运行」<strong>默认启用</strong>：命令在沙箱中自动运行并判定风险，白名单命令无需经过沙箱直接运行</li>
+        <li>「自动运行」官方风险原文："建议非必要不启用 '自动运行' 模式。该模式会跳过所有安全检查，可能导致高风险操作在无提示的情况下被执行。"</li>
+        <li>可按 IDE 模式 / SOLO 模式分别设置；「自动运行 MCP」为独立开关</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="note key">
+    <span class="lbl">一个值得注意的落差</span>
+    TRAE 的新三档与 TraeWork 完全同名同义，但它<strong>只对个人版开放</strong>。企业版没有这套 UI，只能靠管理员侧的企业命令黑名单 ＋ 企业沙箱 ＋ 客户端旧「自动运行」设置来做管控。也就是说，<strong>企业客户目前拿不到"手动审批 / 自动审批"这种档位化的体验</strong>，而个人版用户可以。这是本次五家对比中唯一出现的"分档能力与版本/套餐绑定"的情况。
+  </div>
+
+  <h3>沙箱实现是五家里最"本土化"的</h3>
+  <p>TRAE 没有像其他几家那样统一走 Seatbelt ＋ bubblewrap，而是按平台分别实现：macOS 用系统 <code>sandbox-exec</code>，<strong>Windows 用自研沙箱 SDK</strong>，WSL2/Linux 用 <code>Bubblewrap + User Namespace</code>（Debian 10+ / Ubuntu 20.04+，通过 Remote SSH），远程 Linux 还会自动写入 <code>/etc/sysctl.d/trae-sandbox.conf</code>。它是五家里唯一在原生 Windows 上提供沙箱的（Claude Code 完全不支持原生 Windows 沙箱，CodeBuddy 计划中，OpenClaw 依赖 Docker）。</p>
+  <p>文件系统边界也最"白名单化"：项目目录内 <code>.trae</code>、<code>.vscode</code>、<code>.git</code> 被排除在读写之外；根目录 <code>/</code> 默认只读，<strong>所有未显式声明为可写的目录均为只读</strong>；读写权限继承当前用户权限，读写与只读冲突时<strong>以只读为准</strong>。需要注意官方明确"当前系统内置安全策略不涉及网络访问"，网络控制在 <code>sandbox.json</code> 中<strong>仅 Windows 生效</strong>。</p>
+
+  <h3>企业管控是五家里最完整的</h3>
+  <ul class="clean">
+    <li><strong>企业命令黑名单</strong>：文本匹配，"只要命令的任何部分（前缀、中间、结尾）匹配到黑名单文本，该命令就会被拦截"；一次工具调用中任一条命中则<strong>整批禁止</strong>。优先级为<strong>企业黑名单 &gt; 个人白名单 &gt; TRAE 内置默认规则</strong>。生效延迟约 10 分钟，需旗舰版。</li>
+    <li><strong>企业沙箱</strong>：按 Windows / macOS / Linux 分别下发策略（JSON，含 <code>filesystem</code>、<code>network</code>），官方明确"企业沙箱配置的优先级高于成员的个人沙箱配置"；同一操作系统只能启用一个策略；网络访问控制目前仅支持 Windows。</li>
+    <li>覆盖范围为五家最广：TraeCode / TraeWork 桌面＋网页 / TRAE 移动端 / Plugin / CLI。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>OpenClaw 专章</h2>
+
+  <h3>它是唯一把"三层"讲清楚的产品</h3>
+  <p>OpenClaw 官方把权限拆成三个互相独立的问题，这是五家里表述最清晰的一套：</p>
+  <ul class="clean">
+    <li><strong>Sandbox（在哪跑）</strong>：<code>agents.defaults.sandbox.mode</code> = <code>off</code>（默认）/ <code>non-main</code> / <code>all</code>；后端默认 Docker，另有 Podman / SSH / OpenShell / Crabbox；作用域 <code>session</code> / <code>agent</code>（默认）/ <code>shared</code>；工作区访问 <code>workspaceAccess</code> = <code>none</code>（默认）/ <code>ro</code> / <code>rw</code>。Gateway 进程始终留在宿主机，只有工具执行被移入沙箱。</li>
+    <li><strong>Tool policy（哪些工具存在）</strong>：五层过滤，逐层只能收紧，<code>deny</code> 永远优先；若 <code>allow</code> 非空则其余一律视为被阻止。tool policy 是硬停止，<code>/exec</code> 无法覆盖被 deny 的 <code>exec</code> 工具。</li>
+    <li><strong>Elevated（exec 专用逃逸口）</strong>：默认跑在 gateway，需 <code>tools.elevated.enabled</code> ＋ <code>tools.elevated.allowFrom.&lt;provider&gt;</code> 双重门控。</li>
+  </ul>
+  <p>审批层则是 5 档的 <code>tools.exec.mode</code>：<code>deny</code> / <code>allowlist</code> / <code>ask</code> / <code>auto</code> / <code>full</code>。这套设计的好处是"能做什么"与"问不问人"彻底解耦，坏处是概念数量最多、上手成本最高。</p>
+
+  <h3>它的默认值是五家里最放开的</h3>
+  <p>官方明确：沙箱默认 <code>off</code>；gateway / node 主机的 <code>exec.security</code> 默认 <code>full</code>、<code>exec.ask</code> 默认 <code>off</code>，即<strong>默认无审批、无沙箱</strong>。官方原文："No-approval host exec is the default for gateway and node"。同时官方也在文档中做了大量自我限定：</p>
+  <div class="note warn">
+    <span class="lbl">官方自陈的三条边界</span>
+    <strong>"这不是一个完美的安全边界"</strong>（This is not a perfect security boundary, but it materially limits filesystem and process access when the model does something dumb.）<br>
+    <strong>"每个 gateway 只有一个信任边界"</strong>：OpenClaw is not a hostile multi-tenant security boundary for mutually adversarial users sharing one agent or gateway.<br>
+    <strong>"审批不是认证边界"</strong>：Approvals reduce accidental execution risk, but are not a per-user auth boundary or filesystem read-only policy.<br>
+    官方还特别说明：运行 <code>security="full"</code> 且 <code>ask="off"</code> 的 node "遵循默认的可信操作员模型，是预期行为而非缺陷"。
+  </div>
+
+  <h3>三个别家没有的机制</h3>
+  <ul class="clean">
+    <li><strong>双层取严</strong>：有效策略由配置层 <code>tools.exec.*</code> 与主机本地审批状态两处派生，取<strong>更严格</strong>的一方；审批只能收紧、不能放松配置派生的安全策略。审批状态从早期 <code>exec-approvals.json</code> 迁移到了共享 SQLite 的 <code>exec_approvals_config</code> 行。</li>
+    <li><strong>审批绑定执行上下文</strong>：命令获批后绑定规范执行上下文（cwd、精确 argv、env、固定可执行文件路径与内容哈希），若审批到执行之间解析发生变化则<strong>拒绝运行</strong>。这防的是"批的时候是 A，跑的时候变成 B"的经典 TOCTOU 问题，五家里只有 OpenClaw 显式做了这件事。</li>
+    <li><strong>把 Codex / Claude Code 当后端并接管其权限</strong>：<code>mode="auto"</code> 会驱动 Codex app-server 走 Guardian 审查，并<strong>强制覆盖</strong> Codex 原有的 sandbox / approval 配置，避免残留 <code>approvalPolicy:"never"</code> ＋ <code>sandbox:"danger-full-access"</code> 这类不安全组合；<code>deny</code> / <code>allowlist</code> 会完全阻断 Codex 的本地执行。接 Claude Code 时则只用其 exec allowlist 校验命令参数，不接管沙箱。</li>
+  </ul>
+
+  <h3>额外拦截项</h3>
+  <p><code>strictInlineEval</code>（默认 <code>false</code>）开启后，内联代码求值形式（<code>python -c</code>、<code>node -e</code>、<code>ruby -e</code>、<code>perl -e</code>、<code>php -r</code>、<code>lua -e</code>、<code>osascript -e</code>，以及 <code>awk</code>/<code>sed</code>/<code>make</code>/<code>find -exec</code>/<code>xargs</code> 的内联形式）必须经审查器或显式人工审批。host 执行还会拒绝 <code>env.PATH</code> 与 <code>LD_*</code>/<code>DYLD_*</code> 覆盖，防二进制劫持。bind mount 默认阻断 <code>/etc</code>、<code>/proc</code>、<code>/sys</code>、<code>/dev</code>、<code>/root</code>、<code>/boot</code>、Docker socket 目录以及 HOME 下的凭据子路径（<code>.aws</code>、<code>.docker</code>、<code>.ssh</code>、<code>.gnupg</code>、<code>.npm</code> 等）。</p>
+</section>
+
+<section>
+  <h2>对 TraeWork 的建议</h2>
+  <p>加入 TRAE 与 OpenClaw 之后，此前的建议需要做两处修正。</p>
+  <ul class="clean">
+    <li><strong>补第 2 档仍然成立，且更有必要。</strong>五家里只有三家（Claude Code、CodeBuddy、Codex）能原生表达"编辑自动、命令问人"。TRAE 与 OpenClaw 都需要额外配置。这说明第 2 档是<strong>行业普遍缺口</strong>而非个别产品缺失，谁能先做成一等公民，谁就多一个明确的差异化点。</li>
+    <li><strong>优先解决 TRAE 自身的"新旧双轨"问题。</strong>TRAE 目前新旧两套权限体系并存，新三档还是 Beta 且企业版不可用。对 TraeWork 而言，真正的对手不是 Claude Code，而是同门的旧「自动运行」三档：<strong>两套档位命名相似、语义重叠、默认值不同</strong>，用户与企业管理员极易混淆。建议明确收敛时间表与迁移路径。</li>
+    <li><strong>第 3 档的判定器需要显式定义并对外说明。</strong>五家分成"确定性规则"与"LLM 判定"两支，而 TRAE 是唯一<strong>两支并存</strong>的（旧体系规则判定为默认，新体系 LLM Guardian）。若 TraeWork 走 LLM Guardian 路线，应像 Codex 一样公开熔断阈值与策略边界，像 Claude Code 一样明确"判定层不读项目内配置"，并像 OpenClaw 一样说明"审批不是认证边界"。</li>
+    <li><strong>把"第 4 档是否保留硬红线"写成明确的产品承诺。</strong>五家中三家（Claude Code、CodeBuddy，以及分两层的 TRAE 旧体系）在第 4 档保留了一定拦截，两家（Codex、OpenClaw）彻底放开。这是一个必须显式表态的取舍，不能留白。</li>
+    <li><strong>企业版分档能力值得补齐。</strong>TRAE 的企业命令黑名单与企业沙箱（按 OS 下发、优先级高于个人配置）在五家里最完整，值得借鉴；但其新「权限审批」UI 企业版不可用，是明显短板。建议 TraeWork 在企业版同时提供"档位选择 ＋ 管理员强制下限"两层能力。</li>
+    <li><strong>可借鉴 OpenClaw 的"审批绑定执行上下文"。</strong>命令获批后绑定 cwd、精确 argv、env 与可执行文件哈希，解析变化即拒绝运行。这是防止审批被绕过的高性价比加固，且不增加用户侧的操作负担。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>来源</h2>
+  <ol class="src">
+    <li><span class="t">TRAE · 权限审批（TraeCode）</span><a href="https://docs.trae.cn/ide_permission-and-approval">https://docs.trae.cn/ide_permission-and-approval</a></li>
+    <li><span class="t">TRAE · 权限审批（TraeWork）</span><a href="https://docs.trae.cn/work_permission-and-approval">https://docs.trae.cn/work_permission-and-approval</a></li>
+    <li><span class="t">TRAE · 自动运行 &amp; 安全性</span><a href="https://docs.trae.cn/ide_auto-run-and-security">https://docs.trae.cn/ide_auto-run-and-security</a></li>
+    <li><span class="t">TRAE · 沙箱（TraeCode）</span><a href="https://docs.trae.cn/ide_sandbox">https://docs.trae.cn/ide_sandbox</a></li>
+    <li><span class="t">TRAE · 沙箱（TraeWork）</span><a href="https://docs.trae.cn/work_sandbox">https://docs.trae.cn/work_sandbox</a></li>
+    <li><span class="t">TRAE · 更新日志</span><a href="https://docs.trae.cn/ide_changelog">https://docs.trae.cn/ide_changelog</a></li>
+    <li><span class="t">TRAE · 命令黑名单</span><a href="https://docs.trae.cn/enterprise_command-blocklist">https://docs.trae.cn/enterprise_command-blocklist</a></li>
+    <li><span class="t">TRAE · 企业沙箱</span><a href="https://docs.trae.cn/enterprise_sandbox">https://docs.trae.cn/enterprise_sandbox</a></li>
+    <li><span class="t">TRAE · 功能清单（企业版能力矩阵）</span><a href="https://docs.trae.cn/enterprise_feature-list">https://docs.trae.cn/enterprise_feature-list</a></li>
+    <li><span class="t">TRAE · Beta 功能</span><a href="https://docs.trae.cn/ide_beta-features">https://docs.trae.cn/ide_beta-features</a></li>
+    <li><span class="t">TRAE · 自定义权限模式配置参考</span><a href="https://docs.trae.cn/ide_custom-permission-mode-configuration-reference">https://docs.trae.cn/ide_custom-permission-mode-configuration-reference</a></li>
+    <li><span class="t">TRAE CLI · 权限模式（火山引擎文档）</span><a href="https://www.volcengine.com/docs/86677/2227872">https://www.volcengine.com/docs/86677/2227872</a></li>
+    <li><span class="t">OpenClaw · Sandboxing</span><a href="https://docs.openclaw.ai/gateway/sandboxing.md">https://docs.openclaw.ai/gateway/sandboxing.md</a></li>
+    <li><span class="t">OpenClaw · Sandbox modes, scope and backend</span><a href="https://docs.openclaw.ai/gateway/sandboxing/modes-scope-and-backend.md">https://docs.openclaw.ai/gateway/sandboxing/modes-scope-and-backend.md</a></li>
+    <li><span class="t">OpenClaw · Exec approvals</span><a href="https://docs.openclaw.ai/tools/exec-approvals.md">https://docs.openclaw.ai/tools/exec-approvals.md</a></li>
+    <li><span class="t">OpenClaw · Exec tool</span><a href="https://docs.openclaw.ai/tools/exec.md">https://docs.openclaw.ai/tools/exec.md</a></li>
+    <li><span class="t">OpenClaw · Permission modes（含 Codex Guardian mapping）</span><a href="https://docs.openclaw.ai/tools/permission-modes.md">https://docs.openclaw.ai/tools/permission-modes.md</a></li>
+    <li><span class="t">OpenClaw · Sandbox vs tool policy vs elevated</span><a href="https://docs.openclaw.ai/gateway/sandbox-vs-tool-policy-vs-elevated.md">https://docs.openclaw.ai/gateway/sandbox-vs-tool-policy-vs-elevated.md</a></li>
+    <li><span class="t">OpenClaw · Tool and agent permissions</span><a href="https://docs.openclaw.ai/gateway/security/tool-permissions">https://docs.openclaw.ai/gateway/security/tool-permissions</a></li>
+    <li><span class="t">OpenClaw · Security</span><a href="https://docs.openclaw.ai/gateway/security">https://docs.openclaw.ai/gateway/security</a></li>
+    <li><span class="t">Claude Code · Permission modes</span><a href="https://code.claude.com/docs/en/permission-modes">https://code.claude.com/docs/en/permission-modes</a></li>
+    <li><span class="t">Claude Code · Sandboxing</span><a href="https://code.claude.com/docs/en/sandboxing">https://code.claude.com/docs/en/sandboxing</a></li>
+    <li><span class="t">Claude Code · Permissions</span><a href="https://code.claude.com/docs/en/permissions">https://code.claude.com/docs/en/permissions</a></li>
+    <li><span class="t">Claude Code · Configure auto mode</span><a href="https://code.claude.com/docs/en/auto-mode-config">https://code.claude.com/docs/en/auto-mode-config</a></li>
+    <li><span class="t">Codex · Agent approvals &amp; security</span><a href="https://developers.openai.com/codex/agent-approvals-security">https://developers.openai.com/codex/agent-approvals-security</a></li>
+    <li><span class="t">Codex · Sandboxing concepts</span><a href="https://developers.openai.com/codex/concepts/sandboxing">https://developers.openai.com/codex/concepts/sandboxing</a></li>
+    <li><span class="t">Codex · Auto-review</span><a href="https://developers.openai.com/codex/concepts/sandboxing/auto-review">https://developers.openai.com/codex/concepts/sandboxing/auto-review</a></li>
+    <li><span class="t">Codex · CLI reference</span><a href="https://developers.openai.com/codex/cli/reference">https://developers.openai.com/codex/cli/reference</a></li>
+    <li><span class="t">Codex · Rules（execpolicy / prefix_rule）</span><a href="https://developers.openai.com/codex/rules">https://developers.openai.com/codex/rules</a></li>
+    <li><span class="t">CodeBuddy · 权限模式</span><a href="https://www.codebuddy.ai/docs/zh/cli/permission-modes">https://www.codebuddy.ai/docs/zh/cli/permission-modes</a></li>
+    <li><span class="t">CodeBuddy · 权限规则</span><a href="https://www.codebuddy.cn/docs/cli/permissions">https://www.codebuddy.cn/docs/cli/permissions</a></li>
+    <li><span class="t">CodeBuddy · Bash 沙箱</span><a href="https://www.codebuddy.cn/docs/cli/bash-sandboxing">https://www.codebuddy.cn/docs/cli/bash-sandboxing</a></li>
+    <li><span class="t">CodeBuddy · 安全</span><a href="https://www.codebuddy.ai/docs/zh/cli/security">https://www.codebuddy.ai/docs/zh/cli/security</a></li>
+  </ol>
+</section>
+
+<footer>
+  报告生成于 2026-09-18 · 五家结论均基于官方文档站一手内容 · 本报告覆盖并取代此前的三产品版本 · 产品迭代较快，建议在决策前复核官方最新页面。
+</footer>
+
+</div>
+</body>
+</html>

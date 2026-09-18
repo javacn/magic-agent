@@ -7,7 +7,7 @@ package cli
 //	- 端到端：fake 引擎注册 + cobra 命令执行 + 默认 json 输出
 //	- 根命令提问（-p / 位置参数）
 //	- --tools 解析（off / on / 白名单 / 非法值）
-//	- --engines flag（text 表格 + --json）
+//	- --engines flag（默认 JSON 数组；--json 兼容）
 //	- 子命令已删除（ask / engines / version / completion 均不存在）
 //	- 引擎/格式参数校验错误 → exit 2
 //
@@ -17,6 +17,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -26,7 +27,33 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/darren/magic-agent/internal/agent"
+	"github.com/darren/magic-agent/internal/config"
+	"github.com/darren/magic-agent/internal/session"
 )
+
+// TestMain 隔离用户真实配置与会话登记表。
+//
+// prepareAsk 会读配置文件取「默认系统提示词」（~/.config/magic-agent/config.json），
+// 每次调用还会往会话登记表（~/.magic-agent/sessions/）落一条记录 —— 不隔离的话
+// 本机那份配置会渗进断言，测试还会往用户真实登记表里写垃圾。
+// 需要真配置/真登记表的用例自己用 t.Setenv 覆盖。
+func TestMain(m *testing.M) {
+	_ = os.Setenv(config.EnvPath, filepath.Join(os.TempDir(), "magic-agent-test-absent", "config.json"))
+	// 登记表目录用 /tmp 下的**短**路径：常驻会话的追加入口是 unix socket，
+	// 路径有 104 字节上限，而 macOS 的 TMPDIR 是 /var/folders/... 那种长路径。
+	sessDir, err := os.MkdirTemp("/tmp", "mas-cli-test-")
+	if err != nil {
+		sessDir, err = os.MkdirTemp("", "mas-cli-test-")
+	}
+	if err == nil {
+		_ = os.Setenv(session.EnvDir, sessDir)
+	}
+	code := m.Run()
+	if err == nil {
+		_ = os.RemoveAll(sessDir)
+	}
+	os.Exit(code)
+}
 
 // stringEngine 最简单的假引擎：固定返回文本。
 type stringEngine struct {
@@ -77,12 +104,16 @@ func (s *streamingEngine) Stream(ctx context.Context, req agent.Request, onEvent
 
 // capturingEngine 捕获收到的 prompt 与 tools 模式，供组合输入断言。
 type capturingEngine struct {
-	name         string
-	lastPrompt   string
-	lastTools    agent.ToolsMode
-	lastSchema   *agent.JSONSchema
-	lastMaxTok   int
-	lastTemp     *float64
+	name          string
+	lastPrompt    string
+	lastTools     agent.ToolsMode
+	lastSchema    *agent.JSONSchema
+	lastMaxTok    int
+	lastTemp      *float64
+	lastSessionID string
+	lastContinue  bool
+	lastSystem    string
+	lastAttach    []agent.Attachment
 }
 
 func (c *capturingEngine) Name() string           { return c.name }
@@ -95,6 +126,10 @@ func (c *capturingEngine) Complete(ctx context.Context, req agent.Request) (agen
 	c.lastSchema = req.JSONSchema
 	c.lastMaxTok = req.MaxTokens
 	c.lastTemp = req.Temperature
+	c.lastSessionID = req.SessionID
+	c.lastContinue = req.Continue
+	c.lastSystem = req.SystemPrompt
+	c.lastAttach = req.Attachments
 	return agent.Response{Text: "captured", Model: "fake-model", Latency: 1_000_000}, nil
 }
 
@@ -261,6 +296,79 @@ func TestToolsPassthrough(t *testing.T) {
 	}
 	if !agent.ToolsIsOn(capEng.lastTools) {
 		t.Errorf("tools=on should pass through, got %#v", capEng.lastTools)
+	}
+}
+
+// --session 会话续接 id 透传到引擎 Request；缺省为空 = 新会话。
+func TestSessionPassthrough(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-sess"}
+	registerFake(capEng)
+
+	// 显式 --session abc → Request.SessionID == "abc"
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sess", "--session", "abc", "接着说"); err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastSessionID != "abc" {
+		t.Errorf("lastSessionID = %q, want abc", capEng.lastSessionID)
+	}
+
+	// 缺省 → 空串（新会话）
+	capEng.lastSessionID = "sentinel"
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sess", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastSessionID != "" {
+		t.Errorf("default lastSessionID = %q, want empty (new session)", capEng.lastSessionID)
+	}
+
+	// 纯空白值视同缺省 → 空串
+	capEng.lastSessionID = "sentinel"
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sess", "--session", "  ", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastSessionID != "" {
+		t.Errorf("blank lastSessionID = %q, want empty (trimmed)", capEng.lastSessionID)
+	}
+}
+
+// -c/--continue 透传到引擎 Request；缺省 false = 新会话；
+// --session 与 -c 同时给时两者都透传（引擎侧 SessionID 优先）。
+func TestContinuePassthrough(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-cont"}
+	registerFake(capEng)
+
+	// -c → Continue == true
+	if _, _, err := runAskCmd(t, "", "-e", "fake-cont", "-c", "接着说"); err != nil {
+		t.Fatal(err)
+	}
+	if !capEng.lastContinue {
+		t.Errorf("lastContinue = false, want true (-c)")
+	}
+
+	// 长形式 --continue 等价
+	capEng.lastContinue = false
+	if _, _, err := runAskCmd(t, "", "-e", "fake-cont", "--continue", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if !capEng.lastContinue {
+		t.Errorf("--continue long form not captured")
+	}
+
+	// 缺省 → false（新会话）
+	capEng.lastContinue = true
+	if _, _, err := runAskCmd(t, "", "-e", "fake-cont", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastContinue {
+		t.Errorf("default lastContinue = true, want false (new session)")
+	}
+
+	// --session 与 -c 同时给：CLI 层两者都透传，优先级由引擎侧保证
+	if _, _, err := runAskCmd(t, "", "-e", "fake-cont", "--session", "abc", "-c", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if capEng.lastSessionID != "abc" || !capEng.lastContinue {
+		t.Errorf("session=%q continue=%v, want abc/true", capEng.lastSessionID, capEng.lastContinue)
 	}
 }
 
@@ -486,23 +594,32 @@ func TestExitCodeOf(t *testing.T) {
 func unregisterLast() {}
 
 // ── --engines flag ───────────────────────────────────────────
+//
+// 注意：以下用例一律带 --no-models —— 模型探测会真的启动本机 CLI
+//（trae-cli / llm / codex / openclaw / codebuddy），单元测试不该依赖它们。
+// models 字段本身的行为由 TestEnginesFlagIncludesModels 用假引擎 + 假探测覆盖。
 
-func TestEnginesFlagText(t *testing.T) {
+// --engines 默认即输出 JSON 数组（含引擎名与是否可用），无需 --json。
+func TestEnginesFlagJSONByDefault(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-list", text: "x"})
 
-	stdout, _, err := runAskCmd(t, "", "--engines")
+	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
 	if err != nil {
 		t.Fatalf("--engines: %v", err)
 	}
-	if !strings.Contains(stdout, "ENGINE") || !strings.Contains(stdout, "fake-list") {
-		t.Errorf("stdout = %q, want engine table with fake-list", stdout)
+	if !strings.Contains(stdout, `"engine":"fake-list"`) || !strings.Contains(stdout, `"ok":true`) {
+		t.Errorf("stdout = %q, want json array with engine name and ok", stdout)
+	}
+	if strings.Contains(stdout, "ENGINE") {
+		t.Errorf("stdout = %q, want json output only (no text table)", stdout)
 	}
 }
 
+// --engines --json 旧调用形态仍然兼容（同样输出 JSON）。
 func TestEnginesFlagJSON(t *testing.T) {
 	registerFake(&stringEngine{name: "fake-json-list", text: "x"})
 
-	stdout, _, err := runAskCmd(t, "", "--engines", "--json")
+	stdout, _, err := runAskCmd(t, "", "--engines", "--json", "--no-models")
 	if err != nil {
 		t.Fatalf("--engines --json: %v", err)
 	}
@@ -513,12 +630,125 @@ func TestEnginesFlagJSON(t *testing.T) {
 
 // --engines 时不应触发提问（无 prompt 也不报错）。
 func TestEnginesFlagSkipsPrompt(t *testing.T) {
-	stdout, _, err := runAskCmd(t, "", "--engines")
+	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
 	if err != nil {
 		t.Fatalf("--engines should not require prompt: %v", err)
 	}
-	if !strings.Contains(stdout, "ENGINE") {
-		t.Errorf("stdout = %q, want engine table", stdout)
+	if !strings.Contains(stdout, `"engine"`) {
+		t.Errorf("stdout = %q, want json engine list", stdout)
+	}
+}
+
+// modelListEngine 假引擎：在 stringEngine 之上实现 agent.ModelLister。
+type modelListEngine struct {
+	stringEngine
+	models []string
+	err    error
+}
+
+func (m *modelListEngine) ListModels(context.Context) ([]string, error) {
+	return m.models, m.err
+}
+
+// stubModelProbe 把 CLI 层的模型探测限制在假引擎上：
+// 假引擎（*modelListEngine）走它自己的 ListModels，其余引擎（真实 CLI 引擎）
+// 直接返回"无动态来源"。t.Cleanup 自动还原。
+func stubModelProbe(t *testing.T) {
+	t.Helper()
+	prev := probeEngineModels
+	probeEngineModels = func(ctx context.Context, l agent.ModelLister) ([]string, error) {
+		if _, ok := l.(*modelListEngine); ok {
+			return l.ListModels(ctx)
+		}
+		return nil, agent.ErrNoModelSource
+	}
+	t.Cleanup(func() { probeEngineModels = prev })
+}
+
+// enginesRow --engines 输出的一行（只看本用例关心的字段）。
+type enginesRow struct {
+	Engine     string   `json:"engine"`
+	OK         bool     `json:"ok"`
+	Models     []string `json:"models"`
+	ModelsNote string   `json:"models_note"`
+}
+
+// findEnginesRow 按引擎名取行。
+func findEnginesRow(t *testing.T, rows []enginesRow, name string) enginesRow {
+	t.Helper()
+	for _, r := range rows {
+		if r.Engine == name {
+			return r
+		}
+	}
+	t.Fatalf("engine %q not found in %+v", name, rows)
+	return enginesRow{}
+}
+
+// --engines 每行带 models（动态探测结果）；探测失败的引擎给 models_note。
+func TestEnginesFlagIncludesModels(t *testing.T) {
+	okEngine := &modelListEngine{
+		stringEngine: stringEngine{name: "fake-models-ok"},
+		models:       []string{"m-a", "m-b"},
+	}
+	errEngine := &modelListEngine{
+		stringEngine: stringEngine{name: "fake-models-err"},
+		err:          errors.New("probe failed: boom"),
+	}
+	registerFake(okEngine)
+	registerFake(errEngine)
+	stubModelProbe(t)
+
+	stdout, _, err := runAskCmd(t, "", "--engines")
+	if err != nil {
+		t.Fatalf("--engines: %v", err)
+	}
+	var rows []enginesRow
+	if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+
+	ok := findEnginesRow(t, rows, "fake-models-ok")
+	if len(ok.Models) != 2 || ok.Models[0] != "m-a" || ok.Models[1] != "m-b" {
+		t.Errorf("models = %v want [m-a m-b]", ok.Models)
+	}
+	if ok.ModelsNote != "" {
+		t.Errorf("models_note should be empty on success, got %q", ok.ModelsNote)
+	}
+
+	bad := findEnginesRow(t, rows, "fake-models-err")
+	if len(bad.Models) != 0 {
+		t.Errorf("failed probe should not report models, got %v", bad.Models)
+	}
+	if !strings.Contains(bad.ModelsNote, "probe failed: boom") {
+		t.Errorf("models_note = %q, want probe error", bad.ModelsNote)
+	}
+}
+
+// --engines --no-models 完全不触发探测（不启动任何 CLI）。
+func TestEnginesFlagNoModelsSkipsProbe(t *testing.T) {
+	registerFake(&modelListEngine{
+		stringEngine: stringEngine{name: "fake-no-models"},
+		models:       []string{"m-a"},
+	})
+
+	prev := probeEngineModels
+	calls := 0
+	probeEngineModels = func(context.Context, agent.ModelLister) ([]string, error) {
+		calls++
+		return []string{"should-not-appear"}, nil
+	}
+	t.Cleanup(func() { probeEngineModels = prev })
+
+	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
+	if err != nil {
+		t.Fatalf("--engines --no-models: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("probe called %d times, want 0", calls)
+	}
+	if strings.Contains(stdout, `"models":`) || strings.Contains(stdout, `"models_note":`) {
+		t.Errorf("stdout = %q, want no models fields", stdout)
 	}
 }
 
@@ -641,3 +871,106 @@ func TestStreamFailureJSON(t *testing.T) {
 
 // 确保 cobra 命令满足接口。
 var _ = cobra.Command{}
+
+// ── 默认系统提示词（配置文件 systemPrompt）────────────────────
+
+// writeCLIConfig 把配置内容落到临时文件并返回路径（供 t.Setenv(config.EnvPath, ...)）。
+func writeCLIConfig(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// 没给 -s → 用配置文件里的 systemPrompt（全局默认）。
+func TestSystemPromptDefaultsFromConfig(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-syscfg"}
+	registerFake(capEng)
+	t.Setenv(config.EnvPath, writeCLIConfig(t, `{"systemPrompt":"你是一个中文助手，始终用中文回答所有问题。"}`))
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-syscfg", "hi"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	want := "你是一个中文助手，始终用中文回答所有问题。"
+	if capEng.lastSystem != want {
+		t.Errorf("SystemPrompt = %q want %q", capEng.lastSystem, want)
+	}
+}
+
+// -s 优先于配置里的默认值（给了就完全替换，不叠加）。
+func TestSystemFlagOverridesConfigDefault(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-sysover"}
+	registerFake(capEng)
+	t.Setenv(config.EnvPath, writeCLIConfig(t, `{"systemPrompt":"配置里的默认"}`))
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sysover", "-s", "命令行给的", "hi"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if capEng.lastSystem != "命令行给的" {
+		t.Errorf("SystemPrompt = %q want 命令行值", capEng.lastSystem)
+	}
+}
+
+// 配置里没有 systemPrompt（或文件不存在）→ 不注入，行为与以前一致。
+func TestSystemPromptAbsentNotInjected(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-sysnone"}
+	registerFake(capEng)
+
+	// ① 配置文件存在但无该键
+	t.Setenv(config.EnvPath, writeCLIConfig(t, `{"arkclaw":{"url":"u","key":"k","claw_id":"c"}}`))
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sysnone", "hi"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if capEng.lastSystem != "" {
+		t.Errorf("无该键时应为空, got %q", capEng.lastSystem)
+	}
+
+	// ② 配置文件不存在
+	t.Setenv(config.EnvPath, filepath.Join(t.TempDir(), "absent.json"))
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sysnone", "hi"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if capEng.lastSystem != "" {
+		t.Errorf("文件缺失时应为空, got %q", capEng.lastSystem)
+	}
+}
+
+// 环境变量 MAGIC_AGENT_SYSTEM_PROMPT 覆盖文件值。
+func TestSystemPromptEnvOverride(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-sysenv"}
+	registerFake(capEng)
+	t.Setenv(config.EnvPath, writeCLIConfig(t, `{"systemPrompt":"文件里的"}`))
+	t.Setenv(config.EnvSystemPrompt, "环境变量里的")
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sysenv", "hi"); err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if capEng.lastSystem != "环境变量里的" {
+		t.Errorf("SystemPrompt = %q want 环境变量值", capEng.lastSystem)
+	}
+}
+
+// 配置文件语法错 → 不阻断调用（不注入默认值）；-v 时在 stderr 说明原因。
+func TestBrokenConfigDoesNotBreakAsk(t *testing.T) {
+	capEng := &capturingEngine{name: "fake-sysbad"}
+	registerFake(capEng)
+	t.Setenv(config.EnvPath, writeCLIConfig(t, `{"systemPrompt":`))
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-sysbad", "hi"); err != nil {
+		t.Fatalf("坏配置不应让调用失败: %v", err)
+	}
+	if capEng.lastSystem != "" {
+		t.Errorf("坏配置时不注入, got %q", capEng.lastSystem)
+	}
+
+	// -v：stderr 出现提示（不静默）
+	_, stderr, err := runAskCmd(t, "", "-e", "fake-sysbad", "-v", "hi")
+	if err != nil {
+		t.Fatalf("ask -v: %v", err)
+	}
+	if !strings.Contains(stderr, "读取默认系统提示词失败") {
+		t.Errorf("-v 应提示配置读取失败, stderr = %q", stderr)
+	}
+}

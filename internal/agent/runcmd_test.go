@@ -20,8 +20,9 @@ func TestRunCLIKillsProcessGroupOnTimeout(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "alive")
 	cli := filepath.Join(dir, "slow-cli")
-	// 脚本：后台循环写 marker（模拟 worker 存活），前台 sleep 30s。
-	script := "#!/bin/sh\n(while true; do touch " + marker + "; sleep 0.2; done) &\nsleep 30\n"
+	// 脚本：启动即 touch marker（消除负载下的启动竞态），后台循环持续
+	// 写 marker（模拟 worker 存活），前台 sleep 30s。
+	script := "#!/bin/sh\ntouch " + marker + "\n(while true; do touch " + marker + "; sleep 0.2; done) &\nsleep 30\n"
 	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

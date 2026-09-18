@@ -1,17 +1,21 @@
 // Package agent - 引擎无关的 agent CLI 代理抽象层。
 //
 // magic-agent 是一个专业的 agent CLI 代理工具：把 claude / codebuddy /
-// trae 三家 CLI 的非交互调用统一成一个 Engine 接口，对外提供一致的
-// 请求/响应结构、超时与重试语义、固定的 text / json 输出格式。
+// trae / llm / codex / openclaw 六家 CLI 的非交互调用统一成一个 Engine 接口，
+// 对外提供一致的请求/响应结构、超时与重试语义、固定的 text / json 输出格式。
 //
 // 各关注点分文件维护：
 //
-//	engine.go    — Engine 接口、Request/Response 类型、注册表
-//	prompt.go    — 多轮消息扁平化为单条 prompt 的公共逻辑
-//	claude.go    — Claude Code CLI 引擎（--print --output-format json）
-//	codebuddy.go — CodeBuddy（WorkBuddy）CLI 引擎
-//	trae.go      — Trae CLI 引擎（-p，无 --model flag，-c model.name= 覆盖）
-//	runner.go    — 超时 + 重试编排（可重试错误分类、指数退避）
+//	engine.go      — Engine 接口、Request/Response 类型、注册表
+//	engine_base.go — 公共基座：统一探测链（cliBase）+ 统一参数矩阵
+//	prompt.go      — 多轮消息扁平化为单条 prompt 的公共逻辑
+//	claude.go      — Claude Code CLI 引擎（--print --output-format json）
+//	codebuddy.go   — CodeBuddy（WorkBuddy）CLI 引擎
+//	trae.go        — Trae CLI 引擎（-p，无 --model flag，-c model.name= 覆盖）
+//	llmengine.go   — simonw/LLM CLI 引擎（-m / -s / -o 透传）
+//	codex.go       — Codex CLI 引擎（exec / exec resume + --output-schema）
+//	openclaw.go    — OpenClaw CLI 引擎（agent --local --json）
+//	runner.go      — 超时 + 重试编排（可重试错误分类、指数退避）
 package agent
 
 import (
@@ -83,19 +87,49 @@ type Request struct {
 	// Tools 工具开关模式（默认 ToolsOff）。
 	Tools ToolsMode
 
+	// Permission 四档权限档位（默认 DefaultPermissionTier = full，保持既有行为）。
+	//
+	// 四档语义与 Claude Code 参数映射见 permission.go。空串 = 用默认档。
+	// 只有 PermissionSupported 为真的引擎（claude / codebuddy）会真正落地；
+	// 其余引擎传非空值会在 CLI 层被**明确拒绝**（exit 2），不会静默忽略 ——
+	// 静默忽略一个安全设置，等于让用户以为自己被保护着。
+	Permission PermissionTier
+
+	// PermissionOptions 四档模型之上的可选项（沙箱排除命令、网络白名单、
+	// 第 3 档分类器的受信边界、deny/ask 规则）。零值即最严格。
+	// 只在 PermissionSupported 的引擎上生效。
+	PermissionOptions PermissionOptions
+
 	// Messages 对话消息；CLI 引擎会扁平化为单条 prompt。
 	Messages []Message
 
+	// SessionID 会话续接 id。空 = 新会话（默认，上下文从零开始）；
+	// 非空 = 续接该会话（引擎透传各自的续接参数），上一轮上下文继续生效。
+	// 会话 id 通常取自上一次 Response.SessionID。各引擎映射（统一支持）：
+	// claude/codebuddy --resume <id>；trae --resume=<id>；llm --cid <id>。
+	// 注意：新会话不主动禁用落盘（--no-session-persistence 的会话无法续接），
+	// 这样首轮返回的 session_id 才能用于下一轮 --session。
+	SessionID string
+
+	// Continue 续接"最近一次会话"（不需要 session id）。各引擎映射
+	//（统一支持）：claude/codebuddy --continue；trae 裸 --resume
+	//（AUTO = 自动接最近一次会话，实测 -p 非交互模式可用）；llm -c。
+	// 与 SessionID 同时设置时 SessionID 优先（显式 id 比"最近一次"更精确）。
+	Continue bool
+
 	// MaxTokens 输出 token 上限。0 = 不指定（交给引擎/模型默认）。
 	//
-	// 各引擎支持度不同（见各引擎文件）：llm 引擎经 `-o max_tokens` 透传；
-	// 其余 CLI 引擎不支持该参数，会忽略（不上报错误）。
+	// 各引擎映射（统一支持，trae 除外）：llm 经 `-o max_tokens` 透传；
+	// claude/codebuddy 经 `--settings` 注入 env CLAUDE_CODE_MAX_OUTPUT_TOKENS
+	//（两者无原生 flag）；trae 不支持 —— `-c <k>=<v>` 会整体覆盖模型配置块
+	//（实测注入后模型名漂移并触发配额错误），静默忽略。
 	// 推理模型（MiniMax-M3 等）的思考过程计入 output 配额，调用方
 	// 需要给足够大的值，否则正文会被思考吃光。
 	MaxTokens int
 
 	// Temperature 采样温度。nil = 不提（交给引擎/模型默认）。
-	// 支持度同 MaxTokens。
+	// 仅 llm 支持（`-o temperature`）；claude/codebuddy/trae 无原生参数，
+	// 忽略（不上报错误）。
 	Temperature *float64
 
 	// JSONSchema 是可选的结构化输出约束。
@@ -111,9 +145,60 @@ type Request struct {
 	// 提示词约束；本字段只是 llm 引擎做"输出后处理"以稳定 JSON。
 	JSONSchema *JSONSchema
 
+	// Attachments 随提示词一起发送的附件（截图 / 图片为主）。
+	//
+	// 用户需求原文（2026-09-17）：「文件＋提示词 比如截图加提示词」——
+	// 提示词与附件是**并列**关系，不是「提示词其实是个文件路径」。
+	//
+	// 各引擎落地方式（尽量用原生能力，见 AttachmentSupportOf）：
+	//
+	//	codex     原生 `-i/--image <FILE>...`（可重复）
+	//	claude    原生 `--input-format stream-json`：附件作为 message content 的
+	//	          image block 走 stdin（CLI 要求此时 output-format 也是 stream-json）
+	//	codebuddy 同上（同族 CLI，同样有 --input-format）
+	//	llm       直连：OpenAI 兼容 content parts（image_url + data URL）；
+	//	          委托 llm CLI：原生 `-a/--attachment <path>`
+	//	arkclaw   原生 A2A：message.parts 里追加 kind=file 的 file part（base64 inline）
+	//	trae      无原生输入通道 → 只能把**绝对路径**写进提示词，靠它的读文件工具看
+	//	openclaw  同上
+	//
+	// 路径由 CLI 层校验（存在 + 普通文件）后填成绝对路径；引擎不重复校验。
+	Attachments []Attachment
+
+	// Append 追加消息通道（常驻会话 / keep-alive）。
+	//
+	// 用户需求（2026-09-18）：「会话中追加需求」。非 nil 时本次调用是**常驻会话**：
+	// 引擎先发提示词，之后每从通道收到一条文本就再追加一轮 user 消息（同一进程、同一会话），
+	// 通道关闭 → stdin EOF → 引擎收尾退出。
+	//
+	// 只有 claude / codebuddy 支持（走 stream-json 输入：`--input-format stream-json` 的
+	// stdin 可以持续喂 user 消息，官方文档明确「allows providing guidance to the model
+	// while it [is working]」，本项目 2026-09-18 实测同一进程内两轮均被处理）。
+	// 其它引擎拿到非 nil 会在 CLI 层被挡下（见 AppendSupportOf）。
+	Append <-chan string
+
 	// Timeout 单次尝试的超时（含引擎 CLI 自身执行时间）。
 	// 0 = 引擎默认。
 	Timeout time.Duration
+
+	// Workspace 工作目录（绝对路径）。空 = 用调用方的 cwd（默认行为）。
+	//
+	// 各引擎落地方式（尽量用原生能力，见 WorkspaceSupportOf）：
+	//
+	//	codex     原生 `-C/--cd <dir>`（working root）**并**子进程 cwd
+	//	claude    子进程 cwd（CLI 无工作目录 flag；--add-dir 只用于追加额外目录）
+	//	codebuddy 同上（有 --add-dir，语义同 claude）
+	//	trae      同上（有 --add-dir）
+	//	openclaw  不支持：workspace 与 agent 绑定（`openclaw agents`），无 per-call flag，
+	//	          实测子进程 cwd 被忽略 → 参数被忽略（CLI 层提示）
+	//	llm       不支持：模型不直接读写文件，无文件系统语义 → 参数被忽略（CLI 层提示）
+	//	arkclaw   不支持：远端网关按 claw_id 绑定，客户端无法指定
+	//
+	// 上面的"生效/忽略"与 WorkspaceSupportOf 的取值一一对应（flag:-C / cwd / none）。
+	//
+	// 目录必须存在且是目录（CLI 层校验）；不存在时 spawn 会以 "chdir ...: no such file
+	// or directory" 失败，这里提前拦掉更清楚。
+	Workspace string
 }
 
 // JSONSchema 是传给 Engine 的结构化输出契约（精简版）。
@@ -205,6 +290,9 @@ func initEngines() {
 	Register(&CodeBuddyEngine{})
 	Register(&TraeEngine{})
 	Register(&LLMEngine{})
+	Register(&CodexEngine{})
+	Register(&OpenClawEngine{})
+	Register(&ArkClawEngine{})
 }
 
 // toolsOrDefault nil ToolsMode 视为 ToolsOff。

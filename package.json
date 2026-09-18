@@ -1,7 +1,7 @@
 {
   "name": "magic-agent",
-  "version": "0.1.0",
-  "description": "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae 引擎",
+  "version": "0.2.0",
+  "description": "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae / llm / codex / openclaw 引擎",
   "license": "MIT",
   "bin": {
     "magic-agent": "npm/bin/magic-agent.js"

@@ -68,6 +68,24 @@ func TestEnvironKeepsEssentials(t *testing.T) {
 	}
 }
 
+// 宿主注入的 Python 变量必须剔除：llm 引擎由 venv python 启动，
+// PYTHONHOME / PYTHONPATH 会打乱其 sys.path（见 env.go 注释）。
+func TestEnvironStripsPythonVars(t *testing.T) {
+	t.Setenv("PYTHONHOME", "/some/host/python")
+	t.Setenv("PYTHONPATH", "/some/host/site-packages")
+
+	got := map[string]bool{}
+	for _, kv := range environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		got[name] = true
+	}
+	for _, k := range []string{"PYTHONHOME", "PYTHONPATH"} {
+		if got[k] {
+			t.Errorf("%s 不应传给子 CLI（会破坏 llm 的 venv 解释器）", k)
+		}
+	}
+}
+
 func TestEnvDenied(t *testing.T) {
 	cases := map[string]bool{
 		"SERVER__PORT":                true,

@@ -13,8 +13,10 @@ package agent
 // 注释里刻意不写裸反斜杠，避免转义歧义。
 
 import (
+	"errors"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -36,4 +38,29 @@ func killProcessGroup(cmd *exec.Cmd) {
 	if err := exec.Command("taskkill", "/T", "/F", "/PID", pid).Run(); err != nil {
 		_ = cmd.Process.Kill()
 	}
+}
+
+// TerminatePID Windows 无 SIGTERM 语义 → 与 KillPID 同路（taskkill /T /F 杀整棵树）。
+func TerminatePID(pid int, group bool) error {
+	return KillPID(pid, group)
+}
+
+// KillPID 按 pid 杀进程树（group 参数在 Windows 无意义：taskkill /T 总是带后代）。
+func KillPID(pid int, group bool) error {
+	if pid <= 0 {
+		return errors.New("invalid pid")
+	}
+	return exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+}
+
+// PIDAlive 用 tasklist 查该 pid 是否还在。
+func PIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	out, err := exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/NH").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), strconv.Itoa(pid))
 }

@@ -21,10 +21,12 @@ import (
 //	│ Continue     │ --continue               │ --continue                │ --resume（自动选最近会话） │ -c               │ resume --last         │ sessions 查最新 id  │
 //	│ MaxTokens    │ --settings（env 注入）①  │ --settings（env 注入）①   │ 不支持（静默忽略）②        │ -o max_tokens    │ 不支持（静默忽略）②   │ 静默忽略②           │
 //	│ Temperature  │ 不支持                   │ 不支持                    │ 不支持（静默忽略）②        │ -o temperature   │ 不支持（静默忽略）②   │ 静默忽略②           │
-//	│ Tools        │ --tools / 全放行③        │ --tools / 全放行③         │ --disallowed-tool / 全放行③│ 不支持           │ -s 沙箱档位④          │ 内嵌 agent（忽略）  │
+//	│ Tools        │ --tools / 档位③         │ --tools / 档位③          │ --disallowed-tool / 全放行③│ 不支持           │ -s 沙箱档位④          │ 内嵌 agent（忽略）  │
+//	│ Permission   │ --permission-mode⑧      │ --permission-mode⑧        │ 未接线（yaml 配置）        │ 不支持           │ 未接线（沙箱×审批两轴）│ 未接线（exec.mode） │
 //	│ SystemPrompt │ --append-system-prompt   │ --append-system-prompt    │ 展平进 prompt 头部         │ -s               │ -c developer_instr.⑤  │ 展平进 prompt 头部  │
 //	│ Timeout      │ 进程级超时               │ 进程级超时                │ + --query-timeout          │ 进程级超时       │ 进程级超时            │ + --timeout <sec>   │
 //	│ JSONSchema   │ 不支持                   │ 不支持                    │ 不支持                     │ 输出后处理抽 JSON│ --output-schema 原生  │ 输出后处理抽 JSON   │
+//	│ Workspace    │ 子进程 cwd⑥              │ 子进程 cwd⑥               │ 子进程 cwd⑥                │ 不支持⑦          │ -C/--cd + cwd⑥        │ 不支持⑦             │
 //	└──────────────┴──────────────────────────┴───────────────────────────┴────────────────────────────┴──────────────────┴───────────────────────┴─────────────────────┘
 //
 // 注：
@@ -36,15 +38,39 @@ import (
 //    三者构造参数时统一静默忽略。
 // ③ Tools 语义：关闭 = claude/codebuddy `--tools ""`；trae `--disallowed-tool`
 //    逐个列出内置实体工具（Bash/Edit/Write/Glob/Grep/Read）。
-//    开启 = claude `--dangerously-skip-permissions`；codebuddy/trae `-y`。
-//    白名单 = claude/codebuddy `--tools a,b`；trae **无收窄能力**（`--allowed-tool`
-//    只做自动批准、不裁剪工具集，实测仍下发全部 18 个工具），故白名单降级为
-//    「默认开启所有工具」= 全放行 `-y`，与 codex 的白名单降级同构。
+//    开启 = claude/codebuddy `--permission-mode <档位>`（四档模型，见 ⑧ 与 permission.go；
+//    改造前恒传 `--dangerously-skip-permissions` / `-y` = 第 4 档）；trae `-y`。
+//    白名单 = claude/codebuddy `--tools a,b` + `--permission-mode <档位>`；trae **无收窄能力**
+//    （`--allowed-tool` 只做自动批准、不裁剪工具集，实测仍下发全部 18 个工具），
+//    故白名单降级为「默认开启所有工具」= 全放行 `-y`，与 codex 的白名单降级同构。
 //    llm 无工具概念。
 // ④ codex 无逐工具白名单/禁用能力：off → `-s read-only`（只读沙箱，尽力压制写入与执行）；
 //    on / 白名单 → `--dangerously-bypass-approvals-and-sandbox`（白名单降级为全放行）。
 // ⑤ codex 的 system prompt 经 `-c developer_instructions=<TOML 字符串>` 原生注入；
 //    任意文本用 json.Marshal 转义（其转义集与 TOML basic string 兼容）。
+// ⑥ Workspace（工作目录）落地方式 —— 能用 CLI 原生能力的就用原生：
+//    codex 原生 `-C/--cd <dir>`（"working root"，同时决定 sandbox 可写根）+ 子进程 cwd；
+//    claude / codebuddy / trae **没有**工作目录 flag（`--add-dir` 是「追加额外可访问目录」），
+//    其原生方式就是**在目标目录里启动进程**（cwd）——相对路径解析、CLAUDE.md/AGENTS.md
+//    发现、git 上下文都跟着 cwd，故一律用子进程 cwd 实现（2026-09-17 真机验证：
+//    codex/claude/codebuddy/trae 跑 `pwd` 都落在指定目录）。
+// ⑦ **不支持**（-w 会被忽略，CLI 层打一行提示）：
+//    llm       chat CLI，模型不直接读写文件，无文件系统语义；
+//    arkclaw   远端网关，workspace 由 claw_id 绑定，客户端无法指定；
+//    openclaw  workspace 与 agent 绑定（`openclaw agents add` 时分配），无 per-call flag ——
+//              **实测子进程 cwd 被忽略**（agent 报的仍是自己的 ~/.openclaw/workspace），
+//              要换目录得配一个绑定该目录的 agent。
+//    机器可读的能力表见 WorkspaceSupportOf（--engines 每行的 workspace 字段）。
+// ⑧ Permission（四档权限模型，2026-09-18 新增，详见 permission.go）：
+//    档位 manual / accept-edits / auto / full 映射到 claude、codebuddy 的
+//    `--permission-mode default / acceptEdits / auto / bypassPermissions`。
+//    沙箱没有 CLI flag（claude 的 flags 表里没有 --sandbox），只能经 `--settings`
+//    的 sandbox.* 注入；而 `--settings` 不是可重复 flag，故与 MaxTokens 的 env 注入
+//    合并进同一份 JSON（agentSettingsPayload）。第 3 档还会注入 settings.autoMode。
+//    默认档 full = 保持改造前的行为（恒传 --dangerously-skip-permissions / -y）。
+//    未接线的引擎（trae/llm/codex/openclaw/arkclaw）传 --permission 会在 CLI 层
+//    exit 2 明确报错 —— 安全设置不做静默忽略。
+//    机器可读的能力表见 PermissionSupportOf（--engines 每行的 permission 字段）。
 
 // cliBase 描述一个 CLI 引擎的可执行文件探测配置。
 // 各引擎保留顶层 BinPath 字段与一行式 Name()，以保证测试中零值/复合字面量构造的兼容性；
@@ -167,15 +193,50 @@ func expandHome(p string) string {
 	return filepath.Join(home, p[2:])
 }
 
-// maxTokensSettings 构造 claude / codebuddy `--settings` 所需的 JSON 载荷，
-// 通过 env 注入 CLAUDE_CODE_MAX_OUTPUT_TOKENS。n<=0 时返回 ("", false) 表示不注入。
-func maxTokensSettings(n int) (string, bool) {
+// ExpandHome 导出给 CLI 层做参数路径展开（-w/--workspace 等）。
+func ExpandHome(p string) string { return expandHome(p) }
+
+// WorkspaceSupportOf 返回某引擎「指定工作目录（workspace）」的落地方式（机器可读）：
+//
+//	"flag:-C"  CLI 有原生工作目录 flag（codex 的 -C/--cd）
+//	"cwd"      没有 flag，但**子进程 cwd 就是它的原生方式**（相对路径 / CLAUDE.md 发现 /
+//	           git 上下文都跟着 cwd）—— 工作目录真的会生效
+//	"none"     改不动：llm / arkclaw 没有文件系统语义；openclaw 的 workspace 与 agent
+//	           绑定（`openclaw agents`），**实测子进程 cwd 被忽略**（它的 agent 在自己的
+//	           workspace 里跑）→ 参数被忽略，CLI 层会打一行提示
+//
+// 该值同时出现在 `--engines` 每行的 workspace 字段里，供调用方（如观物台）决定是否下发。
+func WorkspaceSupportOf(engine string) string {
+	switch engine {
+	case "codex":
+		return "flag:-C"
+	case "llm", "arkclaw", "openclaw":
+		return "none"
+	default:
+		return "cwd" // claude / codebuddy / trae（以及测试用假引擎）
+	}
+}
+
+// maxTokensEnv 返回 claude / codebuddy `--settings` 里 env 段的取值，
+// 通过 CLAUDE_CODE_MAX_OUTPUT_TOKENS 注入输出上限。n<=0 时返回 nil 表示不注入。
+func maxTokensEnv(n int) map[string]string {
 	if n <= 0 {
+		return nil
+	}
+	return map[string]string{"CLAUDE_CODE_MAX_OUTPUT_TOKENS": strconv.Itoa(n)}
+}
+
+// maxTokensSettings 构造只含 env 的 `--settings` JSON 载荷（历史入口，保留兼容）。
+//
+// 注意：claude / codebuddy 实际走 agentSettingsPayload —— 因为 `--settings` 只接受
+// 一份载荷，MaxTokens 的 env、沙箱配置、autoMode、权限规则必须合并进同一个 JSON
+// （见 permission.go）。本函数保留给「只要 env」的调用方与既有测试。
+func maxTokensSettings(n int) (string, bool) {
+	env := maxTokensEnv(n)
+	if env == nil {
 		return "", false
 	}
-	payload, err := json.Marshal(map[string]any{
-		"env": map[string]string{"CLAUDE_CODE_MAX_OUTPUT_TOKENS": strconv.Itoa(n)},
-	})
+	payload, err := json.Marshal(map[string]any{"env": env})
 	if err != nil {
 		return "", false
 	}

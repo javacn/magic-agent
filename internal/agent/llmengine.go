@@ -13,17 +13,34 @@ package agent
 //
 // 用法：
 //
-//	magic-agent -e llm "问题"                # llm 的默认模型
+//	magic-agent -e llm "问题"                # 配置文件的**首条**模型（无配置文件时 = llm 的默认）
 //	magic-agent -e llm -m minimax-m3 "问题"  # 显式模型
+//
+// 两条执行路径（2026-09-17 起）：
+//
+//	① **配置文件模型**（`~/.magic-agent/models.json`，见 llmmodels.go / llmhttp.go）：
+//	   `-m <id>` 命中条目 → 引擎**直连**条目里的 url，model 字段当真实模型名、
+//	   extraBody 原样 merge 进请求体。id 是唯一标识（真实模型名会重复：MiniMax-M3 与
+//	   minimax-nothink 同名，只差 thinking.disabled），所以参数必须传 id。
+//	   未给 -m 时用**首条**（首条即默认）；显式要求 --session/-c 会明确报错（直连无会话库）。
+//	② **llm CLI 委托**：没命中配置文件（未配置 / id 不在表里）→ 原样委托 simonw/LLM CLI，
+//	   行为与以前一致（`llm prompt -m <model>`，支持 --cid 会话续接）。
 //
 // CLI 调用形式（两种模式共用 buildArgs）：
 //
-//	Complete: llm prompt -n --no-stream --json [-m MODEL] [-s SYSTEM] \
-//	          [-o max_tokens N] [-o temperature T] PROMPT
-//	Stream:   llm prompt -n            [-m MODEL] [-s SYSTEM] \
-//	          [-o max_tokens N] [-o temperature T] PROMPT
+//	Complete: llm prompt --no-stream --json [--cid ID | -c] [-m MODEL] \
+//	          [-s SYSTEM] [-o max_tokens N] [-o temperature T] PROMPT
+//	Stream:   llm prompt            [--cid ID | -c] [-m MODEL] \
+//	          [-s SYSTEM] [-o max_tokens N] [-o temperature T] PROMPT
 //
-// Complete 额外带 --json：同时拿正文与 token 计数（见下方 parseLLMJSONEntry）。
+// 故意**不传** -n/--no-log：llm 会把每轮对话写入本地 SQLite 日志库
+//（与 claude/trae 的 transcript 落盘语义一致），会话闭环（--cid）正
+// 依赖这份持久化 —— 传 -n 则 conversation_id 虽出现在 envelope 里、
+// 下一轮却查无此会话（实测 2026-09-16）。
+//
+// Complete 额外带 --json：同时拿正文、token 计数与会话 id
+//（envelope 各项内的 conversation_id，见下方 parseLLMJSONEntry），
+// 回填 Response.SessionID 后下一轮可经 --cid 续接。
 //
 // 流式输出是**纯文本 stdout**（非 NDJSON）。MiniMax 等推理模型会把思维链
 // 以标签形式直接混在正文里；本引擎用 thinkSplitter 状态机把标签块路由到
@@ -38,7 +55,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -56,39 +72,15 @@ func (e *LLMEngine) Name() string { return "llm" }
 // DefaultLLMTimeout llm 引擎单次尝试默认超时。
 const DefaultLLMTimeout = 10 * time.Minute
 
-// DefaultLLMModel 默认模型：空串 = llm 自己的默认模型（第一个注册的）。
+// DefaultLLMModel 默认模型：空串 = 配置文件里的首条（有配置文件时，见 llmmodels.go），
+// 否则交给 llm CLI 自己的默认模型。
 const DefaultLLMModel = ""
 
-// bin 探测 llm CLI：BinPath → MAGIC_AGENT_LLM_BIN → 常见安装位 → PATH。
-// venv 位（~/.llm-venv）排在 Homebrew 之前：Homebrew Python 3.14 的
-// pip truststore 有 bug，用户专门建的 venv 是能用的那份。
+// bin 探测 llm CLI（委托 cliBase 统一探测链；llmBase 的候选路径保持
+// venv 位 ~/.llm-venv 优先的次序 —— Homebrew Python 3.14 的 pip
+// truststore 有 bug，用户专门建的 venv 是能用的那份）。
 func (e *LLMEngine) bin() string {
-	if e.BinPath != "" {
-		return e.BinPath
-	}
-	if env := os.Getenv("MAGIC_AGENT_LLM_BIN"); env != "" {
-		return env
-	}
-	candidates := []string{
-		"/opt/homebrew/bin/llm",
-		"/usr/local/bin/llm",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		// venv 优先（插到最前）：能跑的版本比 brew 装的半残版本重要。
-		candidates = append([]string{
-			home + "/.llm-venv/bin/llm",
-		}, candidates...)
-		candidates = append(candidates, home+"/.local/bin/llm")
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	if p, err := exec.LookPath("llm"); err == nil {
-		return p
-	}
-	return ""
+	return llmBase.resolve(e.BinPath)
 }
 
 // Detect 实现 Engine：找到 CLI 即可用（模型/密钥由 llm 自管，不在
@@ -96,11 +88,11 @@ func (e *LLMEngine) bin() string {
 // 显式指定的路径（BinPath / MAGIC_AGENT_LLM_BIN）必须真实存在，
 // 自动探测链中的候选路径本身就经过 os.Stat 过滤。
 func (e *LLMEngine) Detect() (bool, string) {
-	p := e.bin()
+	p := llmBase.resolve(e.BinPath)
 	if p == "" {
-		return false, "llm CLI not found (pip install llm / brew, or set MAGIC_AGENT_LLM_BIN)"
+		return false, llmBase.notFound
 	}
-	if e.BinPath != "" || os.Getenv("MAGIC_AGENT_LLM_BIN") != "" {
+	if e.BinPath != "" || os.Getenv(llmBase.envVar) != "" {
 		if _, err := os.Stat(p); err != nil {
 			return false, fmt.Sprintf("llm CLI not found at %s", p)
 		}
@@ -119,12 +111,33 @@ func (e *LLMEngine) Detect() (bool, string) {
 // 具体选项名由模型插件决定；未注册该选项时 llm 会报错，属于调用方
 // 传错参数，不在这里静默吞掉。
 func (e *LLMEngine) buildArgs(req Request, prompt string) []string {
-	args := []string{"prompt", "-n"}
+	// 不传 -n/--no-log：会话闭环依赖 llm 本地日志库持久化（见文件头注释）。
+	args := []string{"prompt"}
+	switch {
+	case req.SessionID != "":
+		// 续接指定会话：--cid <id>（llm 的 conversation id，通常取自
+		// 上一轮 --json envelope 的 conversation_id，经 Response.SessionID 透传）。
+		args = append(args, "--cid", req.SessionID)
+	case req.Continue:
+		// 续接最近一次会话：-c/--continue（无需 id）。
+		args = append(args, "-c")
+	}
 	if m := stripModelPrefix(req.Model); m != "" {
 		args = append(args, "-m", m)
 	}
 	if req.SystemPrompt != "" {
 		args = append(args, "-s", req.SystemPrompt)
+	}
+	// 附件（截图）：llm CLI 原生 `-a/--attachment <path>`（多模态模型靠它收图，
+	// `llm prompt --help` 明确写了 `llm 'Extract text from this image' -a image.jpg`）。
+	// 非图片附件没有通用类型 → 路径写进提示词正文。
+	var nonImage []Attachment
+	for _, a := range req.Attachments {
+		if a.IsImage() {
+			args = append(args, "-a", a.Path)
+			continue
+		}
+		nonImage = append(nonImage, a)
 	}
 	if req.MaxTokens > 0 {
 		args = append(args, "-o", "max_tokens", strconv.Itoa(req.MaxTokens))
@@ -132,7 +145,7 @@ func (e *LLMEngine) buildArgs(req Request, prompt string) []string {
 	if req.Temperature != nil {
 		args = append(args, "-o", "temperature", formatTemperature(*req.Temperature))
 	}
-	return append(args, prompt)
+	return append(args, appendAttachmentSection(prompt, nonImage))
 }
 
 // formatTemperature 把温度格式化为最短十进制表示（去掉多余的尾零）。
@@ -164,6 +177,29 @@ func encodeJSONSchemaInline(s *JSONSchema) (string, bool) {
 	return string(out), true
 }
 
+// ListModels 实现 ModelLister：**配置文件优先** ——
+// `~/.magic-agent/models.json` 是 llm 引擎的模型注册表，它的 id 是 `-m` 可直接执行的
+// （首条即默认，见 llmmodels.go）；没有配置文件才退回 `llm models`（llm CLI 自己
+// 注册的模型，含插件自带的整套目录，形如 "OpenAI Chat: gpt-4o (aliases: 4o)"）。
+func (e *LLMEngine) ListModels(ctx context.Context) ([]string, error) {
+	if list, err := LoadLLMConfigModels(); err == nil && len(list) > 0 {
+		ids := make([]string, 0, len(list))
+		for _, m := range list {
+			ids = append(ids, m.ID)
+		}
+		return ids, nil
+	}
+	stdout, err := probeCLI(ctx, "llm", e.bin(), "models")
+	if err != nil {
+		return nil, err
+	}
+	models := parseLLMModelsText(stdout)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("%w: llm models returned no entries", ErrNoModelSource)
+	}
+	return models, nil
+}
+
 // Complete 实现 Engine：llm prompt --json --no-stream，一次性拿全文 + token 计数。
 //
 // 为什么加 --json：纯文本模式下 llm 不吐 token 数，上游（如 magic-video）
@@ -171,6 +207,12 @@ func encodeJSONSchemaInline(s *JSONSchema) (string, bool) {
 // --json 输出同 `llm logs --json` 的结构（数组，每项含 response /
 // input_tokens / output_tokens），解析失败时退回纯文本路径，不引入新的失败点。
 func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error) {
+	// 配置文件模型（models.json）：命中 id → 直连端点（见 llmhttp.go）。
+	// 为什么必须按 id：id 唯一，而真实模型名会重复（MiniMax-M3 与 minimax-nothink
+	// 真实名相同，只差 extraBody）—— 用名字做参数就无法区分。
+	if m, ok := ResolveLLMConfigModel(req.Model); ok {
+		return e.completeConfigured(ctx, m, req)
+	}
 	start := time.Now()
 	bin := e.bin()
 	if bin == "" {
@@ -219,9 +261,12 @@ func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error)
 		}
 		total := entry.InputTokens + entry.OutputTokens
 		return Response{
-			Engine:       e.Name(),
-			Text:         strings.TrimSpace(text),
-			Model:        model,
+			Engine: e.Name(),
+			Text:   strings.TrimSpace(text),
+			Model:  model,
+			// llm --json envelope 顶层带 conversation_id（实测确认）：
+			// 回填后下一轮 Request.SessionID → --cid 即可续接该会话。
+			SessionID:    entry.ConversationID,
 			Latency:      time.Since(start),
 			InputTokens:  entry.InputTokens,
 			OutputTokens: entry.OutputTokens,
@@ -244,10 +289,11 @@ func (e *LLMEngine) Complete(ctx context.Context, req Request) (Response, error)
 
 // llmJSONEntry 是 `llm prompt --json` 数组里一项的所需子集。
 type llmJSONEntry struct {
-	Model        string `json:"model"`
-	Response     string `json:"response"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
+	Model          string `json:"model"`
+	Response       string `json:"response"`
+	InputTokens    int    `json:"input_tokens"`
+	OutputTokens   int    `json:"output_tokens"`
+	ConversationID string `json:"conversation_id"`
 }
 
 // parseLLMJSONEntry 解析 `llm prompt --json` 输出，取最后一项有正文的条目。
@@ -271,6 +317,10 @@ func parseLLMJSONEntry(raw string) (llmJSONEntry, bool) {
 // Stream 实现 Streamer：llm prompt 默认流式，逐行读纯文本 stdout，
 // thinkSplitter 把标签块路由到 thinking 通道。
 func (e *LLMEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	// 配置文件模型：命中 id → 直连 SSE（见 llmhttp.go / completeConfigured 上方注释）
+	if m, ok := ResolveLLMConfigModel(req.Model); ok {
+		return e.streamConfigured(ctx, m, req, onEvent)
+	}
 	start := time.Now()
 	bin := e.bin()
 	if bin == "" {
@@ -338,7 +388,7 @@ func splitThinkingTags(s string) (text, thinking string) {
 // llm 的流式输出是逐行纯文本。关键事实：思维链标签本身不含换行符，
 // 而 Scanner 按行交付完整行，因此标签永远完整落在某一行内、不会被
 // 行边界切开——无需前缀保持（holdback）。行内出现被换行打断的伪标签
-//（如 "<th\nink>"）在原始字节流里本来就不是标签，与非流式的
+// （如 "<th\nink>"）在原始字节流里本来就不是标签，与非流式的
 // splitThinkingTags 判定一致：视为正文。
 //
 // 状态：
@@ -348,12 +398,12 @@ func splitThinkingTags(s string) (text, thinking string) {
 //	          消化标签独立成行时残留的换行）
 //	sawThink  同上，针对思维链通道
 type thinkSplitter struct {
-	OnEvent   func(StreamEvent)
-	Text      strings.Builder
-	Thinking  strings.Builder
-	inThink   bool
-	sawText   bool
-	sawThink  bool
+	OnEvent  func(StreamEvent)
+	Text     strings.Builder
+	Thinking strings.Builder
+	inThink  bool
+	sawText  bool
+	sawThink bool
 }
 
 // feed 处理一行流式输出（line 应含行尾换行符，以保留多行结构）。
@@ -389,7 +439,7 @@ func (sp *thinkSplitter) finish() (text, thinking string) {
 }
 
 // emitText 发出一段正文增量。首个实质内容前的纯空白段静默吞掉
-//（builder 不写、事件不发），避免标签行的换行污染输出。
+// （builder 不写、事件不发），避免标签行的换行污染输出。
 func (sp *thinkSplitter) emitText(s string) {
 	if s == "" {
 		return

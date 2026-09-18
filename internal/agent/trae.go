@@ -106,6 +106,25 @@ func TraeDefaultModel() string {
 	return ""
 }
 
+// ListModels 实现 ModelLister：`trae-cli models --json` 是 trae 自己的
+// 权威清单（含用户自定义模型，如 ~/.trae/trae_cli.yaml 里的 My-MiniMax-M3）。
+// 取 name（= -c model.name=<name> 接受的那个标识），缺失时退回 real_name。
+func (e *TraeEngine) ListModels(ctx context.Context) ([]string, error) {
+	stdout, err := probeCLI(ctx, "trae", e.bin(), "models", "--json")
+	if err != nil {
+		return nil, err
+	}
+	objs, err := jsonModelsArray(stdout)
+	if err != nil {
+		return nil, err
+	}
+	models := modelNamesFromObjects(objs, "name", "real_name")
+	if len(models) == 0 {
+		return nil, fmt.Errorf("%w: trae-cli models --json returned no entries", ErrNoModelSource)
+	}
+	return models, nil
+}
+
 // Complete 实现 Engine：单次调用 trae-cli。
 func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
@@ -123,10 +142,14 @@ func (e *TraeEngine) Complete(ctx context.Context, req Request) (Response, error
 	if req.SystemPrompt == "" && toolsIsOff(req) {
 		prompt += noToolSuffix
 	}
+	// 附件：trae-cli 没有图片/附件输入通道（--help 无 image/attach/input-format），
+	// 只能把绝对路径写进提示词，靠 trae 的读文件工具看 —— 因此需要工具可用。
+	prompt = appendAttachmentSection(prompt, req.Attachments)
 
 	args := e.buildArgs(req, prompt)
 
-	stdout, stderr, err := runCLI(ctx, bin, args...)
+	// workspace：trae 无工作目录 flag（有 --add-dir 但那是追加额外目录），子进程 cwd 即原生方式
+	stdout, stderr, err := runCLIIn(ctx, req.Workspace, bin, args...)
 	if err != nil {
 		return Response{}, wrapCliError("trae", stdout, stderr, err)
 	}
@@ -249,11 +272,12 @@ func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(Strea
 	if req.SystemPrompt == "" && toolsIsOff(req) {
 		prompt += noToolSuffix
 	}
+	prompt = appendAttachmentSection(prompt, req.Attachments)
 
 	args := e.buildArgs(req, prompt)
 	args = append(args, "--output-format", "stream-json", "--include-partial-messages")
 
-	acc := &streamAccumulator{OnEvent: onEvent}
+	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
 	var fin struct {
 		Type      string `json:"type"`
 		Subtype   string `json:"subtype"`
@@ -263,7 +287,7 @@ func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(Strea
 	}
 	seenResult := false
 
-	err := runStreamCLI(ctx, bin, args, func(line string) error {
+	err := runStreamCLIIn(ctx, req.Workspace, bin, args, func(line string) error {
 		isResult, perr := acc.handleNDJSONLine(line)
 		if perr != nil {
 			return perr

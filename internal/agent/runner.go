@@ -63,6 +63,8 @@ func (r *Runner) defaultTimeout() time.Duration {
 		return DefaultTraeTimeout
 	case *LLMEngine:
 		return DefaultLLMTimeout
+	case *ArkClawEngine:
+		return DefaultArkClawTimeout
 	}
 	return 5 * time.Minute
 }

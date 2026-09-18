@@ -9,11 +9,21 @@ package cli
 //	4. stdin 管道（stdin 非 TTY 且无其他输入时自动读取）
 // --file 与 -p/args 可组合：文件内容在前，-p/args 在后（附加上下文）。
 //
+// **提示词可以是文件路径**（用户 2026-09-17：「传了提示词需要支持传入文件路径」）：
+// -p / 位置参数 / -s 的值若命中一个已存在的普通文件，就按文件内容用（并打一行 stderr 提示）；
+// 想强制按文件读、读不到就报错，写 "@<path>"（-p、位置参数、-s、配置的 systemPrompt 都支持）。
+// 判据保守（单行、≤4096 字节、stat 是普通文件），所以 `-p "解释一下 README.md"` 这类
+// 正常提示词不受影响；详见 expandPromptSource。
+//
 // 工具开关（--tools）：
 //	off（默认）  禁用全部工具 —— 纯 chat 一次成型，输出可解析
 //	on           保持引擎默认工具集 + 权限旁路（agent 模式）
 //	<白名单>     逗号分隔工具名（如 Bash,Read），仅允许这些工具
 //	             + 权限旁路；引擎不支持的白名单成员忽略。
+//
+// 会话续接（--session）：
+//	默认新会话；把上次输出 envelope 里的 session_id 传回 --session，
+//	即可继续同一会话（引擎侧透传各自的 --resume 参数）。
 
 import (
 	"context"
@@ -21,70 +31,310 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/darren/magic-agent/internal/agent"
+	"github.com/darren/magic-agent/internal/config"
+	"github.com/darren/magic-agent/internal/session"
 )
 
 // askOptions 根命令的全部参数。
 type askOptions struct {
-	engine      string
-	model       string
-	system      string
-	prompt      string
-	file        string
-	tools       string
-	timeout     time.Duration
-	retries     int
-	backoff     time.Duration
-	output      string
-	verbose     bool
-	engines     bool
-	jsonOut     bool
-	stream      bool
-	noThinking  bool
-	maxTokens   int
-	temperature float64
-	tempSet     bool
-	jsonSchema  string // 内联 JSON Schema（仅 llm 引擎走 --schema）
+	engine       string
+	model        string
+	system       string
+	prompt       string
+	file         string
+	attach       []string // 附件（截图/图片）路径；与提示词一起发给引擎
+	tools        string
+	timeout      time.Duration
+	retries      int
+	backoff      time.Duration
+	output       string
+	verbose      bool
+	engines      bool
+	noModels     bool
+	jsonOut      bool
+	stream       bool
+	noThinking   bool
+	maxTokens    int
+	temperature  float64
+	tempSet      bool
+	jsonSchema   string        // 内联 JSON Schema（仅 llm 引擎走 --schema）
+	session      string        // 会话续接 id（空 = 新会话，默认）
+	continueF    bool          // 续接最近一次会话（-c/--continue；不需要 id）
+	workspace    string        // 工作目录（-w/--workspace；空 = 用调用方 cwd）
+	stop         string        // 停止指定会话/运行（--stop <session_id|run_id>）
+	listSessions bool          // 列出会话登记表（--sessions）
+	keepAlive    bool          // 常驻会话：首轮结束后不退出，等 --append 追加（需配合 --stream）
+	appendTo     string        // 向常驻会话追加消息（--append <session_id|run_id>）
+	idle         time.Duration // 常驻会话空闲收工时长（--idle，仅 --keep-alive 有效）
+
+	// 四档权限模型（见 internal/agent/permission.go）。仅 claude / codebuddy 接线。
+	permission     string   // 档位：manual | accept-edits | auto | full
+	sandboxExclude []string // 始终在沙箱外执行的命令（sandbox.excludedCommands）
+	sandboxDomain  []string // 沙箱网络白名单（sandbox.network.allowedDomains）
+	autoModeEnv    []string // 第 3 档分类器的受信边界描述（autoMode.environment）
+	permDeny       []string // 追加 deny 规则（permissions.deny，所有档位生效）
+	permAsk        []string // 追加 ask 规则（permissions.ask，强制人工审批）
 }
 
 // newAskOptions 返回带默认值的选项集。
 //   - 默认输出 json：固定单行 envelope，程序解析最友好；人看用 -o text。
 //   - 默认引擎 codebuddy：hy3 免费模型开箱即用。
 //   - 默认超时 600s：10 分钟，覆盖 codebuddy 慢响应场景。
+//   - 默认常驻（keepAlive）：claude/codebuddy 的流式调用自动成为常驻会话，
+//     任务跑着的时候就能 `--append` 追加需求（用户 2026-09-18：「keep-alive要是默认的」）。
+//     用 --keep-alive=false 关掉；非流式 / 不支持追加的引擎会自动忽略它。
 func newAskOptions() *askOptions {
 	return &askOptions{
-		engine:  "codebuddy",
-		output:  "json",
-		timeout: 600 * time.Second,
+		engine:    "codebuddy",
+		output:    "json",
+		timeout:   600 * time.Second,
+		keepAlive: true,
 	}
 }
 
 // bindAskFlags 把全部 flags 注册为根命令的 persistent flags。
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
-	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm（默认 codebuddy）")
+	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm | codex | openclaw | arkclaw（默认 codebuddy）")
 	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎传 llm CLI 注册名，如 minimax-m3）")
-	f.StringVarP(&opts.system, "system", "s", "", "系统提示词")
-	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词")
+	f.StringVarP(&opts.system, "system", "s", "", "系统提示词（空 = 用配置文件 ~/.config/magic-agent/config.json 的 systemPrompt；两者都为空则不注入）。值若是文件路径或 @文件 → 读该文件内容")
+	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词（值若是文件路径或 @文件 → 读该文件内容作为提示词）")
+	f.StringVarP(&opts.workspace, "workspace", "w", "", "工作目录（workspace）：在该目录里执行引擎；codex 走原生 -C，claude/codebuddy/trae 用子进程 cwd，llm/arkclaw/openclaw 不支持（忽略并提示）")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
+	f.StringArrayVarP(&opts.attach, "attach", "a", nil, "附件路径（截图/图片等），可重复或逗号分隔；与提示词一起发给引擎（各引擎落地方式见 --engines 的 attachments 字段）")
 	f.StringVar(&opts.tools, "tools", "off", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)")
-	f.IntVar(&opts.maxTokens, "max-tokens", 0, "输出 token 上限（0=不指定；仅 llm 引擎透传，其余引擎忽略）")
+	f.StringVar(&opts.session, "session", "", "会话续接 id（空=新会话；传入上次输出里的 session_id 继续同一会话；arkclaw 传 contextId）")
+	f.BoolVarP(&opts.continueF, "continue", "c", false, "续接当前目录最近一次会话（不需要 session id；与 --session 同时给时 --session 优先）")
+	f.StringVar(&opts.stop, "stop", "", "停止指定会话/运行：传 session_id 或 run_id（--sessions 可见），杀掉它的引擎进程组")
+	f.BoolVar(&opts.listSessions, "sessions", false, "列出会话登记表（JSON 数组：run_id / session_id / pid / engine / state / 起止时间）")
+	f.BoolVar(&opts.keepAlive, "keep-alive", true, "常驻会话（默认开；仅 claude/codebuddy 的 --stream 调用生效）：首轮结束后不退出、等 --append 追加；--keep-alive=false 关闭")
+	f.StringVar(&opts.appendTo, "append", "", "向常驻会话追加一条消息：传 session_id 或 run_id，内容用 -p/位置参数给")
+	f.DurationVar(&opts.idle, "idle", 5*time.Minute, "常驻会话空闲收工时长（默认 5m；0 = 本轮结束就收工，追加窗口只在任务运行期间）")
+	f.IntVar(&opts.maxTokens, "max-tokens", 0, "输出 token 上限（0=不指定；claude/codebuddy 经 --settings 注入，llm 透传，trae 忽略）")
 	f.Float64Var(&opts.temperature, "temperature", -1, "采样温度（-1=不指定；仅 llm 引擎透传，其余引擎忽略）")
-	f.StringVar(&opts.jsonSchema, "json-schema", "", "JSON Schema 内联字符串（仅 llm 引擎；启用结构化输出与 JSON 后处理）")
+	f.StringVar(&opts.jsonSchema, "json-schema", "", "JSON Schema 内联字符串（仅 llm / arkclaw 引擎；启用结构化输出与 JSON 后处理）")
 	f.DurationVarP(&opts.timeout, "timeout", "t", 600*time.Second, "单次尝试超时（默认 600s=10m）")
 	f.IntVarP(&opts.retries, "retries", "r", 0, "失败重试次数（默认 0）")
 	f.DurationVar(&opts.backoff, "backoff", 2*time.Second, "首次重试退避间隔（指数翻倍，上限 30s）")
 	f.StringVarP(&opts.output, "output", "o", "json", "输出格式: json | text")
 	f.BoolVarP(&opts.verbose, "verbose", "v", false, "重试过程打印到 stderr")
-	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎与本机 CLI 可用性（可组合 --json）")
-	f.BoolVar(&opts.jsonOut, "json", false, "--engines 的 JSON 输出开关")
+	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎、本机 CLI 可用性与各引擎当前支持的模型（JSON 数组；每行含 models / workspace / streaming 能力字段）")
+	f.BoolVar(&opts.noModels, "no-models", false, "配合 --engines：跳过各引擎的模型探测（只列引擎与可用性，不启动 CLI）")
+	f.BoolVar(&opts.jsonOut, "json", false, "兼容保留：--engines 已默认 JSON，本 flag 不再需要")
 	f.BoolVar(&opts.stream, "stream", false, "流式输出：正文/思考增量实时打到 stdout（text 模式思考走 stderr）")
 	f.BoolVar(&opts.noThinking, "no-thinking", false, "流式模式下不转发思考过程增量")
+	bindPermissionFlags(cmd, opts)
+}
+
+// bindPermissionFlags 注册四档权限模型的 flags（仅 claude / codebuddy 生效）。
+//
+// 默认档 full 是**刻意**的：改造前 claude/codebuddy 在 --tools 非 off 时恒传
+// --dangerously-skip-permissions / -y，语义正是第 4 档。把默认值改成别的档位
+// 会是一次静默的行为变更（既有调用方的 agent 会突然开始弹审批 / 被沙箱拦）。
+// 推荐需要 agent 能力的调用方显式传 `--permission auto`。
+func bindPermissionFlags(cmd *cobra.Command, opts *askOptions) {
+	f := cmd.PersistentFlags()
+	f.StringVar(&opts.permission, "permission", string(agent.DefaultPermissionTier),
+		"权限档位: manual | accept-edits | auto | full（默认 full=保持既有行为；仅 claude/codebuddy 生效）\n"+
+			"  manual        沙箱开启，只读放行，其余逐项由用户确认\n"+
+			"  accept-edits  沙箱开启，编辑放行，命令仍逐条确认\n"+
+			"  auto          沙箱开启，越界由内置 LLM Guardian 判定（推荐）\n"+
+			"  full          沙箱关闭，命令直接在宿主机执行，无审批")
+	f.StringArrayVar(&opts.sandboxExclude, "sandbox-exclude", nil,
+		"始终在沙箱外执行的命令（如 docker,watchman）；可重复或逗号分隔（manual/accept-edits/auto 有效）")
+	f.StringArrayVar(&opts.sandboxDomain, "sandbox-domain", nil,
+		"沙箱网络白名单域名；可重复或逗号分隔（留空 = 不改动引擎自身网络策略）")
+	f.StringArrayVar(&opts.autoModeEnv, "auto-mode-env", nil,
+		"第 3 档分类器的受信边界（自然语言，可重复）。如 \"Source control: github.example.com/acme-corp\"")
+	f.StringArrayVar(&opts.permDeny, "permission-deny", nil,
+		"追加 deny 规则，如 'Bash(rm -rf *)'；在所有档位（含 full）都生效且不可被白名单覆盖；可重复")
+	f.StringArrayVar(&opts.permAsk, "permission-ask", nil,
+		"追加 ask 规则，如 'Bash(git push *)'；命中即强制人工审批（第 3 档下分类器也无法自动放行）；可重复")
+}
+
+// workspaceUnsupportedWarn 引擎没有文件系统语义（llm / arkclaw）时的提示文案；
+// 支持的引擎返回空串（无需提示）。抽成函数便于单测，也把「不支持要说明白」变成可断言的行为。
+func workspaceUnsupportedWarn(engine string) string {
+	if agent.WorkspaceSupportOf(engine) != "none" {
+		return ""
+	}
+	return fmt.Sprintf("magic-agent: 警告：%s 引擎不支持指定工作目录，-w/--workspace 已忽略"+
+		"（各引擎能力见 --engines 的 workspace 字段）\n", engine)
+}
+
+// resolveWorkspaceDir 解析 -w/--workspace：展开 ~、转绝对路径、校验存在且是目录。
+// 空串原样返回（= 不指定，用调用方 cwd）。
+// 路径不存在时提前报错 —— 否则会在 spawn 阶段以 "chdir ...: no such file or directory"
+// 的形式冒出来，指向性差（尤其 `-o json` 下只看到一句 fork/exec 错误）。
+func resolveWorkspaceDir(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(agent.ExpandHome(p))
+	if err != nil {
+		return "", fmt.Errorf("--workspace: %w", err)
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("--workspace: %s 不可访问: %w", abs, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("--workspace: %s 不是目录", abs)
+	}
+	return abs, nil
+}
+
+// resolveSystemPrompt 决定本轮生效的 system prompt：`-s/--system` 优先
+// （其值已由调用方过过 expandPromptSource），未给时回落到配置文件里的全局默认值
+// （`~/.config/magic-agent/config.json` 的 `systemPrompt`，路径可用 MAGIC_AGENT_CONFIG 覆盖，
+// 也可用 MAGIC_AGENT_SYSTEM_PROMPT 覆盖取值）。两者都为空 → 空串（不注入）。
+//
+// 配置里的默认值同样支持「文件路径 / @路径」（系统提示词常单独存一个文件），
+// 故这里也过一遍 expandPromptSource；返回的 note 非空时调用方应写到 stderr。
+//
+// 第二个返回值（旧签名的 err）只在「配置文件读不了 / JSON 语法错 / @路径读不到」时非空 ——
+// 调用方按「不注入 + 提示」处理，绝不因为一份坏配置让整个调用失败。
+func resolveSystemPrompt(flagValue string) (text, note string, err error) {
+	if s := strings.TrimSpace(flagValue); s != "" {
+		return s, "", nil
+	}
+	cfg, cerr := config.Load()
+	if cerr != nil {
+		return "", "", cerr
+	}
+	v := strings.TrimSpace(cfg.SystemPrompt)
+	if v == "" {
+		return "", "", nil
+	}
+	return expandPromptSource(v)
+}
+
+// maxPromptPathLen 自动识别「提示词其实是个文件路径」时的长度上限。
+// 超过这个长度不可能是路径，直接按文本用（也免去一次 stat）。
+const maxPromptPathLen = 4096
+
+// expandPromptSource 把「可能是文件路径」的提示词输入展开成文本。
+//
+// 用户 2026-09-17 的要求：「传了提示词需要支持传入文件路径」。支持的写法：
+//
+//	"@<path>"   显式按文件读取 —— 读不到/不是普通文件直接报错（调用方明确要的就是文件）
+//	"<path>"    值恰好命中一个**已存在的普通文件** → 按文件内容读取，并给一行 stderr 提示
+//	其余        原样文本
+//
+// 自动识别刻意保守，避免把正常提示词误当路径：必须不含换行、长度 ≤ maxPromptPathLen、
+// stat 出来是普通文件（目录不算）、可读。命中时**一定**在 stderr 说明「已按文件读取」，
+// 不静默 —— 否则用户会奇怪「模型怎么收到了文件内容」。
+//
+// 返回的 note 非空时，调用方应把它原样写到 stderr。
+func expandPromptSource(s string) (text, note string, err error) {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return s, "", nil
+	}
+	forced := strings.HasPrefix(raw, "@")
+	p := raw
+	if forced {
+		p = strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+		if p == "" {
+			return "", "", fmt.Errorf("@ 后缺少文件路径")
+		}
+	} else if strings.ContainsAny(raw, "\r\n") || len(raw) > maxPromptPathLen {
+		return s, "", nil // 多行 / 超长：一定是提示词正文，不做路径识别
+	}
+
+	abs, aerr := filepath.Abs(agent.ExpandHome(p))
+	if aerr != nil {
+		if forced {
+			return "", "", fmt.Errorf("解析提示词文件路径 %s: %w", p, aerr)
+		}
+		return s, "", nil
+	}
+	st, serr := os.Stat(abs)
+	switch {
+	case serr != nil:
+		if forced {
+			return "", "", fmt.Errorf("读取提示词文件 %s: %w", abs, serr)
+		}
+		return s, "", nil
+	case !st.Mode().IsRegular():
+		if forced {
+			return "", "", fmt.Errorf("提示词文件 %s 不是普通文件（目录？）", abs)
+		}
+		return s, "", nil
+	}
+	data, rerr := os.ReadFile(abs)
+	if rerr != nil {
+		if forced {
+			return "", "", fmt.Errorf("读取提示词文件 %s: %w", abs, rerr)
+		}
+		return s, "", nil
+	}
+	note = fmt.Sprintf("magic-agent: 提示：提示词输入命中文件，已按文件内容使用：%s（%d 字节）\n", abs, len(data))
+	return strings.TrimSpace(string(data)), note, nil
+}
+
+// maxAttachBytes 单个附件大小上限 —— base64 之后还要胖 1/3，且要整条进 HTTP 请求体，
+// 32MB 已远超「截图」量级，超过基本是误把大文件当附件。
+const maxAttachBytes = 32 << 20
+
+// resolveAttachments 展开 -a/--attach：拆逗号 → 展开 ~ → 绝对路径 → 校验（普通文件 + 体积）。
+//
+// 为什么在这里校验：路径错误要尽早以 exit 2 报出来（而不是等到引擎层变成
+// 一句含糊的 "open ...: no such file"），且引擎实现因此可以信任 Path 是干净的绝对路径。
+// 重复路径去重（同一张图手滑写两遍不必发两遍）。
+func resolveAttachments(values []string) ([]agent.Attachment, error) {
+	var out []agent.Attachment
+	seen := make(map[string]bool)
+	for _, v := range values {
+		for _, raw := range strings.Split(v, ",") {
+			p := strings.TrimSpace(raw)
+			if p == "" {
+				continue
+			}
+			abs, err := filepath.Abs(agent.ExpandHome(p))
+			if err != nil {
+				return nil, fmt.Errorf("--attach: %w", err)
+			}
+			st, err := os.Stat(abs)
+			if err != nil {
+				return nil, fmt.Errorf("--attach: %s 不可访问: %w", abs, err)
+			}
+			if !st.Mode().IsRegular() {
+				return nil, fmt.Errorf("--attach: %s 不是普通文件", abs)
+			}
+			if st.Size() > maxAttachBytes {
+				return nil, fmt.Errorf("--attach: %s 超过 %dMB 上限", abs, maxAttachBytes>>20)
+			}
+			if seen[abs] {
+				continue
+			}
+			seen[abs] = true
+			out = append(out, agent.NewAttachment(abs))
+		}
+	}
+	return out, nil
+}
+
+// attachmentPromptFallbackWarn 引擎没有附件输入通道（AttachmentSupportOf == "prompt"）时的提示：
+// 附件改成「把路径写进提示词」，需要引擎自己能读文件 —— 因此 --tools off 时必须点明。
+// 抽成函数便于单测，也把「不静默降级」变成可断言的行为。
+func attachmentPromptFallbackWarn(engine string, count int, toolsOff bool) string {
+	if count == 0 || agent.AttachmentSupportOf(engine) != "prompt" {
+		return ""
+	}
+	msg := fmt.Sprintf("magic-agent: 警告：%s 引擎没有附件输入通道，%d 个附件已改为「把路径写进提示词」", engine, count)
+	if toolsOff {
+		msg += "；当前 --tools off，引擎读不到这些文件，请改用 --tools on"
+	}
+	return msg + "（各引擎能力见 --engines 的 attachments 字段）\n"
 }
 
 // parseToolsMode 解析 --tools 参数为结构化模式。
@@ -113,12 +363,39 @@ func parseToolsMode(s string) (agent.ToolsMode, error) {
 	}
 }
 
+// resolvePermissionTier 解析并校验 --permission（四档权限模型，见 agent/permission.go）。
+//
+// 两道校验：
+//  1. 取值必须是四档之一（含别名与数字档位）；
+//  2. 引擎必须已接线 —— 未接线时**报错**（exit 2），不静默忽略。
+//     静默忽略一个安全设置是最坏的结果：用户以为自己被保护着，实际没有。
+//     注意只在「显式传过 --permission」时才做第 2 道校验，这样默认值不会
+//     让 `-e codex` 这类既有调用突然失败。
+func resolvePermissionTier(engineName, raw string, explicit bool) (agent.PermissionTier, error) {
+	tier, ok := agent.ParsePermissionTier(raw)
+	if !ok {
+		return "", &usageError{fmt.Errorf("invalid --permission %q (want one of: %s)",
+			raw, strings.Join(agent.PermissionTiers(), " | "))}
+	}
+	if explicit && !agent.PermissionSupported(engineName) {
+		return "", &usageError{fmt.Errorf(
+			"--permission 暂不支持 %s 引擎（当前仅 claude、codebuddy；各引擎能力见 --engines 的 permission 字段）",
+			engineName)}
+	}
+	return tier, nil
+}
+
 // runAsk ask 主流程（非流式）。
 func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 	engine, format, req, err := prepareAsk(cmd, args, opts)
 	if err != nil {
 		return err
 	}
+
+	// 会话登记 + spawn 钩子：把引擎子进程 pid 记下来，之后任何进程都能
+	// `magic-agent --stop <session_id>` 精确停掉它（见 internal/session）。
+	h := beginSession(engine.Name(), req)
+	ctx := withSessionHook(cmd.Context(), h)
 
 	runner := &agent.Runner{
 		Engine:  engine,
@@ -127,8 +404,9 @@ func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		Backoff: opts.backoff,
 		Verbose: opts.verbose,
 	}
-	resp, err := runner.Run(cmd.Context(), req)
+	resp, err := runner.Run(ctx, req)
 	if err != nil {
+		finishSession(h, "", session.StateFailed)
 		attempts := 1 + opts.retries
 		// WriteError 已把失败信息（json envelope / text 行）写到 stderr，
 		// 标记已输出，Execute 不再重复打印。
@@ -137,7 +415,54 @@ func runAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		}
 		return err
 	}
+	finishSession(h, resp.SessionID, session.StateDone)
 	return agent.WriteOutput(cmd.OutOrStdout(), format, resp)
+}
+
+// beginSession 落一条 running 记录（失败不阻断调用：登记表只是可运维性）。
+// PID 先填自身 pid 兜底 —— HTTP 直连这类没有子进程的引擎也能被 --stop 停掉
+// （杀 magic-agent 自己即中止该次调用）；子进程起来后 spawn 钩子会覆盖成引擎 pid。
+func beginSession(engine string, req agent.Request) *session.Handle {
+	h, err := session.Begin(session.BeginOptions{
+		Engine:     engine,
+		Model:      req.Model,
+		Workspace:  req.Workspace,
+		SessionID:  req.SessionID,
+		PromptHead: firstUserText(req.Messages),
+		PID:        os.Getpid(),
+	})
+	if err != nil {
+		return nil
+	}
+	setActiveSession(h)
+	return h
+}
+
+// withSessionHook 给 ctx 挂上「子进程已启动」回调（h 为空时原样返回）。
+func withSessionHook(ctx context.Context, h *session.Handle) context.Context {
+	if h == nil {
+		return ctx
+	}
+	return agent.WithSpawnHook(ctx, func(pid int) { h.SetPID(pid, true) })
+}
+
+// finishSession 收尾：写最终状态 + 回填会话 id，并清掉「当前活动会话」。
+func finishSession(h *session.Handle, sessionID, state string) {
+	if h == nil {
+		return
+	}
+	h.Finish(sessionID, state)
+	clearActiveSession(h)
+}
+
+// firstUserText 取第一条 user 消息的开头（记录里给人看）。
+func firstUserText(msgs []agent.Message) string {
+	for _, m := range msgs {
+		if m.Role == "user" || m.Role == "" {
+			return m.Content
+		}
+	}
+	return ""
 }
 
 // runStreamAsk 流式主流程。
@@ -175,6 +500,7 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 	var onEvent func(agent.StreamEvent)
 	if format == agent.FormatJSON {
 		onEvent = func(ev agent.StreamEvent) {
+			// --no-thinking 只压制思考过程；工具事件保持透传。
 			if ev.Kind == agent.KindThinking && opts.noThinking {
 				return
 			}
@@ -190,32 +516,72 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 				fmt.Fprint(stderr, "… "+ev.Text)
 			case agent.KindText:
 				fmt.Fprint(stdout, ev.Text)
+			case agent.KindToolUse:
+				// 与 thinking 对称：工具事件走 stderr，前缀 🔧。
+				// 2>/dev/null 可静音；stdout 正文保持干净。
+				prefix := "🔧 " + ev.Name + "(" + ev.ID + ") "
+				fmt.Fprint(stderr, prefix+ev.Text+"\n")
+			case agent.KindToolResult:
+				fmt.Fprint(stderr, "   ↳ "+ev.Text+"\n")
+			case agent.KindAsk:
+				// 「需要用户选择」：一行摘要打到 stderr（与工具事件同一条通道，
+				// 2>/dev/null 可静音），stdout 正文保持干净。
+				//
+				// ⚠️ headless 下 claude 会在模型提问后**自行拒绝**（模型拿不到答案），
+				// 要真正作答得把答案作为后续 user 消息补进去（agent.EncodeAskFollowUp）。
+				fmt.Fprint(stderr, "❓ "+ev.Text+"\n")
 			}
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(cmd.Context(), opts.timeout)
-	defer cancel()
+	// 超时：常驻会话的存活由 --idle（空闲收工）决定，所以常驻生效时只有调用方**显式**给 -t
+	// 才套总超时；否则不设上限（长任务 + 追加不受 600s 默认值限制）。
+	ctx := cmd.Context()
+	if !kaEnabled(cmd, opts, engine.Name()) || flagChanged(cmd, "timeout") {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.timeout)
+		defer cancel()
+	}
+
+	// 会话登记 + spawn 钩子（与 runAsk 同一套：--stop 靠它拿到引擎 pid）。
+	h := beginSession(engine.Name(), req)
+	ctx = withSessionHook(ctx, h)
+
+	// 常驻会话（默认开，claude/codebuddy 的流式调用）：开追加入口等 --append，
+	// 空闲 --idle 后优雅收工（关闭通道 → 引擎 stdin EOF → 正常收尾）。
+	if kaEnabled(cmd, opts, engine.Name()) {
+		ka, kerr := startKeepAlive(cmd, opts, engine.Name(), h)
+		if kerr != nil {
+			finishSession(h, "", session.StateFailed)
+			return kerr
+		}
+		defer ka.Close()
+		req.Append = ka.appendCh
+		onEvent = ka.wrapOnEvent(onEvent)
+	}
 
 	res, err := streamer.Stream(ctx, req, onEvent)
 	if err != nil {
+		finishSession(h, "", session.StateFailed)
 		if format == agent.FormatText {
 			fmt.Fprintf(stderr, "\nmagic-agent: %v\n", err)
 		}
 		return &reportedError{err}
 	}
+	finishSession(h, res.SessionID, session.StateDone)
 
 	if format == agent.FormatJSON {
-		// 结尾汇总行（jq 可 tail -1 取全文 + 思考过程）。
+		// 结尾汇总行（jq 可 tail -1 取全文 + 思考过程 + 工具调用列表）。
 		out := struct {
-			Type      string `json:"type"`
-			Engine    string `json:"engine"`
-			Model     string `json:"model"`
-			SessionID string `json:"session_id,omitempty"`
-			Attempts  int    `json:"attempts"`
-			LatencyMS int64  `json:"latency_ms"`
-			Thinking  string `json:"thinking,omitempty"`
-			Text      string `json:"text"`
+			Type      string           `json:"type"`
+			Engine    string           `json:"engine"`
+			Model     string           `json:"model"`
+			SessionID string           `json:"session_id,omitempty"`
+			Attempts  int              `json:"attempts"`
+			LatencyMS int64            `json:"latency_ms"`
+			Thinking  string           `json:"thinking,omitempty"`
+			Text      string           `json:"text"`
+			Tools     []agent.ToolCall `json:"tools,omitempty"`
 		}{
 			Type:      "result",
 			Engine:    res.Engine,
@@ -225,6 +591,7 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 			LatencyMS: res.Latency.Milliseconds(),
 			Thinking:  res.Thinking,
 			Text:      res.Text,
+			Tools:     res.Tools,
 		}
 		if opts.noThinking {
 			out.Thinking = ""
@@ -242,11 +609,26 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 }
 
 // writeStreamEventJSON 输出一行流式事件 NDJSON。
+//
+// 输出 schema（所有事件共享 {type,text}）：
+//
+//	{"type":"thinking","text":"..."}                模型思考增量
+//	{"type":"text","text":"..."}                    正文增量
+//	{"type":"tool_use","text":"<args JSON>","name":"Bash","id":"toolu_xxx"}
+//	{"type":"tool_result","text":"<output>","name":"","id":"toolu_xxx"}
+//	{"type":"turn_end","text":"<该轮正文>","session_id":"..."}   一轮结束（常驻会话）
+//
+// 工具事件多带 name / id 字段；turn_end 带 session_id（调用方据此绑定会话锚点）；
+// thinking / text 事件的 name / id / session_id 省略（取零值）。
 func writeStreamEventJSON(w io.Writer, ev agent.StreamEvent) error {
 	data, err := json.Marshal(struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{Type: string(ev.Kind), Text: ev.Text})
+		Type      string            `json:"type"`
+		Text      string            `json:"text"`
+		Name      string            `json:"name,omitempty"`
+		ID        string            `json:"id,omitempty"`
+		SessionID string            `json:"session_id,omitempty"`
+		Ask       *agent.AskRequest `json:"ask,omitempty"`
+	}{Type: string(ev.Kind), Text: ev.Text, Name: ev.Name, ID: ev.ID, SessionID: ev.SessionID, Ask: ev.Ask})
 	if err != nil {
 		return err
 	}
@@ -282,15 +664,92 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 	if err != nil {
 		return nil, "", agent.Request{}, err
 	}
+	// 四档权限档位：解析 + 能力校验。
+	tier, err := resolvePermissionTier(engine.Name(), opts.permission, flagChanged(cmd, "permission"))
+	if err != nil {
+		return nil, "", agent.Request{}, err
+	}
+	// --tools off 下不调用任何工具，档位无处生效 —— 显式传了非默认档就说明白（不静默）。
+	if flagChanged(cmd, "permission") && toolsMode.IsOff() && tier != agent.DefaultPermissionTier {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"magic-agent: 提示：当前 --tools off（不调用任何工具），--permission %s 不会生效；如需工具请加 --tools on\n", tier)
+	}
+	// 常驻会话默认开（claude/codebuddy 的流式调用），但只在「流式 + 引擎支持追加」时才有意义。
+	// 显式 `--keep-alive` 却没满足条件 → 明确报错；默认值不满足条件 → 静默忽略（不影响原有调用）。
+	if flagChanged(cmd, "keep-alive") && opts.keepAlive {
+		if !opts.stream {
+			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
+				"--keep-alive 是常驻会话（首轮结束后等 --append 追加），必须配合 --stream：追加轮次的输出要靠事件流送出")}
+		}
+		if !agent.AppendSupportOf(engine.Name()) {
+			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
+				"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy：它们能持续从 stdin 收 user 消息）", engine.Name())}
+		}
+	}
+	if opts.idle < 0 {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("--idle 不能为负（收到 %v；0 = 本轮结束就收工）", opts.idle)}
+	}
+	// 工作目录（workspace）：展开 ~、转绝对路径、校验存在且是目录。
+	workspace, err := resolveWorkspaceDir(opts.workspace)
+	if err != nil {
+		return nil, "", agent.Request{}, &usageError{err}
+	}
+	if workspace != "" {
+		// 引擎不支持时**明确提示**（参数会被忽略），而不是静默不生效。
+		if warn := workspaceUnsupportedWarn(engine.Name()); warn != "" {
+			fmt.Fprint(cmd.ErrOrStderr(), warn)
+		}
+	}
+	// 附件（截图/图片等）：与提示词并列的第二份输入，校验后交给引擎按各自原生方式落地。
+	attachments, err := resolveAttachments(opts.attach)
+	if err != nil {
+		return nil, "", agent.Request{}, &usageError{err}
+	}
+	if len(attachments) > 0 {
+		// 没有原生附件通道的引擎会降级成「路径写进提示词」——明确说清楚（不静默）。
+		if warn := attachmentPromptFallbackWarn(engine.Name(), len(attachments), toolsMode.IsOff()); warn != "" {
+			fmt.Fprint(cmd.ErrOrStderr(), warn)
+		}
+	}
 
 	// 2. 组装 prompt：-p > --file/stdin 内容 + 位置参数。
-	promptParts, err := collectPrompt(cmd.InOrStdin(), args, opts.file)
+	// 每个输入先过 expandPromptSource：值是文件路径（或 @路径）时按文件内容用，
+	// 命中提示写 stderr（不静默）。
+	var notes []string
+	expandArg := func(label, v string) (string, error) {
+		text, note, e := expandPromptSource(v)
+		if e != nil {
+			return "", fmt.Errorf("%s: %w", label, e)
+		}
+		if note != "" {
+			notes = append(notes, note)
+		}
+		return text, nil
+	}
+	expandedArgs := make([]string, 0, len(args))
+	for _, a := range args {
+		text, e := expandArg("参数", a)
+		if e != nil {
+			return nil, "", agent.Request{}, &usageError{e}
+		}
+		expandedArgs = append(expandedArgs, text)
+	}
+	promptParts, err := collectPrompt(cmd.InOrStdin(), expandedArgs, opts.file)
 	if err != nil {
 		return nil, "", agent.Request{}, &usageError{err}
 	}
 	if p := strings.TrimSpace(opts.prompt); p != "" {
+		text, e := expandArg("-p/--prompt", p)
+		if e != nil {
+			return nil, "", agent.Request{}, &usageError{e}
+		}
 		// --prompt 优先级最高：放到最前（同 --file 语义，附加内容跟后面）。
-		promptParts = append([]string{p}, promptParts...)
+		if text != "" {
+			promptParts = append([]string{text}, promptParts...)
+		}
+	}
+	for _, n := range notes {
+		fmt.Fprint(cmd.ErrOrStderr(), n)
 	}
 	prompt := strings.TrimSpace(strings.Join(promptParts, "\n\n"))
 	if prompt == "" {
@@ -303,12 +762,42 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 	}
 
 	// 4. 组装 Request。
+	// system prompt：-s 优先，其次配置文件里的默认值（空 = 不注入）。
+	// -s 的值同样支持「文件路径 / @路径」（系统提示词常存在单独的文件里）。
+	systemFlag, sysNote, sysFlagErr := expandPromptSource(opts.system)
+	if sysFlagErr != nil {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf("-s/--system: %w", sysFlagErr)}
+	}
+	if sysNote != "" {
+		fmt.Fprint(cmd.ErrOrStderr(), sysNote)
+	}
+	systemPrompt, cfgNote, sysErr := resolveSystemPrompt(systemFlag)
+	if cfgNote != "" {
+		// 配置里的默认值指向文件 → 同样明说一句（不静默）。
+		fmt.Fprint(cmd.ErrOrStderr(), cfgNote)
+	}
+	if sysErr != nil && opts.verbose {
+		// 配置坏掉不阻断调用（默认值只是「锦上添花」），但要让 -v 用户看见原因。
+		fmt.Fprintf(cmd.ErrOrStderr(), "magic-agent: 警告：读取默认系统提示词失败（%v），本次不注入\n", sysErr)
+	}
 	req := agent.Request{
 		Engine:       engine.Name(),
 		Model:        opts.model,
-		SystemPrompt: opts.system,
+		SystemPrompt: systemPrompt,
 		Tools:        toolsMode,
+		Attachments:  attachments,
 		MaxTokens:    opts.maxTokens,
+		SessionID:    strings.TrimSpace(opts.session),
+		Continue:     opts.continueF,
+		Workspace:    workspace,
+		Permission:   tier,
+		PermissionOptions: agent.PermissionOptions{
+			ExcludedCommands:    opts.sandboxExclude,
+			AllowedDomains:      opts.sandboxDomain,
+			AutoModeEnvironment: opts.autoModeEnv,
+			Deny:                opts.permDeny,
+			Ask:                 opts.permAsk,
+		},
 		Messages: []agent.Message{
 			{Role: "user", Content: prompt},
 		},
@@ -331,8 +820,8 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 //
 // 支持的形态（按宽松顺序）：
 //
-//	1) 完整 JSON Schema 对象：{"type":"object","properties":{...},"required":[...]}
-//	2) 已经预解析的 JSON（任意合法 JSON Schema 顶层对象）
+//  1. 完整 JSON Schema 对象：{"type":"object","properties":{...},"required":[...]}
+//  2. 已经预解析的 JSON（任意合法 JSON Schema 顶层对象）
 //
 // 仅当 type=="object" 时返回；其他顶层 type 一律视为不适用并报错。
 func parseJSONSchemaInline(s string) (*agent.JSONSchema, error) {

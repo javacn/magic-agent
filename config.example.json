@@ -1,0 +1,8 @@
+{
+  "systemPrompt": "你是一个中文助手，始终用中文回答所有问题。",
+  "arkclaw": {
+    "url": "https://<host>/a2a/jsonrpc",
+    "key": "<apikey>",
+    "claw_id": "ci-xxxxxxxxxxxxxxxxxxxx"
+  }
+}

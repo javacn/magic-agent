@@ -3,7 +3,7 @@ package agent
 // llmengine_test.go - llm 引擎（simonw/LLM CLI 包装）测试。
 //
 // 用 fake CLI 脚本模拟 llm prompt 的行为，验证：
-//	- buildArgs 参数构造（-n、-m、-s、--no-stream、prompt 位置）
+//	- buildArgs 参数构造（-m、-s、--no-stream、prompt 位置）
 //	- Complete：--no-stream + 标签剥离
 //	- Stream：纯文本逐行流式 + thinkSplitter 标签路由
 //	- 标签被行边界切开的边界情况
@@ -23,29 +23,52 @@ import (
 // llmTag 拼接思维链标签（避免源码出现连续 token）。
 func llmTag(parts ...string) string { return strings.Join(parts, "") }
 
-// TestLLMBuildArgs 参数构造：-n 恒有；-m / -s 按需；prompt 收尾。
+// TestLLMBuildArgs 参数构造：会话（--cid / -c）、-m / -s 按需；prompt 收尾。
+// 不含 -n/--no-log（会话闭环依赖 llm 本地日志持久化，见 llmengine.go 头注释）。
 func TestLLMBuildArgs(t *testing.T) {
 	e := &LLMEngine{}
 
 	// 最小形式
 	got := e.buildArgs(Request{Model: "minimax-m3"}, "你好")
-	want := []string{"prompt", "-n", "-m", "minimax-m3", "你好"}
+	want := []string{"prompt", "-m", "minimax-m3", "你好"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
 
 	// 带 system + engine/model 前缀剥离
 	got = e.buildArgs(Request{Model: "llm/minimax-m3", SystemPrompt: "你是助手"}, "问题")
-	want = []string{"prompt", "-n", "-m", "minimax-m3", "-s", "你是助手", "问题"}
+	want = []string{"prompt", "-m", "minimax-m3", "-s", "你是助手", "问题"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
 
 	// 无模型：不传 -m（llm 用自己的默认模型）
 	got = e.buildArgs(Request{}, "hi")
-	want = []string{"prompt", "-n", "hi"}
+	want = []string{"prompt", "hi"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 续接指定会话：--cid <id>（统一参数矩阵；id 通常来自上一轮
+	// --json envelope 的 conversation_id）
+	got = e.buildArgs(Request{SessionID: "01m2kx2qa0mbefrm2bk06mzz6r"}, "接着说")
+	want = []string{"prompt", "--cid", "01m2kx2qa0mbefrm2bk06mzz6r", "接着说"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// 续接最近一次会话：-c
+	got = e.buildArgs(Request{Continue: true}, "接着说")
+	want = []string{"prompt", "-c", "接着说"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q", got, want)
+	}
+
+	// SessionID 与 Continue 同时设置：SessionID 优先（与 Request 注释一致）
+	got = e.buildArgs(Request{SessionID: "conv-1", Continue: true}, "接着说")
+	want = []string{"prompt", "--cid", "conv-1", "接着说"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("buildArgs = %q, want %q (SessionID 应优先于 Continue)", got, want)
 	}
 }
 
@@ -61,14 +84,14 @@ func TestLLMBuildArgsModelOptions(t *testing.T) {
 	// 两个都给
 	temp := 0.3
 	got := e.buildArgs(Request{Model: "minimax-m3", MaxTokens: 32000, Temperature: &temp}, "写一集")
-	want := []string{"prompt", "-n", "-m", "minimax-m3", "-o", "max_tokens", "32000", "-o", "temperature", "0.3", "写一集"}
+	want := []string{"prompt", "-m", "minimax-m3", "-o", "max_tokens", "32000", "-o", "temperature", "0.3", "写一集"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
 
 	// 只给 max-tokens
 	got = e.buildArgs(Request{MaxTokens: 8000}, "hi")
-	want = []string{"prompt", "-n", "-o", "max_tokens", "8000", "hi"}
+	want = []string{"prompt", "-o", "max_tokens", "8000", "hi"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
@@ -76,7 +99,7 @@ func TestLLMBuildArgsModelOptions(t *testing.T) {
 	// 整数温度不留 ".0" 尾巴；0 是合法温度（必须出现）
 	zero := 0.0
 	got = e.buildArgs(Request{Temperature: &zero}, "hi")
-	want = []string{"prompt", "-n", "-o", "temperature", "0", "hi"}
+	want = []string{"prompt", "-o", "temperature", "0", "hi"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("buildArgs = %q, want %q (温度 0 必须透传)", got, want)
 	}
@@ -183,7 +206,7 @@ func TestLLMCompletePassesFlags(t *testing.T) {
 	}
 	data, _ := os.ReadFile(log)
 	args := string(data)
-	for _, want := range []string{"prompt", "-n", "-m minimax-m3", "-s 你是助手", "--no-stream"} {
+	for _, want := range []string{"prompt", "-m minimax-m3", "-s 你是助手", "--no-stream"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("%q missing in args: %q", want, args)
 		}
@@ -327,11 +350,13 @@ func TestLLMStreamPlainText(t *testing.T) {
 }
 
 // TestLLMCompleteParsesJSONUsage --json 路径：正文取自 response（思维链已剥离），
-// token 计数从 input_tokens / output_tokens 读出，model 用 llm 回报的实际模型名。
+// token 计数从 input_tokens / output_tokens 读出，model 用 llm 回报的实际模型名；
+// envelope 的 conversation_id 回填 Response.SessionID，供下一轮 --cid 续接。
 func TestLLMCompleteParsesJSONUsage(t *testing.T) {
 	open := llmTag("<", "think", ">")
 	closeTag := llmTag("<", "/", "think", ">")
-	payload := `[{"model":"minimax-m3","input_tokens":192,"output_tokens":38,"response":"` +
+	payload := `[{"model":"minimax-m3","input_tokens":192,"output_tokens":38,` +
+		`"conversation_id":"01m2kxhae6x0chahn5e71nvm84","response":"` +
 		open + `想一下` + closeTag + `\n\n收到"}]`
 	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+payload+"\nEOF\n")
 	e := &LLMEngine{BinPath: cli}
@@ -355,6 +380,11 @@ func TestLLMCompleteParsesJSONUsage(t *testing.T) {
 	// llm 回报的 model 优先于请求里的 "llm/minimax-m3"（前缀已剥）。
 	if resp.Model != "minimax-m3" {
 		t.Errorf("Model = %q, want minimax-m3", resp.Model)
+	}
+	// 会话闭环：envelope 的 conversation_id → Response.SessionID，
+	// 下一轮 Request.SessionID → buildArgs 的 --cid（见 TestLLMBuildArgs）。
+	if resp.SessionID != "01m2kxhae6x0chahn5e71nvm84" {
+		t.Errorf("SessionID = %q, want 01m2kxhae6x0chahn5e71nvm84（conversation_id 应回填）", resp.SessionID)
 	}
 }
 
