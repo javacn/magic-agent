@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ── 纯函数解析器 ─────────────────────────────────────────────
@@ -131,6 +132,9 @@ func TestJSONModelsArray(t *testing.T) {
 // ── 各引擎 ListModels（假 CLI）────────────────────────────────
 
 func TestEngineListModelsWithFakeCLI(t *testing.T) {
+	// 隔离 HOME：codebuddy-ai 的扩展来源会扫 ~/.codebuddy-ai 与 ~/.codebuddy 的
+	// local_storage 缓存，不隔离会吃到真机缓存导致断言失败。
+	t.Setenv("HOME", t.TempDir())
 	cases := []struct {
 		name    string
 		cliName string
@@ -179,6 +183,16 @@ func TestEngineListModelsWithFakeCLI(t *testing.T) {
 			want:    []string{"auto", "hy3", "custom-local:MiniMax-M3"},
 			build:   func(bin string) ModelLister { return &CodeBuddyEngine{BinPath: bin} },
 		},
+		{
+			// AI 后端的注册表是分层别名（国外模型网关侧映射），与 WorkBuddy 端完全不同；
+			// listModels 必须经 extraEnv 隔离读到自己的清单（这里用假 CLI 验证解析面）。
+			name:    "codebuddy-ai",
+			cliName: "codebuddy-ai",
+			canned:  `printf '%s\n' 'Options:' '  --model <model>  Model ID. Currently supported: (fast-model, balanced-model, primary-model, deep-model)'`,
+			wantArg: "--help",
+			want:    []string{"fast-model", "balanced-model", "primary-model", "deep-model"},
+			build:   func(bin string) ModelLister { return &CodeBuddyAIEngine{BinPath: bin} },
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -220,6 +234,397 @@ func TestEngineListModelsFailures(t *testing.T) {
 	if _, err := (&LLMEngine{BinPath: filepath.Join(dir, "nope")}).ListModels(context.Background()); err == nil {
 		t.Error("missing CLI should error")
 	}
+}
+
+// ── product.json 模型清单（codebuddy-ai 专用来源）────────────────
+
+func TestParseCreditMultiplier(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"x2.20 credits", "2.20"},
+		{"x0.77", "0.77"},
+		{"x0.00", "0.00"},
+		{"  X1.5 CREDITS ", "1.5"},
+		{"", ""},        // 空
+		{"credits", ""}, // 缺倍率
+		{"abc", ""},     // 非数字
+		{"x", ""},       // 只有前缀
+	}
+	for _, tc := range cases {
+		if got := parseCreditMultiplier(tc.in); got != tc.want {
+			t.Errorf("parseCreditMultiplier(%q) = %q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestParseProductJSONModels(t *testing.T) {
+	// 真实 AI 端 product.json 的裁剪形态：条目带 name / credits 等无关字段。
+	data := []byte(`{
+	  "$schema": "x",
+	  "models": [
+	    {"id":"default-model","name":"Default","credits":"x2.20 credits"},
+	    {"id":"gpt-5.5","name":"GPT-5.5","credits":"x3.31"},
+	    {"id":"gemini-3.1-pro","name":"Gemini-3.1-Pro"},
+	    {"id":"fast-model","name":"Fast","credits":"x0.34 credits"}
+	  ]
+	}`)
+	want := []string{"default-model", "gpt-5.5", "gemini-3.1-pro", "fast-model"}
+	if got := parseProductJSONModels(data); !equalStrings(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+	// 积分倍率：规范化数字；无 credits 的模型不进表。
+	wantCredits := map[string]string{"default-model": "2.20", "gpt-5.5": "3.31", "fast-model": "0.34"}
+	if _, gotCredits := parseProductJSONCatalog(data); !equalMaps(gotCredits, wantCredits) {
+		t.Errorf("credits = %v want %v", gotCredits, wantCredits)
+	}
+
+	// 缺 id / 空 id 的条目跳过；重复项去重。
+	partial := []byte(`{"models":[{"id":"a"},{"name":"no-id"},{"id":"  "},{"id":"b"},{"id":"a"}]}`)
+	if got := parseProductJSONModels(partial); !equalStrings(got, []string{"a", "b"}) {
+		t.Errorf("partial: got %v", got)
+	}
+
+	// 坏 JSON / models 类型不对 / 无 models / 空清单 → nil（调用方据此回退 --help）。
+	for _, bad := range []string{`not json`, `{"models":"nope"}`, `{}`, `{"models":[]}`} {
+		if got := parseProductJSONModels([]byte(bad)); got != nil {
+			t.Errorf("bad %q: got %v want nil", bad, got)
+		}
+	}
+}
+
+func TestProductJSONPath(t *testing.T) {
+	cases := []struct{ bin, want string }{
+		{
+			bin:  "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+			want: "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/product.json",
+		},
+		{bin: "/usr/local/bin/codebuddy", want: "/usr/local/product.json"},
+		{bin: "", want: ""},
+	}
+	for _, tc := range cases {
+		if got := productJSONPath(tc.bin); got != tc.want {
+			t.Errorf("productJSONPath(%q) = %q want %q", tc.bin, got, tc.want)
+		}
+	}
+}
+
+// ── 远程配置缓存（codebuddy-ai 扩展来源之一）────────────────────
+
+func TestReadRemoteConfigCacheModels(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "local_storage")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 正常条目：两个账号的清单取并集、去重、保序。
+	write("entry_a.info", `[
+	  {"userId":"u1","data":{"models":[{"id":"auto"},{"id":"deepseek-v4.1-flash"}]}},
+	  {"userId":"u2","data":{"models":[{"id":"deepseek-v4.1-flash"},{"id":"hy3"}]}}
+	]`)
+	// 其他形态：对象 / 字符串数组（base64+gzip 大对象）/ 坏 JSON → 都跳过。
+	write("entry_flags.info", `{"productFeatures":{"Billing":true}}`)
+	write("entry_blob.info", `["H4sIAAAAAAAAE+y9e28kWXYf"]`)
+	write("entry_broken.info", `not json`)
+	write("ignore.txt", `[{"data":{"models":[{"id":"nope"}]}}]`)
+
+	want := []string{"auto", "deepseek-v4.1-flash", "hy3"}
+	if got := readRemoteConfigCacheModels(dir); !equalStrings(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+
+	// 目录缺失 / 空目录 / 空参 → nil。
+	if got := readRemoteConfigCacheModels(filepath.Join(t.TempDir(), "nope")); got != nil {
+		t.Errorf("missing dir: got %v want nil", got)
+	}
+	empty := filepath.Join(t.TempDir(), "local_storage")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := readRemoteConfigCacheModels(empty); got != nil {
+		t.Errorf("empty dir: got %v want nil", got)
+	}
+	if got := readRemoteConfigCacheModels(""); got != nil {
+		t.Errorf("empty arg: got %v want nil", got)
+	}
+}
+
+// ── 客户端合并配置缓存（codebuddy-ai 首选来源）──────────────────
+
+// codebuddy-ai 首选 ~/.workbuddy-ai/cache/acc-product-config-v*.json（客户端模型
+// 选择器同源）；多版本取 mtime 最新；缺失时回退「远程配置缓存 ∪ product.json」。
+func TestCodeBuddyListModelsAccConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cacheDir := filepath.Join(os.Getenv("HOME"), ".workbuddy-ai", "cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeAcc := func(name, body string, modTime time.Time) {
+		t.Helper()
+		p := filepath.Join(cacheDir, name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, modTime, modTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	accV3 := `{"endpoint":"https://www.workbuddy.ai","models":[
+	  {"id":"fast-model","credits":"x0.34 credits"},{"id":"deepseek-v4.1-flash","credits":"x0.00"},
+	  {"id":"gpt-5.5","credits":"x3.31"},{"id":"gpt-6-astra","credits":"x6.67"},{"id":"custom-local:MiniMax-M3"}
+	]}`
+	// 旧版本的清单不同，用于验证「取 mtime 最新」。
+	accV2 := `{"models":[{"id":"stale-model"}]}`
+
+	// A) acc 缓存命中 → 精确返回客户端清单（哪怕远程配置缓存 / product.json
+	//    里有别的模型也不并入）；ModelCredits 给出规范化倍率，custom-local 不进表。
+	writeAcc("acc-product-config-v2.json", accV2, time.Now().Add(-time.Hour))
+	writeAcc("acc-product-config-v3.json", accV3, time.Now())
+	bin, argsLog := appPkgCLI(t, "", `{"models":[{"id":"gpt-5.5"}]}`)
+	ai := &CodeBuddyAIEngine{BinPath: bin}
+	got, err := ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	want := []string{"fast-model", "deepseek-v4.1-flash", "gpt-5.5", "gpt-6-astra", "custom-local:MiniMax-M3"}
+	if !equalStrings(got, want) {
+		t.Errorf("acc got %v want %v", got, want)
+	}
+	wantCredits := map[string]string{
+		"fast-model": "0.34", "deepseek-v4.1-flash": "0.00", "gpt-5.5": "3.31", "gpt-6-astra": "6.67",
+	}
+	if gotC := ai.ModelCredits(context.Background()); !equalMaps(gotC, wantCredits) {
+		t.Errorf("ModelCredits = %v want %v", gotC, wantCredits)
+	}
+	if _, err := os.Stat(argsLog); err == nil {
+		t.Error("acc 缓存命中时不应启动 CLI 取 --help")
+	}
+
+	// B) 只有旧版本 → 一样生效（glob 不写死版本号）；无倍率字段 → ModelCredits 为 nil。
+	if err := os.Remove(filepath.Join(cacheDir, "acc-product-config-v3.json")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(v2): %v", err)
+	}
+	if !equalStrings(got, []string{"stale-model"}) {
+		t.Errorf("v2-only got %v", got)
+	}
+	if gotC := ai.ModelCredits(context.Background()); gotC != nil {
+		t.Errorf("v2-only ModelCredits = %v want nil", gotC)
+	}
+}
+
+// codebuddy-ai 的清单链：远程配置缓存 ∪ product.json → 都没有时回退 --help；
+// WorkBuddy 端两条扩展来源都不启用。
+func TestCodeBuddyListModelsProductJSON(t *testing.T) {
+	// 隔离 HOME：扩展来源扫 ~/.codebuddy-ai 与 ~/.codebuddy 的缓存，不隔离会吃到真机缓存。
+	t.Setenv("HOME", t.TempDir())
+
+	const aiHelp = `Options:
+  --model <model>  Model ID. Currently supported: (fast-model, balanced-model, primary-model, deep-model)
+`
+	const aiProduct = `{"models":[{"id":"gpt-5.5","credits":"x3.31 credits"},{"id":"gemini-3.1-pro"},{"id":"deepseek-v3-2-volc"},{"id":"fast-model"}]}`
+	cacheBody := `[
+	  {"userId":"u1","data":{"models":[{"id":"deepseek-v4.1-flash","credits":"x0.03"},{"id":"auto"},{"id":"hy3"}]}},
+	  {"userId":"u2","data":{"models":[{"id":"deepseek-v4.1-flash"},{"id":"fast-model","credits":"x0.34 credits"}]}}
+	]`
+	sharedCache := filepath.Join(os.Getenv("HOME"), ".codebuddy", "local_storage")
+	writeCache := func(dir, body string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "entry_cache.info"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A) 缓存 + product.json → 并集（缓存序在前、去重），且**不启动 CLI**。
+	//    倍率同链合并：缓存优先（deepseek-v4.1-flash 取 u1 的 x0.03），product.json 补 gpt-5.5。
+	writeCache(sharedCache, cacheBody)
+	bin, argsLog := appPkgCLI(t, aiHelp, aiProduct)
+	ai := &CodeBuddyAIEngine{BinPath: bin}
+	got, err := ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	want := []string{"deepseek-v4.1-flash", "auto", "hy3", "fast-model", "gpt-5.5", "gemini-3.1-pro", "deepseek-v3-2-volc"}
+	if !equalStrings(got, want) {
+		t.Errorf("ai got %v want %v", got, want)
+	}
+	wantCredits := map[string]string{"deepseek-v4.1-flash": "0.03", "fast-model": "0.34", "gpt-5.5": "3.31"}
+	if gotC := ai.ModelCredits(context.Background()); !equalMaps(gotC, wantCredits) {
+		t.Errorf("ModelCredits = %v want %v", gotC, wantCredits)
+	}
+	if _, err := os.Stat(argsLog); err == nil {
+		t.Error("扩展来源命中时不应启动 CLI 取 --help")
+	}
+
+	// B) 无缓存 + product.json → 仅 product.json，仍不启动 CLI。
+	if err := os.RemoveAll(sharedCache); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(product): %v", err)
+	}
+	if !equalStrings(got, []string{"gpt-5.5", "gemini-3.1-pro", "deepseek-v3-2-volc", "fast-model"}) {
+		t.Errorf("product-only got %v", got)
+	}
+	if gotC := ai.ModelCredits(context.Background()); !equalMaps(gotC, map[string]string{"gpt-5.5": "3.31"}) {
+		t.Errorf("product-only ModelCredits = %v", gotC)
+	}
+
+	// C) 两者皆无 → 回退 --help 的四个分层别名。
+	bin3, _ := appPkgCLI(t, aiHelp, "")
+	got, err = (&CodeBuddyAIEngine{BinPath: bin3}).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(fallback): %v", err)
+	}
+	if !equalStrings(got, []string{"fast-model", "balanced-model", "primary-model", "deep-model"}) {
+		t.Errorf("fallback got %v", got)
+	}
+
+	// D) WorkBuddy 端：缓存和 product.json 就在旁边也必须忽略，走 --help。
+	writeCache(sharedCache, cacheBody)
+	const wbHelp = `Options:
+  --model <model>  Model ID. Currently supported: (auto, hy3, glm-5.3)
+`
+	binWB, _ := appPkgCLI(t, wbHelp, aiProduct)
+	got, err = (&CodeBuddyEngine{BinPath: binWB}).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(workbuddy): %v", err)
+	}
+	if !equalStrings(got, []string{"auto", "hy3", "glm-5.3"}) {
+		t.Errorf("workbuddy got %v", got)
+	}
+
+	// E) 用户显式设置 CODEBUDDY_CONFIG_DIR：只信该目录，共享缓存不兜底。
+	t.Setenv("CODEBUDDY_CONFIG_DIR", t.TempDir())
+	bin5, _ := appPkgCLI(t, aiHelp, "")
+	got, err = (&CodeBuddyAIEngine{BinPath: bin5}).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(custom dir): %v", err)
+	}
+	if !equalStrings(got, []string{"fast-model", "balanced-model", "primary-model", "deep-model"}) {
+		t.Errorf("custom-dir got %v", got)
+	}
+	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
+}
+
+// codebuddy（非 ai）的倍率链：acc 缓存（~/.workbuddy）→ 远程配置缓存 ∪ product.json；
+// **清单始终按 --help**（扩展清单链不启用 —— 与 codebuddy-ai 的关键差异）。
+// 同时验证 ModelCredits 全程不启动 CLI（倍率只读缓存文件）。
+func TestCodeBuddyModelCredits(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
+
+	const help = `Options:
+  --model <model>  Model ID. Currently supported: (hy3, fast-model, deep-model)
+`
+	// product.json 给 hy3/fast-model 两条倍率：acc 命中时不得混入（7.77/1.23）；
+	// 兜底链里它们分别被缓存值顶掉 / 并入。
+	product := `{"models":[{"id":"hy3","credits":"x7.77"},{"id":"fast-model","credits":"x1.23"}]}`
+	accBody := `{"models":[
+	  {"id":"hy3","credits":"x0.00"},{"id":"fast-model","credits":"x0.34"},
+	  {"id":"balanced-model","credits":"x0.65"},{"id":"only-in-acc","credits":"x1.00"}
+	]}`
+	cacheBody := `[{"userId":"u1","data":{"models":[{"id":"hy3","credits":"x9.99"}]}}]`
+	accDir := filepath.Join(os.Getenv("HOME"), ".workbuddy", "cache")
+	sharedCache := filepath.Join(os.Getenv("HOME"), ".codebuddy", "local_storage")
+	writeFile := func(p, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A) acc 缓存命中 → 倍率只来自 acc（hy3=0.00，而非缓存 9.99 / product 7.77）；
+	//    acc 里清单外的模型（only-in-acc）照常进表；**清单仍是 --help 的**。
+	writeFile(filepath.Join(accDir, "acc-product-config-v3.json"), accBody)
+	writeFile(filepath.Join(sharedCache, "entry_cache.info"), cacheBody)
+	bin, argsLog := appPkgCLI(t, help, product)
+	cb := &CodeBuddyEngine{BinPath: bin}
+	got, err := cb.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if !equalStrings(got, []string{"hy3", "fast-model", "deep-model"}) {
+		t.Errorf("清单应仍按 --help，got %v", got)
+	}
+	wantA := map[string]string{"hy3": "0.00", "fast-model": "0.34", "balanced-model": "0.65", "only-in-acc": "1.00"}
+	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantA) {
+		t.Errorf("ModelCredits = %v want %v", gotC, wantA)
+	}
+	// ModelCredits 不应再启动 CLI：argsLog 还是 ListModels 那一次的（mtime 不变）。
+	fiBefore, err := os.Stat(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantA) {
+		t.Errorf("ModelCredits(2) = %v want %v", gotC, wantA)
+	}
+	if fiAfter, err := os.Stat(argsLog); err != nil || !fiAfter.ModTime().Equal(fiBefore.ModTime()) {
+		t.Errorf("ModelCredits 不应启动 CLI（argsLog mtime 变了）: %v / %v", fiAfter, err)
+	}
+
+	// B) acc 缺席 → 远程配置缓存 ∪ product.json 合并（缓存优先：hy3 取 9.99）。
+	if err := os.RemoveAll(accDir); err != nil {
+		t.Fatal(err)
+	}
+	wantB := map[string]string{"hy3": "9.99", "fast-model": "1.23"}
+	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantB) {
+		t.Errorf("ModelCredits(fallback) = %v want %v", gotC, wantB)
+	}
+
+	// C) 缓存也没有 → 仅 product.json。
+	if err := os.RemoveAll(sharedCache); err != nil {
+		t.Fatal(err)
+	}
+	wantC := map[string]string{"hy3": "7.77", "fast-model": "1.23"}
+	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantC) {
+		t.Errorf("ModelCredits(product) = %v want %v", gotC, wantC)
+	}
+
+	// D) 什么都没有 → nil（CLI 端省略 model_credits）。
+	bin2, _ := appPkgCLI(t, help, "")
+	if gotC := (&CodeBuddyEngine{BinPath: bin2}).ModelCredits(context.Background()); gotC != nil {
+		t.Errorf("ModelCredits(empty) = %v want nil", gotC)
+	}
+}
+
+// appPkgCLI 搭出 App 包目录结构（<tmp>/cli/bin/<name> + <tmp>/cli/product.json），
+// 用于验证 productJSONPath 的上溯推导。productJSON 为空则不放 product.json。
+func appPkgCLI(t *testing.T, helpOut, productJSON string) (bin, argsLog string) {
+	t.Helper()
+	cliDir := filepath.Join(t.TempDir(), "cli")
+	binDir := filepath.Join(cliDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argsLog = filepath.Join(cliDir, "args.log")
+	bin = filepath.Join(binDir, "codebuddy")
+	// --help 文案是多行文本，用 heredoc 原样输出（直接拼接会被 shell 当命令执行）。
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + argsLog + "\n" +
+		"cat <<'HELPEOF'\n" + strings.TrimRight(helpOut, "\n") + "\nHELPEOF\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if productJSON != "" {
+		if err := os.WriteFile(filepath.Join(cliDir, "product.json"), []byte(productJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bin, argsLog
 }
 
 // claude 的清单来自 settings.json：HOME 下 .claude/settings.json，
@@ -308,6 +713,18 @@ func equalStrings(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
 			return false
 		}
 	}

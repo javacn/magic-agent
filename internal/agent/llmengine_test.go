@@ -478,10 +478,10 @@ func TestLLMCompleteAppliesJSONSchema(t *testing.T) {
 	}
 	objJSON, _ := json.Marshal(obj)
 	payload, _ := json.Marshal([]map[string]any{{
-		"model":        "minimax-m3",
-		"input_tokens": 100,
+		"model":         "minimax-m3",
+		"input_tokens":  100,
 		"output_tokens": len(objJSON),
-		"response":     string(objJSON), // ← 这里是「字符串化的 JSON」
+		"response":      string(objJSON), // ← 这里是「字符串化的 JSON」
 	}})
 	cli := writeFakeCLI(t, "llm", "#!/bin/sh\ncat <<'EOF'\n"+string(payload)+"\nEOF\n")
 	e := &LLMEngine{BinPath: cli}

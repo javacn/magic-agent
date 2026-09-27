@@ -1,9 +1,27 @@
 package agent
 
-// codebuddy.go - CodeBuddy（WorkBuddy）CLI 引擎。
+// codebuddy.go - CodeBuddy（WorkBuddy / WorkBuddy AI）CLI 引擎。
 //
-// 后端：WorkBuddy.app 内置的 codebuddy CLI。非交互模式与 claude 同源
-// （同为 CodeBuddy Code 系），但输出 envelope 实测有两种形态，解析需兼容：
+// 两个后端共用本文件的实现核心（codebuddyCore），只差引擎名 / 探测链 / 默认模型：
+//
+//	codebuddy      WorkBuddy.app 内置 CLI（后端网关 copilot.tencent.com）
+//	codebuddy-ai   WorkBuddy AI.app 内置 CLI（后端网关 www.workbuddy.ai）
+//
+// 两者同为 CodeBuddy Code v2.x：非交互协议与 claude 同源、flag 面一致、Bearer 令牌
+// 各自独立。模型注册表按后端不同：
+//
+//	WorkBuddy  hy3 / glm / kimi / deepseek 等国内模型（--help 动态下发，23 条）
+//	AI 端      客户端所见 ~23 个预制模型（分层别名 + gpt-5.x/5.6 + deepseek-v4.1-flash
+//	           等；--help 只有 4 个分层别名，完整清单见 listModels 的三级来源链）
+//
+// codebuddy-ai 默认不强制 --model（交 CLI 自身默认，旧静态清单里的 kimi-k3-1 等
+// 实测被国际后端 400 拒绝）。
+//
+// 配置目录隔离：codebuddy-ai 通过 CODEBUDDY_CONFIG_DIR=~/.codebuddy-ai 使用
+// 独立凭据库（见 codebuddyAIDir 注释）—— 共享 ~/.codebuddy 会被桌面 App
+// daemon 切换账号，导致登录态被顶、间歇性 401。
+//
+// 非交互模式输出 envelope 实测有两种形态，解析需兼容：
 //
 //	1. 单对象：{"type":"result","result":"<md>",...}
 //	2. 数组：[{...stream messages...}]，扫描 type=="result" 或
@@ -25,8 +43,8 @@ package agent
 //	                                 实现 MaxTokens（codebuddy 无原生 max-tokens flag，
 //	                                 与 claude 同款 --settings 通道，见矩阵①）
 //
-// CLI 路径解析：显式 BinPath → MAGIC_AGENT_CODEBUDDY_BIN → WorkBuddy.app
-// 内置路径 → PATH（探测链统一收敛在 engine_base.go 的 cliBase）。
+// CLI 路径解析：显式 BinPath → MAGIC_AGENT_CODEBUDDY_BIN / MAGIC_AGENT_CODEBUDDY_AI_BIN
+// → 各自 App 内置路径 → PATH（探测链统一收敛在 engine_base.go 的 cliBase）。
 //
 // ⚠️ 在 WorkBuddy 会话内调用时，父进程注入的 SERVER__PORT 会让 CLI 抢
 // 父会话已监听的端口 → EADDRINUSE → 永久挂起。子进程环境由 env.go
@@ -37,49 +55,161 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-// CodeBuddyEngine 通过 CodeBuddy CLI 实现 Engine。
-type CodeBuddyEngine struct {
-	// BinPath 显式指定 CLI 路径（空 = 自动探测）。测试注入用。
-	BinPath string
+// codebuddyCore 两个 codebuddy 后端共享的实现核心。
+// CodeBuddyEngine / CodeBuddyAIEngine 都是它的薄壳（见文件头）。
+type codebuddyCore struct {
+	// name 引擎名：进错误消息、Response.Engine、agentSettingsPayload 的引擎键。
+	name string
+	// base 可执行文件探测链（engine_base.go 的 cliBase）。
+	base cliBase
+	// binPath 显式指定 CLI 路径（空 = 走 base 探测链）。测试注入用。
+	binPath string
+	// model 默认模型（空 = 不传 --model，交 CLI 自身默认）。
+	model string
+	// extraEnv 追加给子进程的环境变量（Go exec：重复 key 取最后 → 覆盖继承值）。
+	// codebuddy-ai 用它把 CODEBUDDY_CONFIG_DIR 指向独立配置目录（见 codebuddyAIExtraEnv）。
+	extraEnv []string
+	// extendedModelSources 启用扩展模型清单来源（仅 codebuddy-ai）：
+	// ① AI 桌面客户端合并配置缓存 acc-product-config（客户端模型选择器同源，
+	// 见 codebuddyAIAccConfigPath）→ ② 远程配置缓存 ∪ App 包 product.json
+	// → ③ --help。WorkBuddy 端不启用。
+	extendedModelSources bool
+	// modelCacheDirs 远程配置缓存的 local_storage 目录（按优先级），两个用途：
+	// extendedModelSources=true 时是扩展清单链 ②；一律用于 modelCredits 的兜底 ②
+	// （见 codebuddyAIModelCacheDirs / codebuddyModelCacheDirs）。
+	modelCacheDirs []string
+	// accConfigPath 该引擎对应桌面客户端的合并产品配置缓存路径（构造时算好：
+	// codebuddyAIAccConfigPath / codebuddyAccConfigPath）。两个用途：
+	// extendedModelSources=true 时是扩展清单链 ①；一律用于 modelCredits 的首选 ①。
+	accConfigPath string
 }
 
-// Name 实现 Engine。
-func (e *CodeBuddyEngine) Name() string { return "codebuddy" }
-
-// DefaultCodeBuddyTimeout 单次尝试默认超时。
-const DefaultCodeBuddyTimeout = 5 * time.Minute
-
-// DefaultCodeBuddyModel codebuddy 引擎的默认模型。
-// 未显式 -m 指定时使用 hy3（与 magic-video 的 DefaultCreativeModel 一致）。
-const DefaultCodeBuddyModel = "hy3"
-
-// bin 探测 codebuddy CLI 路径（委托 cliBase 统一探测链）。
-func (e *CodeBuddyEngine) bin() string {
-	return codebuddyBase.resolve(e.BinPath)
+// bin 探测 CLI 路径（委托 cliBase 统一探测链）。
+func (c codebuddyCore) bin() string {
+	return c.base.resolve(c.binPath)
 }
 
-// Detect 实现 Engine。
-func (e *CodeBuddyEngine) Detect() (bool, string) {
-	p := codebuddyBase.resolve(e.BinPath)
+// detect 返回（是否可用，说明）。
+func (c codebuddyCore) detect() (bool, string) {
+	p := c.base.resolve(c.binPath)
 	if p == "" {
-		return false, codebuddyBase.notFound
+		return false, c.base.notFound
 	}
-	return true, p + " (default model: " + DefaultCodeBuddyModel + ")"
+	if c.model == "" {
+		return true, p
+	}
+	return true, p + " (default model: " + c.model + ")"
 }
 
-// ListModels 实现 ModelLister。
+// extendedModelCatalog 扩展来源链（仅 codebuddy-ai 启用）：返回（模型清单, 积分倍率表, 是否命中）。
 //
-// codebuddy 没有 models 子命令，但 --help 里 --model 的描述自带权威清单
-// （"Currently supported: (auto, hy3, ..., custom-local:*)"）—— 直接解析它，
-// 不写死任何模型名；用户新注册的 custom-local 模型也会自动出现。
-func (e *CodeBuddyEngine) ListModels(ctx context.Context) ([]string, error) {
-	stdout, err := probeCLI(ctx, "codebuddy", e.bin(), "--help")
+// ① 客户端合并配置缓存 acc-product-config（客户端模型选择器同源，清单与倍率同文件）
+// ② 远程配置缓存 ∪ App 包 product.json（超集近似，含国内后端条目）
+//
+// 命中 ① 时 ② 不再叠加 —— ① 就是客户端所见，别无二义。倍率表与清单同源同链。
+func (c codebuddyCore) extendedModelCatalog(bin string) ([]string, map[string]string, bool) {
+	if ids, credits := readProductJSONCatalog(c.accConfigPath); len(ids) > 0 {
+		return ids, credits, true
+	}
+	var ids []string
+	credits := map[string]string{}
+	for _, dir := range c.modelCacheDirs {
+		i, cr := remoteConfigCacheCatalog(dir)
+		ids = append(ids, i...)
+		for k, v := range cr {
+			if _, dup := credits[k]; !dup {
+				credits[k] = v
+			}
+		}
+	}
+	i, cr := readProductJSONCatalog(productJSONPath(bin))
+	ids = append(ids, i...)
+	for k, v := range cr {
+		if _, dup := credits[k]; !dup {
+			credits[k] = v
+		}
+	}
+	ids = dedupeModels(ids)
+	if len(ids) == 0 {
+		return nil, nil, false
+	}
+	return ids, credits, true
+}
+
+// modelCredits 返回各模型的**积分倍率表**（model → 规范化数字字符串，如 "0.34"，
+// 源自客户端 "x0.34 credits"）。来源链与 extendedModelCatalog 完全一致
+// （① acc 缓存 → ② 远程配置缓存 ∪ ③ App 包 product.json），但**只取倍率、
+// 不改变模型清单来源**：codebuddy-ai 的清单本来就走同一条扩展链；codebuddy 的
+// 清单仍按 --help（见 listModels），倍率单独补齐 —— 两张表按 model id 对上，
+// acc 缓存里多出的条目（清单里没有的模型）自然不会被任何清单引用。
+func (c codebuddyCore) modelCredits(bin string) map[string]string {
+	// ① 客户端合并配置缓存（与 extendedModelCatalog 同源同语义：**有模型即钉死**，
+	// 哪怕一条倍率都没有也不穿透 ②③ 去混别处的倍率 —— 客户端不给就是不显示）
+	if ids, credits := readProductJSONCatalog(c.accConfigPath); len(ids) > 0 {
+		if len(credits) == 0 {
+			return nil
+		}
+		return credits
+	}
+	// ② 远程配置缓存（按优先级，先到先得）∪ ③ App 包 product.json
+	credits := map[string]string{}
+	for _, dir := range c.modelCacheDirs {
+		_, cr := remoteConfigCacheCatalog(dir)
+		for k, v := range cr {
+			if _, dup := credits[k]; !dup {
+				credits[k] = v
+			}
+		}
+	}
+	_, cr := readProductJSONCatalog(productJSONPath(bin))
+	for k, v := range cr {
+		if _, dup := credits[k]; !dup {
+			credits[k] = v
+		}
+	}
+	if len(credits) == 0 {
+		return nil
+	}
+	return credits
+}
+
+// listModels 实现 ModelLister 的共享逻辑。
+//
+// 两个来源策略，按引擎择一：
+//
+//	codebuddy      --help 里 --model 描述自带的 "Currently supported: (...)" 清单
+//	codebuddy-ai  客户端合并配置缓存 acc-product-config（客户端同源）
+//	              → 客户端未运行过时回退「远程配置缓存 ∪ product.json」
+//	              → 再回退 --help（只有 4 个分层别名）
+//
+// 实测（2026-09-21）：AI 端各单一来源都不等于客户端所见 —— acc 缓存 27 条
+// （23 预制 + 4 custom-local，含 deepseek-v4.1-flash / gpt-5.6-*）才是客户端
+// 模型选择器的真实数据源；远程配置缓存（52 条）混着国内后端条目但没有 gpt；
+// product.json（26 条）没有 deepseek-v4.1-flash；--help 只有 4 个分层别名。
+//
+// ⚠️ --help 路径必须带 extraEnv：清单由登录后端下发，跟随配置目录。不带隔离
+// 环境时 codebuddy-ai 会读到共享 ~/.codebuddy 里 WorkBuddy 后端的清单。
+func (c codebuddyCore) listModels(ctx context.Context) ([]string, error) {
+	bin := c.bin()
+	if bin == "" {
+		return nil, fmt.Errorf("%s CLI not found", c.name)
+	}
+	if c.extendedModelSources {
+		// ① 客户端合并配置缓存（客户端模型选择器同源）→ ② 远程配置缓存 ∪
+		// App 包 product.json（超集近似）→ 都没有时落 ③ --help（见函数头）。
+		if ids, _, ok := c.extendedModelCatalog(bin); ok {
+			return ids, nil
+		}
+	}
+	stdout, stderr, err := runCLIEnvIn(ctx, "", c.extraEnv, bin, "--help")
 	if err != nil {
-		return nil, err
+		return nil, wrapCliError(c.name, stdout, stderr, err)
 	}
 	models := parseCodebuddyHelpModels(stdout)
 	if len(models) == 0 {
@@ -88,31 +218,31 @@ func (e *CodeBuddyEngine) ListModels(ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
-// Complete 实现 Engine：单次调用 codebuddy CLI。
-func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, error) {
+// complete 单次调用的共享逻辑。
+func (c codebuddyCore) complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
-	bin := e.bin()
+	bin := c.bin()
 	if bin == "" {
-		return Response{}, fmt.Errorf("codebuddy CLI not found; set MAGIC_AGENT_CODEBUDDY_BIN")
+		return Response{}, fmt.Errorf("%s CLI not found; set %s", c.name, c.base.envVar)
 	}
 
 	// 附件（截图）：与 claude 同族，--print 文本模式收不了图，走
 	// --input-format stream-json（图片 content block 经 stdin）。
 	if hasImageAttachment(req.Attachments) {
-		return e.completeWithAttachments(ctx, req, start)
+		return c.completeWithAttachments(ctx, req, start)
 	}
 
-	args := e.buildArgs(req)
+	args := c.buildArgs(req)
 
 	// workspace：codebuddy 与 claude 同族（无工作目录 flag，--add-dir 只加额外目录）
-	stdout, stderr, err := runCLIIn(ctx, req.Workspace, bin, args...)
+	stdout, stderr, err := runCLIEnvIn(ctx, req.Workspace, c.extraEnv, bin, args...)
 	if err != nil {
-		return Response{}, wrapCliError("codebuddy", stdout, stderr, err)
+		return Response{}, wrapCliError(c.name, stdout, stderr, err)
 	}
 
 	raw := strings.TrimSpace(stdout)
 	if raw == "" {
-		return Response{}, fmt.Errorf("codebuddy CLI returned empty output")
+		return Response{}, fmt.Errorf("%s CLI returned empty output", c.name)
 	}
 
 	text := extractCodeBuddyResult(raw)
@@ -122,7 +252,7 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 		text = cleaned
 	}
 	if strings.TrimSpace(text) == "" {
-		return Response{}, fmt.Errorf("codebuddy CLI 返回内容仅为请求回显（无模型正文）")
+		return Response{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 	}
 
 	return Response{
@@ -135,32 +265,32 @@ func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, 
 
 // completeWithAttachments 走 stream-json 输入通道跑一次带附件的调用
 // （codebuddy 与 claude 同族协议），把事件归约成单次 Response。
-func (e *CodeBuddyEngine) completeWithAttachments(ctx context.Context, req Request, start time.Time) (Response, error) {
-	bin := e.bin()
+func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request, start time.Time) (Response, error) {
+	bin := c.bin()
 	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
 	if prompt == "" {
-		return Response{}, fmt.Errorf("codebuddy: empty prompt")
+		return Response{}, fmt.Errorf("%s: empty prompt", c.name)
 	}
-	args := streamJSONArgs(e.buildArgsBase(req), prompt, false)
+	args := streamJSONArgs(c.buildArgsBase(req), prompt, false)
 	stdin, err := streamJSONUserLine(prompt, req.Attachments)
 	if err != nil {
 		return Response{}, err
 	}
-	acc := &streamAccumulator{Engine: e.Name()}
+	acc := &streamAccumulator{Engine: c.name}
 	var fin streamJSONResult
-	seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, strings.NewReader(stdin), acc, &fin)
+	seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, strings.NewReader(stdin), acc, &fin)
 	if err != nil {
-		return Response{}, wrapCliError("codebuddy", "", "", err)
+		return Response{}, wrapCliError(c.name, "", "", err)
 	}
 	if !seen {
-		return Response{}, fmt.Errorf("codebuddy CLI stream ended without result line")
+		return Response{}, fmt.Errorf("%s CLI stream ended without result line", c.name)
 	}
 	if fin.IsError {
-		return Response{}, fmt.Errorf("codebuddy CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
+		return Response{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
 	}
 	text := stripUserQueryEcho(finalizeStreamText(fin, acc))
 	if strings.TrimSpace(text) == "" {
-		return Response{}, fmt.Errorf("codebuddy CLI 返回内容仅为请求回显（无模型正文）")
+		return Response{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 	}
 	return Response{
 		Text:      text,
@@ -171,13 +301,13 @@ func (e *CodeBuddyEngine) completeWithAttachments(ctx context.Context, req Reque
 }
 
 // buildArgs 构造 codebuddy CLI 参数（Complete 与 Stream 共用）。
-func (e *CodeBuddyEngine) buildArgs(req Request) []string {
-	return append(e.buildArgsBase(req), FlattenPrompt(req.SystemPrompt, req.Messages, false))
+func (c codebuddyCore) buildArgs(req Request) []string {
+	return append(c.buildArgsBase(req), FlattenPrompt(req.SystemPrompt, req.Messages, false))
 }
 
 // buildArgsBase 构造参数（不含末尾的位置参数 prompt）——附件场景复用：
 // 那条路提示词走 stdin，不能再作为命令行参数传。
-func (e *CodeBuddyEngine) buildArgsBase(req Request) []string {
+func (c codebuddyCore) buildArgsBase(req Request) []string {
 	args := []string{"--print", "--output-format", "json"}
 	switch {
 	case req.SessionID != "":
@@ -213,32 +343,31 @@ func (e *CodeBuddyEngine) buildArgsBase(req Request) []string {
 	}
 	if m := stripModelPrefix(req.Model); m != "" {
 		args = append(args, "--model", m)
-	} else {
-		// 默认模型 hy3；空串 = CLI 自身默认（几乎不用，保底语义）。
-		if DefaultCodeBuddyModel != "" {
-			args = append(args, "--model", DefaultCodeBuddyModel)
-		}
+	} else if c.model != "" {
+		// 默认模型（codebuddy=hy3；codebuddy-ai 故意留空 = CLI 自身默认，
+		// 见文件头的模型注册表漂移说明）；空串 = 不传 --model。
+		args = append(args, "--model", c.model)
 	}
 	// 统一参数矩阵：`--settings` 只接受一份载荷，故 MaxTokens 的 env 注入与
 	// 四档模型的 sandbox / autoMode / permissions 合并进同一个 JSON。
 	// 注意 codebuddy 的沙箱键集与 claude 略有差异（文档未列 failIfUnavailable），
-	// 由 sandboxSettings 按引擎区分。
-	if payload, ok := agentSettingsPayload(req, "codebuddy"); ok {
+	// 由 sandboxSettings 按引擎区分（codebuddy / codebuddy-ai 同族同语义）。
+	if payload, ok := agentSettingsPayload(req, c.name); ok {
 		args = append(args, "--settings", payload)
 	}
 	return args
 }
 
-// Stream 实现 Streamer：流式调用 codebuddy CLI。
+// stream 流式调用的共享逻辑。
 // 协议与 claude 同源（CodeBuddy Code 系 stream-json）。
-func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+func (c codebuddyCore) stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
 	start := time.Now()
-	bin := e.bin()
+	bin := c.bin()
 	if bin == "" {
-		return StreamResult{}, fmt.Errorf("codebuddy CLI not found; set MAGIC_AGENT_CODEBUDDY_BIN")
+		return StreamResult{}, fmt.Errorf("%s CLI not found; set %s", c.name, c.base.envVar)
 	}
 
-	args := e.buildArgs(req)
+	args := c.buildArgs(req)
 	if req.Append != nil || hasImageAttachment(req.Attachments) {
 		// 附件 / 常驻会话 → stream-json 输入通道：提示词改走 stdin（见 streamjson.go）。
 		prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
@@ -256,26 +385,26 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 			}
 			stdin = strings.NewReader(line)
 		}
-		args = streamJSONArgs(e.buildArgsBase(req), prompt, true)
-		acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
+		args = streamJSONArgs(c.buildArgsBase(req), prompt, true)
+		acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent}
 		var fin streamJSONResult
-		seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, stdin, acc, &fin)
+		seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, stdin, acc, &fin)
 		if err != nil {
 			return StreamResult{}, err
 		}
 		if !seen {
-			return StreamResult{}, fmt.Errorf("codebuddy CLI stream ended without result line")
+			return StreamResult{}, fmt.Errorf("%s CLI stream ended without result line", c.name)
 		}
 		if fin.IsError {
-			return StreamResult{}, fmt.Errorf("codebuddy CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
+			return StreamResult{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
 		}
 		text := stripUserQueryEcho(finalizeStreamText(fin, acc))
 		if strings.TrimSpace(text) == "" {
-			return StreamResult{}, fmt.Errorf("codebuddy CLI 返回内容仅为请求回显（无模型正文）")
+			return StreamResult{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 		}
 		return StreamResult{
 			Response: Response{
-				Engine:    e.Name(),
+				Engine:    c.name,
 				Text:      text,
 				Model:     fin.Model,
 				SessionID: fin.SessionID,
@@ -293,7 +422,7 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 	}
 	args = append(args, "--include-partial-messages", "--verbose")
 
-	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
+	acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent}
 	var fin struct {
 		Type      string `json:"type"`
 		Subtype   string `json:"subtype"`
@@ -304,7 +433,7 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 	}
 	seenResult := false
 
-	err := runStreamCLIIn(ctx, req.Workspace, bin, args, func(line string) error {
+	err := runStreamCLIEnvIn(ctx, req.Workspace, c.extraEnv, bin, args, func(line string) error {
 		isResult, perr := acc.handleNDJSONLine(line)
 		if perr != nil {
 			return perr
@@ -319,10 +448,10 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 		return StreamResult{}, err
 	}
 	if !seenResult {
-		return StreamResult{}, fmt.Errorf("codebuddy CLI stream ended without result line")
+		return StreamResult{}, fmt.Errorf("%s CLI stream ended without result line", c.name)
 	}
 	if fin.IsError {
-		return StreamResult{}, fmt.Errorf("codebuddy CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
+		return StreamResult{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
 	}
 
 	text := stripUserQueryEcho(fin.Result)
@@ -330,11 +459,11 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 		text = strings.TrimSpace(acc.Text.String())
 	}
 	if strings.TrimSpace(text) == "" {
-		return StreamResult{}, fmt.Errorf("codebuddy CLI 返回内容仅为请求回显（无模型正文）")
+		return StreamResult{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 	}
 	return StreamResult{
 		Response: Response{
-			Engine:    e.Name(),
+			Engine:    c.name,
 			Text:      text,
 			Model:     fin.Model,
 			SessionID: fin.SessionID,
@@ -344,6 +473,265 @@ func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(
 		Tools:    acc.Tools,
 	}, nil
 }
+
+// ── codebuddy：WorkBuddy.app 后端 ─────────────────────────────
+
+// CodeBuddyEngine 通过 WorkBuddy.app 内置的 codebuddy CLI 实现 Engine。
+type CodeBuddyEngine struct {
+	// BinPath 显式指定 CLI 路径（空 = 自动探测）。测试注入用。
+	BinPath string
+}
+
+// Name 实现 Engine。
+func (e *CodeBuddyEngine) Name() string { return "codebuddy" }
+
+// DefaultCodeBuddyTimeout 单次尝试默认超时（codebuddy / codebuddy-ai 共用）。
+const DefaultCodeBuddyTimeout = 5 * time.Minute
+
+// DefaultCodeBuddyModel codebuddy 引擎的默认模型。
+// 未显式 -m 指定时使用 hy3（与 magic-video 的 DefaultCreativeModel 一致）。
+const DefaultCodeBuddyModel = "hy3"
+
+// core 返回共享实现核心。
+// 扩展清单链（extendedModelSources）不启用：codebuddy 的模型清单按 --help
+// （见 listModels 的说明）；积分倍率走 modelCredits（来源见 codebuddyAccConfigPath）。
+func (e *CodeBuddyEngine) core() codebuddyCore {
+	return codebuddyCore{
+		name:           "codebuddy",
+		base:           codebuddyBase,
+		binPath:        e.BinPath,
+		model:          DefaultCodeBuddyModel,
+		accConfigPath:  codebuddyAccConfigPath(),
+		modelCacheDirs: codebuddyModelCacheDirs(),
+	}
+}
+
+// bin 探测 codebuddy CLI 路径。
+func (e *CodeBuddyEngine) bin() string { return e.core().bin() }
+
+// Detect 实现 Engine。
+func (e *CodeBuddyEngine) Detect() (bool, string) { return e.core().detect() }
+
+// ListModels 实现 ModelLister。
+func (e *CodeBuddyEngine) ListModels(ctx context.Context) ([]string, error) {
+	return e.core().listModels(ctx)
+}
+
+// ModelCredits 实现 ModelCreditLister：各模型的积分倍率（规范化数字字符串，
+// 如 "0.34"，源自客户端 "x0.34 credits"）。**只取倍率表，清单不动** ——
+// codebuddy 的模型清单仍按 --help（见 listModels）；倍率来源链与 codebuddy-ai
+// 一致：acc 缓存（~/.workbuddy）→ 远程配置缓存 ∪ product.json。清单里某模型
+// 没有倍率数据时自然查不到（UI 不显示）；完全无数据返回 nil（CLI 端省略字段）。
+func (e *CodeBuddyEngine) ModelCredits(ctx context.Context) map[string]string {
+	bin := e.bin()
+	if bin == "" {
+		return nil
+	}
+	return e.core().modelCredits(bin)
+}
+
+// Complete 实现 Engine：单次调用 codebuddy CLI。
+func (e *CodeBuddyEngine) Complete(ctx context.Context, req Request) (Response, error) {
+	return e.core().complete(ctx, req)
+}
+
+// Stream 实现 Streamer。
+func (e *CodeBuddyEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	return e.core().stream(ctx, req, onEvent)
+}
+
+// buildArgs 构造 codebuddy CLI 参数。
+func (e *CodeBuddyEngine) buildArgs(req Request) []string { return e.core().buildArgs(req) }
+
+// buildArgsBase 构造参数（不含末尾的位置参数 prompt）。
+func (e *CodeBuddyEngine) buildArgsBase(req Request) []string { return e.core().buildArgsBase(req) }
+
+// ── codebuddy-ai：WorkBuddy AI.app 后端 ───────────────────────
+
+// DefaultCodeBuddyAIModel codebuddy-ai 引擎的默认模型。
+//
+// 故意留空：WorkBuddy AI（国际后端）的模型注册表与静态 --help 清单有漂移
+// （--help 里的 kimi-k3-1 / deepseek-v4-pro 实测被后端 400 拒绝），强制指定
+// hy3 有同款风险，故默认不传 --model、交 CLI 自身默认；-m 仍可显式指定。
+const DefaultCodeBuddyAIModel = ""
+
+// CodeBuddyAIEngine 通过 WorkBuddy AI.app 内置的 codebuddy CLI 实现 Engine。
+// 协议 / flag 面与 CodeBuddyEngine 完全一致，仅后端网关与 Bearer 令牌不同。
+type CodeBuddyAIEngine struct {
+	// BinPath 显式指定 CLI 路径（空 = 自动探测）。测试注入用。
+	BinPath string
+}
+
+// Name 实现 Engine。
+func (e *CodeBuddyAIEngine) Name() string { return "codebuddy-ai" }
+
+// core 返回共享实现核心。
+func (e *CodeBuddyAIEngine) core() codebuddyCore {
+	return codebuddyCore{
+		name:                 "codebuddy-ai",
+		base:                 codebuddyAIBase,
+		binPath:              e.BinPath,
+		model:                DefaultCodeBuddyAIModel,
+		extraEnv:             codebuddyAIExtraEnv(),
+		extendedModelSources: true,
+		modelCacheDirs:       codebuddyAIModelCacheDirs(),
+		accConfigPath:        codebuddyAIAccConfigPath(),
+	}
+}
+
+// workbuddyAccConfigPath 返回 WorkBuddy 系桌面客户端的合并产品配置缓存路径
+// （appHome = 客户端数据目录名：".workbuddy-ai" / ".workbuddy"）。
+//
+// 桌面客户端把「product.json ∪ 网关远程配置 ∪ 用户自定义模型」合并后的运行时
+// 配置缓存在 <数据目录>/cache/acc-product-config-v*.json，与 product.json 同构
+// （models[].id + models[].credits）—— 这是客户端模型选择器的真实数据源。
+// 文件名带版本号（当前 v3）：glob 全部版本取 mtime 最新；客户端从未运行过时
+// 文件不存在，返回 ""（调用方回退各自的下一条来源）。
+//
+// 两端同构不同目录：codebuddy-ai → ~/.workbuddy-ai（WorkBuddy AI App）；
+// codebuddy → ~/.workbuddy（WorkBuddy App，实测 2026-09-22 同样有 v3 缓存：
+// 58 个模型 33 条倍率，含 hy3 x0.00 —— codebuddy 倍率的首选来源）。
+func workbuddyAccConfigPath(appHome string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	hits, err := filepath.Glob(filepath.Join(home, appHome, "cache", "acc-product-config-v*.json"))
+	if err != nil || len(hits) == 0 {
+		return ""
+	}
+	best := ""
+	var bestMod time.Time
+	for _, p := range hits {
+		fi, statErr := os.Stat(p)
+		if statErr != nil {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestMod) {
+			best, bestMod = p, fi.ModTime()
+		}
+	}
+	return best
+}
+
+// codebuddyAIAccConfigPath 返回 AI 桌面客户端（~/.workbuddy-ai）的合并产品配置
+// 缓存路径。实测 2026-09-21：27 条 = 23 预制 + 4 custom-local，含
+// deepseek-v4.1-flash 与 gpt-5.6-sol/terra/luna、gpt-6-astra 等静态 product.json
+// 里还没有的新模型；endpoint=www.workbuddy.ai、daemon 持续刷新。
+func codebuddyAIAccConfigPath() string {
+	return workbuddyAccConfigPath(".workbuddy-ai")
+}
+
+// codebuddyAccConfigPath 返回 WorkBuddy 桌面客户端（非 AI，~/.workbuddy）的
+// 合并产品配置缓存路径 —— codebuddy 引擎积分倍率的首选来源。
+func codebuddyAccConfigPath() string {
+	return workbuddyAccConfigPath(".workbuddy")
+}
+
+// codebuddyAIModelCacheDirs 返回 codebuddy-ai 模型清单的远程配置缓存目录（按优先级）。
+//
+// 隔离目录优先；共享 ~/.codebuddy 兜底 —— 桌面 App daemon 仍在共享目录运行，
+// 会把网关下发的远程配置持续刷在那里（实测 2026-09-21：隔离 CLI 自身拉
+// /v3/config 全部 400，deepseek-v4.1-flash 所在的远程配置缓存只存在于共享目录）。
+// 只读缓存文件，不触碰凭据。用户显式设置 CODEBUDDY_CONFIG_DIR 时只信该目录。
+func codebuddyAIModelCacheDirs() []string {
+	dirs := []string{filepath.Join(codebuddyAIDir(), "local_storage")}
+	if os.Getenv("CODEBUDDY_CONFIG_DIR") != "" {
+		return dirs
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	shared := filepath.Join(home, ".codebuddy", "local_storage")
+	if shared != dirs[0] {
+		dirs = append(dirs, shared)
+	}
+	return dirs
+}
+
+// codebuddyModelCacheDirs 返回 codebuddy（非 ai）倍率兜底的远程配置缓存目录。
+// 引擎自身不注入 CODEBUDDY_CONFIG_DIR；用户显式设置时只信该目录（与 CLI 的
+// 实际读取一致），否则共享 ~/.codebuddy（桌面 daemon 持续把网关下发的远程
+// 配置刷在那里，实测 2026-09-21）。只读缓存文件，不触碰凭据。
+func codebuddyModelCacheDirs() []string {
+	if dir := os.Getenv("CODEBUDDY_CONFIG_DIR"); dir != "" {
+		return []string{filepath.Join(dir, "local_storage")}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	return []string{filepath.Join(home, ".codebuddy", "local_storage")}
+}
+
+// codebuddyAIDir codebuddy-ai 引擎的专用配置目录（~/.codebuddy-ai）。
+//
+// 为什么不共用 ~/.codebuddy（2026-09-21 实测根因）：两个桌面 App（WorkBuddy /
+// WorkBuddy AI）的 daemon 与两个 CLI 共享同一份凭据库，且各自会切换「活动账号」
+// —— 谁后写谁生效。CLI 登录写入的会话会被 WorkBuddy AI 桌面 daemon 顶掉
+// （实测顶成另一账号，其 refresh token 401），造成引擎间歇性 401 / 空输出。
+// 独立目录让 codebuddy-ai 的登录态只归本引擎，与桌面 App 彻底隔离。
+//
+// 后端网关不受影响：endpoint 定义在 CLI 安装目录的 product.json（随 App 分发），
+// 与配置目录无关（实测 product.json line 11）。
+func codebuddyAIDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".codebuddy-ai")
+}
+
+// codebuddyAIExtraEnv 返回 codebuddy-ai 子进程的隔离环境变量。
+// 用户已显式设置 CODEBUDDY_CONFIG_DIR 时尊重之（不覆盖）。
+func codebuddyAIExtraEnv() []string {
+	if os.Getenv("CODEBUDDY_CONFIG_DIR") != "" {
+		return nil
+	}
+	return []string{"CODEBUDDY_CONFIG_DIR=" + codebuddyAIDir()}
+}
+
+// bin 探测 codebuddy-ai CLI 路径。
+func (e *CodeBuddyAIEngine) bin() string { return e.core().bin() }
+
+// Detect 实现 Engine。
+func (e *CodeBuddyAIEngine) Detect() (bool, string) { return e.core().detect() }
+
+// ListModels 实现 ModelLister。
+func (e *CodeBuddyAIEngine) ListModels(ctx context.Context) ([]string, error) {
+	return e.core().listModels(ctx)
+}
+
+// ModelCredits 实现 ModelCreditLister：各模型的积分倍率（规范化数字字符串，
+// 如 "0.34"，源自客户端 "x0.34 credits"）。与 ListModels 同源同链
+// （core().modelCredits，即 extendedModelCatalog 的倍率半边）；客户端不给倍率
+// 的模型（custom-local）不在返回值里；引擎不可用 / 无倍率数据时返回 nil。
+func (e *CodeBuddyAIEngine) ModelCredits(ctx context.Context) map[string]string {
+	bin := e.bin()
+	if bin == "" {
+		return nil
+	}
+	return e.core().modelCredits(bin)
+}
+
+// Complete 实现 Engine：单次调用 codebuddy-ai CLI。
+func (e *CodeBuddyAIEngine) Complete(ctx context.Context, req Request) (Response, error) {
+	return e.core().complete(ctx, req)
+}
+
+// Stream 实现 Streamer。
+func (e *CodeBuddyAIEngine) Stream(ctx context.Context, req Request, onEvent func(StreamEvent)) (StreamResult, error) {
+	return e.core().stream(ctx, req, onEvent)
+}
+
+// buildArgs 构造 codebuddy-ai CLI 参数。
+func (e *CodeBuddyAIEngine) buildArgs(req Request) []string { return e.core().buildArgs(req) }
+
+// buildArgsBase 构造参数（不含末尾的位置参数 prompt）。
+func (e *CodeBuddyAIEngine) buildArgsBase(req Request) []string { return e.core().buildArgsBase(req) }
+
+// ── 输出解析（两个后端共用）──────────────────────────────────
 
 // stripUserQueryEcho 剥离 <user_query>…</user_query> 请求回显。
 func stripUserQueryEcho(s string) string {

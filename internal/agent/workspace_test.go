@@ -19,13 +19,15 @@ import (
 
 func TestWorkspaceSupportOfMapping(t *testing.T) {
 	cases := map[string]string{
-		"codex":     "flag:-C",
-		"claude":    "cwd",
-		"codebuddy": "cwd",
-		"trae":      "cwd",
-		"openclaw":  "none", // 实测子进程 cwd 被忽略（workspace 与 agent 绑定）
-		"llm":       "none",
-		"arkclaw":   "none",
+		"codex":        "flag:-C",
+		"claude":       "cwd",
+		"codebuddy":    "cwd",
+		"codebuddy-ai": "cwd",
+		"trae":         "cwd",
+		"dsh":          "cwd",  // 官方语义：调用时所在目录即默认 workspace 根
+		"openclaw":     "none", // 实测子进程 cwd 被忽略（workspace 与 agent 绑定）
+		"llm":          "none",
+		"arkclaw":      "none",
 	}
 	for engine, want := range cases {
 		if got := WorkspaceSupportOf(engine); got != want {

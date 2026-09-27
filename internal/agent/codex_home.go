@@ -151,7 +151,7 @@ func copyPreservingMtime(src, dst string) error {
 
 // relativeFileRefs 提取 config.toml 中「数据文件名」形态的字符串值。
 // 规则：basic string 值不含 '/' 与 '\\'（非路径）、带文件扩展名
-//（过滤 model 名 / token / 枚举值等纯 token）、非空；auth.json 永不
+// （过滤 model 名 / token / 枚举值等纯 token）、非空；auth.json 永不
 // 同步（cloud config 触发点，隔离的意义所在）。引用了但源不存在的文件
 // 由 syncCodexHome 阶段自然跳过。
 var tomlStringValRe = regexp.MustCompile(`"([^"\n\\]+)"`)

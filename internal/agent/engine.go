@@ -1,8 +1,9 @@
 // Package agent - 引擎无关的 agent CLI 代理抽象层。
 //
 // magic-agent 是一个专业的 agent CLI 代理工具：把 claude / codebuddy /
-// trae / llm / codex / openclaw 六家 CLI 的非交互调用统一成一个 Engine 接口，
-// 对外提供一致的请求/响应结构、超时与重试语义、固定的 text / json 输出格式。
+// trae / llm / codex / openclaw / dsh 七家 CLI 与 arkclaw 网关的非交互调用
+// 统一成一个 Engine 接口，对外提供一致的请求/响应结构、超时与重试语义、
+// 固定的 text / json 输出格式。
 //
 // 各关注点分文件维护：
 //
@@ -15,12 +16,20 @@
 //	llmengine.go   — simonw/LLM CLI 引擎（-m / -s / -o 透传）
 //	codex.go       — Codex CLI 引擎（exec / exec resume + --output-schema）
 //	openclaw.go    — OpenClaw CLI 引擎（agent --local --json）
+//	dsh.go         — DeepSeek Harness 引擎（--profile headless "<任务>"，纯文本 stdout）
+//	arkclaw.go     — ArkClaw A2A 网关引擎（HTTP JSON-RPC message/send）
+//	arkclaw_stream.go — ArkClaw 流式通道（A2A message/stream 的 SSE 事件流）
+//	codebuddy_gateway.go — CodeBuddy Code HTTP 网关引擎（webhook 投递 + SSE 收流）
+//	codebuddy_gateway_stream.go — 上面那个的 SSE 通道（逐字增量）
 //	runner.go      — 超时 + 重试编排（可重试错误分类、指数退避）
 package agent
 
 import (
 	"context"
+	"strings"
 	"time"
+
+	"github.com/darren/magic-agent/internal/config"
 )
 
 // Message 是一轮对话消息。
@@ -171,10 +180,12 @@ type Request struct {
 	// 引擎先发提示词，之后每从通道收到一条文本就再追加一轮 user 消息（同一进程、同一会话），
 	// 通道关闭 → stdin EOF → 引擎收尾退出。
 	//
-	// 只有 claude / codebuddy 支持（走 stream-json 输入：`--input-format stream-json` 的
+	// claude / codebuddy / codebuddy-ai 走 stream-json 输入（`--input-format stream-json` 的
 	// stdin 可以持续喂 user 消息，官方文档明确「allows providing guidance to the model
-	// while it [is working]」，本项目 2026-09-18 实测同一进程内两轮均被处理）。
+	// while it [is working]」，本项目 2026-09-18 实测同一进程内两轮均被处理）；
+	// dsh 走 SDK 通道（同一进程内对同一 sessionId 继续 session/prompt，官方推荐的续接方式）。
 	// 其它引擎拿到非 nil 会在 CLI 层被挡下（见 AppendSupportOf）。
+	// 默认值是否开启按引擎区分，见 AppendDefaultOn（dsh 默认关）。
 	Append <-chan string
 
 	// Timeout 单次尝试的超时（含引擎 CLI 自身执行时间）。
@@ -253,10 +264,21 @@ type Engine interface {
 	Complete(ctx context.Context, req Request) (Response, error)
 }
 
-// registry 内置引擎注册表（顺序即 `--engines` 列表展示顺序）。
+/* registry 引擎注册表（顺序即 `--engines` / `--contract` 的列表展示顺序）。
+ *
+ * ⚠️ 已知脆弱点（2026-09-27 记录，**行为未改**）：内置引擎的注册挂在
+ * 「registry 为空才 initEngines」这个守卫上。任何在 Engines() 之前调 Register 的代码
+ * 都会让 registry 非空，于是**内置引擎一个都不注册、且没有任何报错** —— 现象是
+ * 「claude 的能力全是空的」「--engines 少了十个引擎」这类极难定位的问题。
+ * 生产路径不会触发（Register 只被 initEngines 与 registerConfiguredAgents 调用），
+ * 但用例里的探针引擎会触发，使**按名筛选**的测试结果随运行方式而变化
+ * （arkclaw_test.go 的 __capfam_probe__ 曾在跑 `-run 'Capabilit'` 时让内置引擎整体消失）。
+ * 要修就得连同一批「用假引擎遮住同名内置」的用例一起改：试过把内置改为无条件注册
+ *（前置或追加），都会打断 TestEnginesInstallCommandByAvailability 这类用例，故暂不动。
+ * 在那之前：**别在 Engines() 之前调 Register。** */
 var registry []Engine
 
-// Register 注册一个引擎（通常在各引擎文件的 init() 中调用）。
+// Register 注册一个引擎（具名 A2A agent 走这里）。
 func Register(e Engine) {
 	registry = append(registry, e)
 }
@@ -269,6 +291,43 @@ func Engines() []Engine {
 	out := make([]Engine, len(registry))
 	copy(out, registry)
 	return out
+}
+
+/* CapabilityFamily 可选接口：引擎声明「我该走能力表的哪一行」。
+ *
+ * 为什么需要（2026-09-23）：能力表（workspace / attachments / permission / ask / append）
+ * 全是**按引擎名写死的 switch**，而配置里的具名 agent 是**同一协议的新名字**
+ * （MagicAI = 另一个 ArkClawEngine）—— 新名字会落进 default 分支、拿到错的能力。
+ * 实测踩到：MagicAI 被报成 `workspace=cwd` / `attachments=prompt`，
+ * 而它实际是 `none` / `part:file`（后者会让界面白白警告「图贴了但模型看不到」）。
+ * 有了这个接口，具名实例只要声明家族，五张表一起就对。
+ * 未实现该接口的引擎 = 家族名就是自己的 Name()（内置引擎行为一字不变）。 */
+type CapabilityFamily interface {
+	CapabilityFamily() string
+}
+
+// CapabilityFamily 实现 CapabilityFamily：A2A JSON-RPC 网关这一族（含具名 agent）。
+func (e *ArkClawEngine) CapabilityFamily() string { return "arkclaw" }
+
+/* CapabilityFamilyOf 把引擎名解析成「能力家族名」。
+ *
+ * 先按注册表找到那个实例：它实现了 CapabilityFamily 就用它的答案；
+ * 否则（内置引擎 / 未注册的名字）返回原名 —— 于是内置引擎行为完全不变，
+ * 而具名 agent 自动继承其协议那一整行能力。
+ * ⚠️ 会（幂等地）触发注册表初始化：`MagicAI` 这种名字只有建完注册表才认得出来。 */
+func CapabilityFamilyOf(engine string) string {
+	name := strings.TrimSpace(engine)
+	if name == "" {
+		return ""
+	}
+	if e := Lookup(name); e != nil {
+		if cf, ok := e.(CapabilityFamily); ok {
+			if fam := strings.TrimSpace(cf.CapabilityFamily()); fam != "" {
+				return fam
+			}
+		}
+	}
+	return name
 }
 
 // Lookup 按名字查找引擎（大小写不敏感）。未找到返回 nil。
@@ -284,15 +343,75 @@ func Lookup(name string) Engine {
 	return nil
 }
 
-// initEngines 惰性初始化，避免 import 顺序影响注册。
+// initEngines 惰性初始化，避免 import 顺序影响注册（脆弱点见 registry 的注释）。
 func initEngines() {
 	Register(&ClaudeEngine{})
 	Register(&CodeBuddyEngine{})
+	// codebuddy-ai 与 codebuddy 同族 CLI、不同后端（WorkBuddy AI / 国际站），
+	// 必须注册在 codebuddy 之后 —— Lookup 取第一个同名匹配，两者名字不同不冲突。
+	Register(&CodeBuddyAIEngine{})
+	// codebuddy-gateway = CodeBuddy 的**第三种接入方式**：不起本机 CLI，而是把 prompt
+	// 投给已在跑的 CodeBuddy Code HTTP 网关（`codebuddy --serve` / `/gateway`），
+	// 走 webhook 投递 + SSE 收流（见 codebuddy_gateway.go 文件头）。
+	Register(&CodeBuddyGatewayEngine{})
 	Register(&TraeEngine{})
 	Register(&LLMEngine{})
 	Register(&CodexEngine{})
 	Register(&OpenClawEngine{})
+	// dsh = DeepSeek Harness 的 headless profile（一次性任务入口）。
+	Register(&DshEngine{})
 	Register(&ArkClawEngine{})
+	// 配置里 agents 数组的**具名 A2A agent**（放在内置引擎之后，重名会被跳过）。
+	registerConfiguredAgents()
+}
+
+/* registerConfiguredAgents 把配置里 `agents` 数组的每个条目注册成一个独立引擎
+ * （2026-09-23 加，用户：「新增 <url> 名字叫 MagicAI」）。
+ *
+ * 为什么在这里做、而不另起一个「引擎工厂」：注册表本来就是「有哪些引擎」的唯一真相，
+ * 而 agents 只是**同一协议（A2A JSON-RPC）的多个实例** —— 复用 ArkClawEngine、
+ * 只换 DisplayName / URL / Key / ClawID，于是 `--engines` 与 `-e <name>` 自动就能用，
+ * 上层（magic-test 的引擎下拉）**一行都不用改**（它读的就是 --engines）。
+ *
+ * 边界（三条都不致命 —— 宁可少一个引擎，也不要把 CLI 打死）：
+ *   · 读配置失败 / 没有 agents 节 → 什么都不注册（老行为一字不变）；
+ *   · 条目 name 为空 → 跳过（没有名字就没法 `-e` 它）；
+ *   · name 与已注册引擎重名 → 跳过（Lookup 取第一个匹配，注册了也只会被遮住，
+ *     却会在 `--engines` 里多出一条同名行 —— 那是纯粹的误导）。
+ */
+func registerConfiguredAgents() {
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	for _, e := range agentEnginesFrom(cfg.Agents, registry) {
+		Register(e)
+	}
+}
+
+// agentEnginesFrom 把配置里的 agents 条目转成待注册的引擎（纯函数，便于直接测）。
+//
+// 两条过滤规则见 registerConfiguredAgents 的注释：**空名跳过**、**与已有引擎重名跳过**。
+// `existing` 传入而不是直接读包级 registry —— 注册表只在首次 `Engines()` 时建一次，
+// 拿它当输入会让测试依赖「谁先跑」，那是假红/假绿的常见来源。
+func agentEnginesFrom(agents []config.AgentConfig, existing []Engine) []Engine {
+	if len(agents) == 0 {
+		return nil
+	}
+	taken := make(map[string]bool, len(existing)+len(agents))
+	for _, e := range existing {
+		taken[strings.ToLower(e.Name())] = true
+	}
+	var out []Engine
+	for _, a := range agents {
+		name := strings.TrimSpace(a.Name)
+		if name == "" || taken[strings.ToLower(name)] {
+			continue
+		}
+		taken[strings.ToLower(name)] = true
+		out = append(out, &ArkClawEngine{DisplayName: name, URL: a.URL, Key: a.Key, ClawID: a.ClawID})
+	}
+	return out
 }
 
 // toolsOrDefault nil ToolsMode 视为 ToolsOff。

@@ -95,20 +95,32 @@ type keepAlive struct {
 	mu        sync.Mutex
 	last      time.Time
 	idle      time.Duration // 0 = 本轮结束就收工（追加窗口只在任务运行期间）
+	closed    bool          // 收工后为 true：Push 据此拒收（与 close(in) 同锁，避免向已关闭通道发送）
 }
 
-// kaEnabled 常驻会话是否生效：默认开（opts.keepAlive=true），但只在
-// 「流式 + 引擎支持追加」时才有意义 —— 不满足就静默不启用（不影响原有调用形态）。
-// 显式传 `--keep-alive` 却不满足条件的报错在 prepareAsk 里（那里能拿到 cmd 与引擎）。
+// kaEnabled 常驻会话是否生效：只在「流式 + 引擎支持追加」时才有意义 —— 不满足就静默
+// 不启用（不影响原有调用形态）。显式传 `--keep-alive` 却不满足条件的报错在 prepareAsk
+// 里（那里能拿到 cmd 与引擎）。
+//
+// 默认值语义**按引擎区分**（agent.AppendDefaultOn）：claude/codebuddy 默认常驻
+// （用户 2026-09-18 的要求）；dsh 默认关、要显式 `--keep-alive` —— 它的 SDK 通道本来
+// 就是一次一轮的形态，默认挂 5 分钟空闲窗口会让既有调用方以为命令卡住了。
 func kaEnabled(cmd *cobra.Command, opts *askOptions, engine string) bool {
-	return opts.keepAlive && opts.stream && agent.AppendSupportOf(engine)
+	if !opts.stream || !agent.AppendSupportOf(engine) {
+		return false
+	}
+	if flagChanged(cmd, "keep-alive") {
+		return opts.keepAlive // 显式开关优先于引擎默认值
+	}
+	return agent.AppendDefaultOn(engine)
 }
 
 // startKeepAlive 启动常驻会话：校验能力 → 开追加入口（写进会话记录）→ 起转发与看门狗。
 func startKeepAlive(cmd *cobra.Command, opts *askOptions, engine string, h *session.Handle) (*keepAlive, error) {
 	if !agent.AppendSupportOf(engine) {
 		return nil, &usageError{fmt.Errorf(
-			"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy：它们能持续从 stdin 收 user 消息）", engine)}
+			"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy、codebuddy-ai：靠 stream-json 输入持续收 user 消息；"+
+				"dsh：靠 SDK 通道对同一会话继续 prompt）", engine)}
 	}
 	if h == nil {
 		return nil, &usageError{fmt.Errorf("--keep-alive 需要会话登记表可用（检查目录：%s）", session.Dir())}
@@ -191,8 +203,39 @@ func (k *keepAlive) activity() time.Time {
 }
 
 // shutdown 收工：关闭输入通道（幂等）→ 引擎 stdin 随之 EOF。
+//
+// ⚠️ closed 与 close(k.in) 必须在**同一把锁**里完成：Push 持锁发送，
+// 否则「Push 判定未关闭 → shutdown 关通道 → Push 发送」会 panic（向已关闭通道发送）。
 func (k *keepAlive) shutdown() {
-	k.closeOnce.Do(func() { close(k.in) })
+	k.closeOnce.Do(func() {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		k.closed = true
+		close(k.in)
+	})
+}
+
+// Push 把一条 user 消息推进常驻会话（与 --append 走同一条入口）。
+//
+// 用途：`--control` 的 answer 命令 —— 审批 / 提问的答案只能作为**下一轮 user 消息**
+// 喂给模型（headless 下原地作答拿不到答案，见 agent.KindAsk）。
+// 返回 false = 常驻已收工或缓冲区已满；调用方据此回一条 control_error，不静默丢。
+func (k *keepAlive) Push(msg string) bool {
+	if k == nil || strings.TrimSpace(msg) == "" {
+		return false
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.closed {
+		return false
+	}
+	select {
+	case k.in <- msg:
+		k.last = time.Now() // 与 touch() 同义；这里已持锁，不能再调 touch()
+		return true
+	default:
+		return false
+	}
 }
 
 // Close 关掉追加入口（幂等）。

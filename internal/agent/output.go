@@ -133,6 +133,12 @@ func reasonOf(err error) string {
 	return err.Error()
 }
 
+// ReasonOf 把 reasonOf 暴露给包外（流式失败事件要用同一个根因文案 ——
+// 见 internal/cli 的 writeStreamErrorJSON）。**只此一个入口**，别在包外另写一份
+// 「取最内层错误」的逻辑：两处算法一旦漂移，同一次失败在 envelope 与事件流里
+// 会写出两句不同的原因。
+func ReasonOf(err error) string { return reasonOf(err) }
+
 // WriteOutput 按格式把成功结果写到 w。
 func WriteOutput(w io.Writer, format OutputFormat, resp Response) error {
 	if format == FormatJSON {

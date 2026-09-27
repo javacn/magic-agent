@@ -69,7 +69,7 @@ func TestFlattenPrompt(t *testing.T) {
 // ── 注册表 ────────────────────────────────────────────────────
 
 func TestLookup(t *testing.T) {
-	for _, name := range []string{"claude", "codebuddy", "trae"} {
+	for _, name := range []string{"claude", "codebuddy", "codebuddy-ai", "trae"} {
 		e := Lookup(name)
 		if e == nil {
 			t.Fatalf("Lookup(%q) = nil", name)

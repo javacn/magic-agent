@@ -57,7 +57,10 @@ type askOptions struct {
 	output       string
 	verbose      bool
 	engines      bool
+	contract     bool // 输出带版本的契约 envelope（--contract；客户端启动校验用）
 	noModels     bool
+	events       bool // --stream 的事件流带契约版本与行号（--events；客户端消费用）
+	control      bool // 从 stdin 读 NDJSON 控制命令（--control；打断 / 收工 / 回审批）
 	jsonOut      bool
 	stream       bool
 	noThinking   bool
@@ -102,33 +105,36 @@ func newAskOptions() *askOptions {
 // bindAskFlags 把全部 flags 注册为根命令的 persistent flags。
 func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
-	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | claude | trae | llm | codex | openclaw | arkclaw（默认 codebuddy）")
-	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；llm 引擎传 llm CLI 注册名，如 minimax-m3）")
+	f.StringVarP(&opts.engine, "engine", "e", "codebuddy", "引擎: codebuddy | codebuddy-ai | claude | trae | llm | codex | openclaw | dsh | arkclaw（默认 codebuddy）")
+	f.StringVarP(&opts.model, "model", "m", "", "模型（空 = 引擎默认：codebuddy=hy3；codebuddy-ai=CLI 自选默认；llm 引擎传 llm CLI 注册名，如 minimax-m3；dsh/arkclaw 不透传）")
 	f.StringVarP(&opts.system, "system", "s", "", "系统提示词（空 = 用配置文件 ~/.config/magic-agent/config.json 的 systemPrompt；两者都为空则不注入）。值若是文件路径或 @文件 → 读该文件内容")
 	f.StringVarP(&opts.prompt, "prompt", "p", "", "提示词（值若是文件路径或 @文件 → 读该文件内容作为提示词）")
-	f.StringVarP(&opts.workspace, "workspace", "w", "", "工作目录（workspace）：在该目录里执行引擎；codex 走原生 -C，claude/codebuddy/trae 用子进程 cwd，llm/arkclaw/openclaw 不支持（忽略并提示）")
+	f.StringVarP(&opts.workspace, "workspace", "w", "", "工作目录（workspace）：在该目录里执行引擎；codex 走原生 -C，claude/codebuddy/trae/dsh 用子进程 cwd，llm/arkclaw/openclaw 不支持（忽略并提示）")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
 	f.StringArrayVarP(&opts.attach, "attach", "a", nil, "附件路径（截图/图片等），可重复或逗号分隔；与提示词一起发给引擎（各引擎落地方式见 --engines 的 attachments 字段）")
 	f.StringVar(&opts.tools, "tools", "off", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)")
-	f.StringVar(&opts.session, "session", "", "会话续接 id（空=新会话；传入上次输出里的 session_id 继续同一会话；arkclaw 传 contextId）")
+	f.StringVar(&opts.session, "session", "", "会话续接 id（空=新会话；传入上次输出里的 session_id 继续同一会话；arkclaw 传 contextId；dsh 不支持续接）")
 	f.BoolVarP(&opts.continueF, "continue", "c", false, "续接当前目录最近一次会话（不需要 session id；与 --session 同时给时 --session 优先）")
 	f.StringVar(&opts.stop, "stop", "", "停止指定会话/运行：传 session_id 或 run_id（--sessions 可见），杀掉它的引擎进程组")
 	f.BoolVar(&opts.listSessions, "sessions", false, "列出会话登记表（JSON 数组：run_id / session_id / pid / engine / state / 起止时间）")
-	f.BoolVar(&opts.keepAlive, "keep-alive", true, "常驻会话（默认开；仅 claude/codebuddy 的 --stream 调用生效）：首轮结束后不退出、等 --append 追加；--keep-alive=false 关闭")
+	f.BoolVar(&opts.keepAlive, "keep-alive", true, "常驻会话：首轮结束后不退出、等 --append 追加（需 --stream）。claude/codebuddy 默认开；dsh 默认关（显式传 --keep-alive 开启）；其余引擎不支持")
 	f.StringVar(&opts.appendTo, "append", "", "向常驻会话追加一条消息：传 session_id 或 run_id，内容用 -p/位置参数给")
 	f.DurationVar(&opts.idle, "idle", 5*time.Minute, "常驻会话空闲收工时长（默认 5m；0 = 本轮结束就收工，追加窗口只在任务运行期间）")
-	f.IntVar(&opts.maxTokens, "max-tokens", 0, "输出 token 上限（0=不指定；claude/codebuddy 经 --settings 注入，llm 透传，trae 忽略）")
+	f.IntVar(&opts.maxTokens, "max-tokens", 0, "输出 token 上限（0=不指定；claude/codebuddy 经 --settings 注入，llm 透传，trae/dsh 忽略）")
 	f.Float64Var(&opts.temperature, "temperature", -1, "采样温度（-1=不指定；仅 llm 引擎透传，其余引擎忽略）")
-	f.StringVar(&opts.jsonSchema, "json-schema", "", "JSON Schema 内联字符串（仅 llm / arkclaw 引擎；启用结构化输出与 JSON 后处理）")
+	f.StringVar(&opts.jsonSchema, "json-schema", "", "JSON Schema 内联字符串（llm / openclaw / dsh / arkclaw 引擎；启用结构化输出与 JSON 后处理）")
 	f.DurationVarP(&opts.timeout, "timeout", "t", 600*time.Second, "单次尝试超时（默认 600s=10m）")
 	f.IntVarP(&opts.retries, "retries", "r", 0, "失败重试次数（默认 0）")
 	f.DurationVar(&opts.backoff, "backoff", 2*time.Second, "首次重试退避间隔（指数翻倍，上限 30s）")
 	f.StringVarP(&opts.output, "output", "o", "json", "输出格式: json | text")
 	f.BoolVarP(&opts.verbose, "verbose", "v", false, "重试过程打印到 stderr")
-	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎、本机 CLI 可用性与各引擎当前支持的模型（JSON 数组；每行含 models / workspace / streaming 能力字段）")
-	f.BoolVar(&opts.noModels, "no-models", false, "配合 --engines：跳过各引擎的模型探测（只列引擎与可用性，不启动 CLI）")
+	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎、本机 CLI 可用性与各引擎当前支持的模型（JSON 数组；每行含 capabilities / models / workspace / streaming 能力字段；不可用的引擎带 install 一键安装命令）")
+	f.BoolVar(&opts.contract, "contract", false, "输出桌面/移动客户端契约：{\"contractVersion\":N,\"engines\":[...]}（engines 与 --engines 同构，另含 capabilities 静态能力字段）。默认不探测模型（快）；要模型写 --no-models=false")
+	f.BoolVar(&opts.noModels, "no-models", false, "配合 --engines / --contract：跳过各引擎的模型探测（只列引擎与可用性，不启动 CLI）")
 	f.BoolVar(&opts.jsonOut, "json", false, "兼容保留：--engines 已默认 JSON，本 flag 不再需要")
 	f.BoolVar(&opts.stream, "stream", false, "流式输出：正文/思考增量实时打到 stdout（text 模式思考走 stderr）")
+	f.BoolVar(&opts.events, "events", false, "配合 --stream：事件流带契约版本与行号（每行加 v / seq，并先发一行 ready），供客户端消费；老消费者不要开（形状与 --stream 不同）")
+	f.BoolVar(&opts.control, "control", false, "配合 --stream：从 stdin 读 NDJSON 控制命令（ping / interrupt / stop / answer），让调用方能打断长任务、回审批")
 	f.BoolVar(&opts.noThinking, "no-thinking", false, "流式模式下不转发思考过程增量")
 	bindPermissionFlags(cmd, opts)
 }
@@ -142,7 +148,7 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 func bindPermissionFlags(cmd *cobra.Command, opts *askOptions) {
 	f := cmd.PersistentFlags()
 	f.StringVar(&opts.permission, "permission", string(agent.DefaultPermissionTier),
-		"权限档位: manual | accept-edits | auto | full（默认 full=保持既有行为；仅 claude/codebuddy 生效）\n"+
+		"权限档位: manual | accept-edits | auto | full（默认 full=保持既有行为；仅 claude/codebuddy/codebuddy-ai 生效）\n"+
 			"  manual        沙箱开启，只读放行，其余逐项由用户确认\n"+
 			"  accept-edits  沙箱开启，编辑放行，命令仍逐条确认\n"+
 			"  auto          沙箱开启，越界由内置 LLM Guardian 判定（推荐）\n"+
@@ -326,12 +332,15 @@ func resolveAttachments(values []string) ([]agent.Attachment, error) {
 // attachmentPromptFallbackWarn 引擎没有附件输入通道（AttachmentSupportOf == "prompt"）时的提示：
 // 附件改成「把路径写进提示词」，需要引擎自己能读文件 —— 因此 --tools off 时必须点明。
 // 抽成函数便于单测，也把「不静默降级」变成可断言的行为。
+//
+// 「请改用 --tools on」这句只对**真的有 --tools 落地通道**的引擎说（ToolsSwitchableOf）：
+// dsh / openclaw 这类自带工具循环的引擎传 --tools 也不改变行为，说了等于误导。
 func attachmentPromptFallbackWarn(engine string, count int, toolsOff bool) string {
 	if count == 0 || agent.AttachmentSupportOf(engine) != "prompt" {
 		return ""
 	}
 	msg := fmt.Sprintf("magic-agent: 警告：%s 引擎没有附件输入通道，%d 个附件已改为「把路径写进提示词」", engine, count)
-	if toolsOff {
+	if toolsOff && agent.ToolsSwitchableOf(engine) {
 		msg += "；当前 --tools off，引擎读不到这些文件，请改用 --tools on"
 	}
 	return msg + "（各引擎能力见 --engines 的 attachments 字段）\n"
@@ -379,7 +388,7 @@ func resolvePermissionTier(engineName, raw string, explicit bool) (agent.Permiss
 	}
 	if explicit && !agent.PermissionSupported(engineName) {
 		return "", &usageError{fmt.Errorf(
-			"--permission 暂不支持 %s 引擎（当前仅 claude、codebuddy；各引擎能力见 --engines 的 permission 字段）",
+			"--permission 暂不支持 %s 引擎（当前仅 claude、codebuddy、codebuddy-ai；各引擎能力见 --engines 的 permission 字段）",
 			engineName)}
 	}
 	return tier, nil
@@ -496,7 +505,17 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		fmt.Fprintln(cmd.ErrOrStderr(), "magic-agent: --stream 不支持自动重试，-r 已忽略")
 	}
 
+	/* 把调用方**显式**给的 -t 透传给引擎（2026-09-24 修）。
+	   以前流式路径从不设 req.Timeout，引擎只能用自己的默认值 —— arkclaw 那个默认是 3 分钟，
+	   于是 `-t 600s` 被静默忽略：网关侧要跑 5 分钟的任务（实测「生成周报」304s 才回）必在
+	   3 分钟被砍，桌面壳上就是「什么都没显示 · 调用失败 context deadline exceeded」。
+	   只在 flagChanged 时透传：没给 -t 就别去覆盖引擎自己的默认（如 llm 的条目级 timeout）。 */
+	if flagChanged(cmd, "timeout") {
+		req.Timeout = opts.timeout
+	}
+
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	sink := newEventSink(stdout, engine.Name(), opts.events)
 	var onEvent func(agent.StreamEvent)
 	if format == agent.FormatJSON {
 		onEvent = func(ev agent.StreamEvent) {
@@ -504,7 +523,7 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 			if ev.Kind == agent.KindThinking && opts.noThinking {
 				return
 			}
-			_ = writeStreamEventJSON(stdout, ev)
+			_ = sink.stream(ev)
 		}
 	} else {
 		onEvent = func(ev agent.StreamEvent) {
@@ -537,6 +556,13 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 	// 超时：常驻会话的存活由 --idle（空闲收工）决定，所以常驻生效时只有调用方**显式**给 -t
 	// 才套总超时；否则不设上限（长任务 + 追加不受 600s 默认值限制）。
 	ctx := cmd.Context()
+	/* --control 要能主动打断：在（可能的）超时之上再套一层可取消的 ctx。
+	   打断与超时走同一条路径 —— 引擎进程组由 Stream 侧按 ctx 收拾。 */
+	var cancelAll context.CancelFunc
+	if opts.control {
+		ctx, cancelAll = context.WithCancel(ctx)
+		defer cancelAll()
+	}
 	if !kaEnabled(cmd, opts, engine.Name()) || flagChanged(cmd, "timeout") {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, opts.timeout)
@@ -549,8 +575,10 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 
 	// 常驻会话（默认开，claude/codebuddy 的流式调用）：开追加入口等 --append，
 	// 空闲 --idle 后优雅收工（关闭通道 → 引擎 stdin EOF → 正常收尾）。
+	var ka *keepAlive
 	if kaEnabled(cmd, opts, engine.Name()) {
-		ka, kerr := startKeepAlive(cmd, opts, engine.Name(), h)
+		var kerr error
+		ka, kerr = startKeepAlive(cmd, opts, engine.Name(), h)
 		if kerr != nil {
 			finishSession(h, "", session.StateFailed)
 			return kerr
@@ -560,10 +588,51 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		onEvent = ka.wrapOnEvent(onEvent)
 	}
 
+	/* 控制通道：给调用方一条回传通道（打断 / 收工 / 回审批）。
+	   起在常驻会话之后 —— answer 依赖 ka。 */
+	var ctl *controlSession
+	if opts.control {
+		ctl = startControlReader(cmd.InOrStdin(), sink, controlHooks{
+			interrupt: func(reason string) { cancelAll() },
+			stop: func() {
+				if ka != nil {
+					ka.Close() // 关追加入口 → 引擎 stdin EOF → 本轮优雅收尾
+					return
+				}
+				cancelAll()
+			},
+			answer: func(text string) bool { return ka != nil && ka.Push(text) },
+		})
+		defer ctl.Close()
+	}
+
+	// ready 握手（仅 --events）：客户端据此确认「谁在跑、契约版本是多少」。
+	_ = sink.ready(req.Model)
+
 	res, err := streamer.Stream(ctx, req, onEvent)
+	if ctl != nil && ctl.WasInterrupted() {
+		/* 打断的应答放在这里、而不是命令到达的那一刻：interrupt 的真实含义是
+		   「这一轮真的结束了」。失败链本身就是 context canceled，不必再包一层。 */
+		_ = sink.notice("interrupted", map[string]any{"reason": "control"})
+	}
 	if err != nil {
 		finishSession(h, "", session.StateFailed)
-		if format == agent.FormatText {
+		/* ⚠️ 失败必须留下**调用方读得到**的说明（2026-09-22 修）。
+		   以前这里 json 模式一个字都不写：stdout 空、stderr 只剩前面那些提示行
+		   （如 openclaw 的「指定了模型，本轮改走非流式」）—— 调用方（桌面壳）看到的就是
+		   「退出码 1 + 一行事件都没有」，界面上画成「空白 + 已完成」，看起来像
+		   「引擎没对接好 / 不显示」（用户 2026-09-22 报障）。
+		   两处都写，各有分工（与 output.go 的契约、runAsk 的做法对齐）：
+		     · stdout 一条 `{"type":"error",...}` 事件 —— 流式消费者不必回头解析 stderr，
+		       事件流自己就是完整的（每轮以 result 或 error 收尾，不会两样都没有）；
+		     · stderr 一份 WriteError —— json = 带 reason 根因的 envelope，text = 一行；
+		       老调用方（只读 stderr / 只读 envelope）照旧能拿到原因。
+		   ⚠️ 别把这条只写进 stderr：桌面壳的**换模型重试**判据吃的是事件流与 stderr 两处，
+		     但只认事件的消费方（第三方 jq 管道）会因此永远看不到失败。 */
+		if format == agent.FormatJSON {
+			_ = sink.event(streamErrorPayload(engine.Name(), err))
+			_ = agent.WriteError(stderr, format, engine.Name(), 1, err)
+		} else {
 			fmt.Fprintf(stderr, "\nmagic-agent: %v\n", err)
 		}
 		return &reportedError{err}
@@ -596,11 +665,9 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		if opts.noThinking {
 			out.Thinking = ""
 		}
-		data, jerr := json.Marshal(out)
-		if jerr != nil {
-			return jerr
+		if err := sink.event(out); err != nil {
+			return err
 		}
-		fmt.Fprintln(stdout, string(data))
 	} else {
 		// text 模式：正文已实时打完，补尾换行即可。
 		fmt.Fprintln(stdout)
@@ -617,23 +684,51 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 //	{"type":"tool_use","text":"<args JSON>","name":"Bash","id":"toolu_xxx"}
 //	{"type":"tool_result","text":"<output>","name":"","id":"toolu_xxx"}
 //	{"type":"turn_end","text":"<该轮正文>","session_id":"..."}   一轮结束（常驻会话）
+//	{"type":"error","error":"<完整错误链>","reason":"<根因>","engine":"..."}  本轮失败（收尾）
 //
 // 工具事件多带 name / id 字段；turn_end 带 session_id（调用方据此绑定会话锚点）；
 // thinking / text 事件的 name / id / session_id 省略（取零值）。
+//
+// ⚠️ **每轮一定以 result 或 error 收尾**（2026-09-22 起）：失败那条由 writeStreamErrorJSON
+// 发出（见 runStreamAsk 的失败分支）。以前失败什么都不发，消费方只能靠退出码猜 ——
+// 「一行事件都没有」被读成「引擎没输出」，界面上就是空白。
 func writeStreamEventJSON(w io.Writer, ev agent.StreamEvent) error {
-	data, err := json.Marshal(struct {
-		Type      string            `json:"type"`
-		Text      string            `json:"text"`
-		Name      string            `json:"name,omitempty"`
-		ID        string            `json:"id,omitempty"`
-		SessionID string            `json:"session_id,omitempty"`
-		Ask       *agent.AskRequest `json:"ask,omitempty"`
-	}{Type: string(ev.Kind), Text: ev.Text, Name: ev.Name, ID: ev.ID, SessionID: ev.SessionID, Ask: ev.Ask})
+	data, err := json.Marshal(streamEventPayload(ev))
 	if err != nil {
 		return err
 	}
 	_, err = fmt.Fprintln(w, string(data))
 	return err
+}
+
+/* writeStreamErrorJSON 输出一行「本轮失败」事件（流式形态的失败收尾）。
+ *
+ *	schema: {"type":"error","engine":"openclaw","attempts":1,
+ *	         "error":"<完整错误链>","reason":"<最内层根因>"}
+ *
+ * 字段与 `-o json` 的失败 envelope（agent.WriteError）**逐字同源**（都走 agent.ReasonOf），
+ * 只是多一个 `type` 便于与事件流混排 —— 同一次失败在事件流与 stderr 里写出的原因必然一致。
+ * 为什么要它：流式调用方按行读 stdout，**失败不发声**就等于这一轮凭空消失（见 runStreamAsk）。 */
+func writeStreamErrorJSON(w io.Writer, engine string, err error) error {
+	data, jerr := json.Marshal(streamErrorPayload(engine, err))
+	if jerr != nil {
+		return jerr
+	}
+	_, werr := fmt.Fprintln(w, string(data))
+	return werr
+}
+
+// streamErrorPayload 「本轮失败」事件的 wire 形状。
+// 与 `-o json` 的失败 envelope（agent.WriteError）**逐字同源**（都走 agent.ReasonOf），
+// 只是多一个 `type` 便于与事件流混排 —— 同一次失败在事件流与 stderr 里写出的原因必然一致。
+func streamErrorPayload(engine string, err error) any {
+	return struct {
+		Type     string `json:"type"`
+		Engine   string `json:"engine"`
+		Attempts int    `json:"attempts"`
+		Error    string `json:"error"`
+		Reason   string `json:"reason"`
+	}{Type: "error", Engine: engine, Attempts: 1, Error: err.Error(), Reason: agent.ReasonOf(err)}
 }
 
 // prepareAsk 校验参数并组装 Request（流式 / 非流式共用）。
@@ -674,8 +769,9 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 		fmt.Fprintf(cmd.ErrOrStderr(),
 			"magic-agent: 提示：当前 --tools off（不调用任何工具），--permission %s 不会生效；如需工具请加 --tools on\n", tier)
 	}
-	// 常驻会话默认开（claude/codebuddy 的流式调用），但只在「流式 + 引擎支持追加」时才有意义。
-	// 显式 `--keep-alive` 却没满足条件 → 明确报错；默认值不满足条件 → 静默忽略（不影响原有调用）。
+	// 常驻会话默认值按引擎区分（见 kaEnabled / agent.AppendDefaultOn），但只在
+	// 「流式 + 引擎支持追加」时才有意义。显式 `--keep-alive` 却没满足条件 → 明确报错；
+	// 默认值不满足条件 → 静默忽略（不影响原有调用）。
 	if flagChanged(cmd, "keep-alive") && opts.keepAlive {
 		if !opts.stream {
 			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
@@ -683,7 +779,8 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 		}
 		if !agent.AppendSupportOf(engine.Name()) {
 			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
-				"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy：它们能持续从 stdin 收 user 消息）", engine.Name())}
+				"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy、codebuddy-ai：靠 stream-json 输入持续收 user 消息；"+
+					"dsh：靠 SDK 通道对同一会话继续 prompt）", engine.Name())}
 		}
 	}
 	if opts.idle < 0 {
@@ -734,9 +831,21 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 		}
 		expandedArgs = append(expandedArgs, text)
 	}
-	promptParts, err := collectPrompt(cmd.InOrStdin(), expandedArgs, opts.file)
+	/* ⚠️ --control 时 stdin 归控制通道，**不能**再让 collectPrompt 去读它：
+	   它会把控制命令当成提示词读走（真机实测：`-p "..." --control` 下 ping / stop
+	   全被吞掉，控制通道形同虚设，而 stdout 上一条异常都没有 —— 极难定位）。
+	   传 nil 让 collectPrompt 跳过 stdin 兜底；提示词必须由 -p / 位置参数 / --file 给。 */
+	promptStdin := cmd.InOrStdin()
+	if opts.control {
+		promptStdin = nil
+	}
+	promptParts, err := collectPrompt(promptStdin, expandedArgs, opts.file)
 	if err != nil {
 		return nil, "", agent.Request{}, &usageError{err}
+	}
+	if opts.control && opts.file == "" && len(promptParts) == 0 && strings.TrimSpace(opts.prompt) == "" {
+		return nil, "", agent.Request{}, &usageError{fmt.Errorf(
+			"--control 占用了 stdin（控制命令走它），所以提示词不能从 stdin 取：请用 -p \"...\" 或位置参数给出")}
 	}
 	if p := strings.TrimSpace(opts.prompt); p != "" {
 		text, e := expandArg("-p/--prompt", p)

@@ -60,10 +60,9 @@ package agent
 //   - SessionID：写入 message.contextId（续接；实测放外层 params.contextId 无效）
 //   - Continue：A2A 无「查询最近上下文」接口 → 显式拒绝（不放外层那种「静默开新会话」的坑）
 //
-// 不实现 Stream：A2A 的流式语义是独立的 message/stream 方法（SSE 事件流），
-// 与本项目现有 Streamer 契约（逐行 NDJSON + 进程 stdout 解析）不是一回事；
-// 按需求只接 message/send 单次请求-响应。CLI 层面对 nil Streamer 有明确
-// 报错路径（see cli/ask.go）。
+// 流式（--stream）：走 A2A 官方的 `message/stream`（SSE 事件流），见 arkclaw_stream.go。
+// 本文件只负责非流式的 `message/send` 单次请求-响应。⚠️ 实测该网关的流式**不是逐字增量**
+//（只有「受理帧 + 整段正文」两帧），别把 --stream 当成打字机效果 —— 详见那边的文件头。
 
 import (
 	"bytes"
@@ -81,15 +80,34 @@ import (
 	"github.com/darren/magic-agent/internal/config"
 )
 
-// DefaultArkClawTimeout 单次 HTTP 请求默认超时。
-// 实测网关单轮往返 8s ~ 23s（agent 侧带工具循环时更久），留足余量。
-const DefaultArkClawTimeout = 3 * time.Minute
+// DefaultArkClawTimeout 单次请求默认超时。
+//
+// 2026-09-24 由 3 分钟提到 10 分钟：3 分钟是按「单轮往返 8~23s」定的，但**带工具循环的
+// 任务会跑很久** —— 实测「生成周报」在网关侧要 304s 才回（期间每 15s 一个 working 心跳），
+// 3 分钟必被砍、正文一个字都拿不到。10 分钟与 CLI 的 -t 默认（600s）对齐，也让流式与非流式
+// 两条路的默认一致（非流式走 Runner，拿的就是 -t）。
+const DefaultArkClawTimeout = 10 * time.Minute
 
 // maxArkClawBody 单次响应体读取上限，防止异常响应把内存吃满。
 const maxArkClawBody = 8 << 20 // 8 MiB
 
+// A2A 方法名：非流式 message/send（本文件）/ 流式 message/stream（arkclaw_stream.go）。
+// 两者共用同一套请求构造（arkClawBuildRequest）与响应解析（arkClawParseResponse）。
+const (
+	arkClawMethodSend   = "message/send"
+	arkClawMethodStream = "message/stream"
+)
+
 // ArkClawEngine 通过 A2A JSON-RPC 网关实现 Engine。
 type ArkClawEngine struct {
+	/* DisplayName 自定义引擎名（空 = "arkclaw"）。
+	 *
+	 * 用途：配置里 `agents` 数组的**具名 agent**（见 internal/config::AgentConfig）——
+	 * 每个条目注册成一个独立引擎，`-e MagicAI` 与 `-e arkclaw` 可以并列存在。
+	 * ⚠️ 名字只影响 `Name()` / `--engines` 的展示与 `-e` 的查找，协议行为一字不改
+	 * （仍是 A2A JSON-RPC，仍由 claw_id 绑模型）。 */
+	DisplayName string
+
 	// URL / Key / ClawID 显式覆盖配置文件与环境变量。三者同时给定时以此为准；
 	// 生产路径留空、走配置文件。测试注入用。
 	URL    string
@@ -106,8 +124,29 @@ type ArkClawEngine struct {
 	Timeout time.Duration
 }
 
-// Name 实现 Engine。
-func (e *ArkClawEngine) Name() string { return "arkclaw" }
+// Name 实现 Engine。有 DisplayName 时用它（具名 agent），否则用默认名 "arkclaw"。
+func (e *ArkClawEngine) Name() string {
+	if n := strings.TrimSpace(e.DisplayName); n != "" {
+		return n
+	}
+	return "arkclaw"
+}
+
+// arkClawURLHasCreds 报告端点 URL 的 query 里是否**已经**带了 apikey / clawId。
+//
+// 为什么需要它（2026-09-23）：配置里允许把凭据直接内嵌在 URL 里
+// （`…/a2a/jsonrpc?apikey=…&clawId=…`，见 config.AgentConfig 的两种写法）——
+// 这种形态下 `key` / `claw_id` 字段本就是空的，若还按「三项都要非空」判，
+// 明明配齐了的 agent 会被判成「未配置」。拼接那一步（arkClawEndpointURL）用的是
+// `q.Set`，会保留既有 query，所以「URL 里已带」与「字段里另给」完全等价。
+func arkClawURLHasCreds(endpoint string) (hasKey, hasClawID bool) {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return false, false
+	}
+	q := u.Query()
+	return strings.TrimSpace(q.Get("apikey")) != "", strings.TrimSpace(q.Get("clawId")) != ""
+}
 
 // endpoint 解析生效的 (url, key, clawID)。
 //
@@ -129,38 +168,47 @@ func (e *ArkClawEngine) endpoint() (string, string, string, error) {
 }
 
 // configHint 返回报错时提示的配置文件路径。
+// 具名 agent（DisplayName 非空）额外点明「是 agents 数组里的条目」——
+// 否则用户会去翻 arkclaw 那一节，那儿根本没有它的配置。
 func (e *ArkClawEngine) configHint() string {
-	if p := strings.TrimSpace(e.ConfigPath); p != "" {
-		return p
+	p := strings.TrimSpace(e.ConfigPath)
+	if p == "" {
+		p = config.Path()
 	}
-	if p := config.Path(); p != "" {
-		return p
+	if p == "" {
+		p = "(配置文件路径未知)"
 	}
-	return "(配置文件路径未知)"
+	if strings.TrimSpace(e.DisplayName) != "" {
+		return p + " 的 agents 数组里 name=\"" + e.Name() + "\" 那一条"
+	}
+	return p
 }
 
 // Detect 实现 Engine。
 //
-// HTTP 引擎没有可执行文件，可用性 = 三项凭据齐备。返回的说明信息用端点
+// HTTP 引擎没有可执行文件，可用性 = 端点与凭据齐备。返回的说明信息用端点
 // URL（与 CLI 引擎返回二进制路径同构，供 --engines 展示）。
+// ⚠️ 凭据允许**内嵌在 URL 的 query 里**（`?apikey=…&clawId=…`）—— 那种形态下
+// key/claw_id 字段本来就是空的，不能再按「字段必须非空」判（见 arkClawURLHasCreds）。
 func (e *ArkClawEngine) Detect() (bool, string) {
 	u, k, c, err := e.endpoint()
 	if err != nil {
-		return false, fmt.Sprintf("arkclaw config error: %v", err)
+		return false, fmt.Sprintf("%s config error: %v", e.Name(), err)
 	}
+	urlHasKey, urlHasClaw := arkClawURLHasCreds(u)
 	var missing []string
 	if u == "" {
 		missing = append(missing, "url")
 	}
-	if k == "" {
+	if k == "" && !urlHasKey {
 		missing = append(missing, "key")
 	}
-	if c == "" {
+	if c == "" && !urlHasClaw {
 		missing = append(missing, "claw_id")
 	}
 	if len(missing) > 0 {
-		return false, fmt.Sprintf("arkclaw not configured: missing %s in %s (or set %s / %s / %s)",
-			strings.Join(missing, ", "), e.configHint(),
+		return false, fmt.Sprintf("%s not configured: missing %s in %s (or set %s / %s / %s)",
+			e.Name(), strings.Join(missing, ", "), e.configHint(),
 			config.EnvArkClawURL, config.EnvArkClawKey, config.EnvArkClawClawID)
 	}
 	return true, u
@@ -265,42 +313,43 @@ func (e *ArkClawEngine) Complete(ctx context.Context, req Request) (Response, er
 
 	endpoint, key, clawID, err := e.endpoint()
 	if err != nil {
-		return Response{}, fmt.Errorf("arkclaw: %w", err)
+		return Response{}, fmt.Errorf("%s: %w", e.Name(), err)
 	}
-	if endpoint == "" || key == "" || clawID == "" {
-		return Response{}, fmt.Errorf("arkclaw: 未配置（需要 url / key / claw_id）；请在 %s 的 \"arkclaw\" 节补齐，或设置 %s / %s / %s",
-			e.configHint(), config.EnvArkClawURL, config.EnvArkClawKey, config.EnvArkClawClawID)
+	urlHasKey, urlHasClaw := arkClawURLHasCreds(endpoint)
+	if endpoint == "" || (key == "" && !urlHasKey) || (clawID == "" && !urlHasClaw) {
+		return Response{}, fmt.Errorf("%s: 未配置（需要 url / key / claw_id）；请在 %s 补齐，或设置 %s / %s / %s",
+			e.Name(), e.configHint(), config.EnvArkClawURL, config.EnvArkClawKey, config.EnvArkClawClawID)
 	}
 
 	// A2A 只提供「按 contextId 续接」，没有「查询最近上下文」的接口，
 	// 因此 Continue 无法实现，直接报错而不是静默新开会话。
 	if req.Continue && req.SessionID == "" {
-		return Response{}, fmt.Errorf("arkclaw: 不支持 continue（A2A 无「查询最近上下文」接口），请用 --session <context_id> 显式续接")
+		return Response{}, fmt.Errorf("%s: 不支持 continue（A2A 无「查询最近上下文」接口），请用 --session <context_id> 显式续接", e.Name())
 	}
 
 	// 实测：网关拒绝 4 种 model 透传（query ?model= / params.message.metadata.model /
 	// params.message.metadata.model.name / params.configuration.model / X-Model header），
 	// 模型由 clawId 绑定。-m 在 arkclaw 上不是透传是「无作用」：告警一次，
-	// 让用户知道「-m 没用，想换模型得改 config.json 的 claw_id」。
+	// 让用户知道「-m 没用，想换模型得改配置的 claw_id」。
 	// max-tokens / temperature / tools 与 trae/codex/openclaw 一致静默忽略
 	//（矩阵注 ②/③ 已有先例，不在 arkclaw 上做差异化告警）。
 	if req.Model != "" {
-		fmt.Fprintf(stderr, "  ⚠ arkclaw: --model %s 不生效（实测网关按 clawId 绑死为 kimi-k2.6），要换模型请改配置 claw_id\n", req.Model)
+		fmt.Fprintf(stderr, "  ⚠ %s: --model %s 不生效（实测网关按 clawId 绑死模型），要换模型请改配置的 claw_id\n", e.Name(), req.Model)
 	}
 
 	// 协议没有独立 system 角色：与 trae / openclaw 同路，展平进 message 头部。
 	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
 	if prompt == "" {
-		return Response{}, fmt.Errorf("arkclaw: empty prompt")
+		return Response{}, fmt.Errorf("%s: empty prompt", e.Name())
 	}
 
 	target, err := arkClawEndpointURL(endpoint, key, clawID)
 	if err != nil {
-		return Response{}, fmt.Errorf("arkclaw: 端点无效: %w", err)
+		return Response{}, fmt.Errorf("%s: 端点无效: %w", e.Name(), err)
 	}
 
 	body, err := func() ([]byte, error) {
-		reqObj, berr := arkClawBuildRequest(prompt, req.SessionID, req.Attachments)
+		reqObj, berr := arkClawBuildRequest(arkClawMethodSend, prompt, req.SessionID, req.Attachments)
 		if berr != nil {
 			return nil, berr
 		}
@@ -364,14 +413,15 @@ func (e *ArkClawEngine) Complete(ctx context.Context, req Request) (Response, er
 	return resp, nil
 }
 
-// arkClawBuildRequest 组装 message/send 请求体。
+// arkClawBuildRequest 组装 A2A JSON-RPC 请求体（method 决定非流式 message/send 还是
+// 流式 message/stream，两者请求体形状完全一致，见 arkclaw_stream.go）。
 //
 // contextID 非空时写入 message.contextId（续接；放外层 params.contextId 无效）。
-func arkClawBuildRequest(prompt, contextID string, atts []Attachment) (arkClawRequest, error) {
+func arkClawBuildRequest(method, prompt, contextID string, atts []Attachment) (arkClawRequest, error) {
 	r := arkClawRequest{
 		JSONRPC: "2.0",
 		ID:      arkClawRandomID(),
-		Method:  "message/send",
+		Method:  method,
 	}
 	// 提示词走 text part；附件走 A2A 原生 file part（inline base64）。
 	// 远端 agent 看不到本机路径，所以**必须**inline —— 传路径等于没传。

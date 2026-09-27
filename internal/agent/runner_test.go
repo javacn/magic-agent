@@ -250,6 +250,7 @@ func TestRunnerDefaultTimeoutByEngine(t *testing.T) {
 	}{
 		{&ClaudeEngine{}, DefaultClaudeTimeout},
 		{&CodeBuddyEngine{}, DefaultCodeBuddyTimeout},
+		{&CodeBuddyAIEngine{}, DefaultCodeBuddyTimeout},
 		{&TraeEngine{}, DefaultTraeTimeout},
 		{&counterEngine{name: "x"}, 5 * time.Minute},
 	}

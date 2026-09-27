@@ -261,7 +261,7 @@ func TestAsStreamerNonStreamer(t *testing.T) {
 	if SupportsStream(e) {
 		t.Error("SupportsStream(non-streamer) should be false")
 	}
-	for _, name := range []string{"claude", "codebuddy", "trae", "llm"} {
+	for _, name := range []string{"claude", "codebuddy", "codebuddy-ai", "trae", "llm"} {
 		if !SupportsStream(Lookup(name)) {
 			t.Errorf("SupportsStream(%s) should be true", name)
 		}

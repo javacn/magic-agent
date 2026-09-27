@@ -111,7 +111,7 @@ func TestPermissionFlagDefaults(t *testing.T) {
 //
 // 按 workspace_test.go 的既有约定按名字注册假引擎（本包真实引擎不会出现）。
 func TestEnginesReportsPermission(t *testing.T) {
-	for _, n := range []string{"claude", "codebuddy", "trae", "llm", "codex", "openclaw", "arkclaw"} {
+	for _, n := range []string{"claude", "codebuddy", "codebuddy-ai", "trae", "llm", "codex", "openclaw", "dsh", "arkclaw"} {
 		registerFake(&stringEngine{name: n, text: "x"})
 	}
 
@@ -136,7 +136,10 @@ func TestEnginesReportsPermission(t *testing.T) {
 	if seen["codebuddy"] != "flag:--permission-mode" {
 		t.Errorf("codebuddy 的 permission 字段 = %q, want flag:--permission-mode", seen["codebuddy"])
 	}
-	for _, e := range []string{"trae", "llm", "codex", "openclaw", "arkclaw"} {
+	if seen["codebuddy-ai"] != "flag:--permission-mode" {
+		t.Errorf("codebuddy-ai 的 permission 字段 = %q, want flag:--permission-mode", seen["codebuddy-ai"])
+	}
+	for _, e := range []string{"trae", "llm", "codex", "openclaw", "dsh", "arkclaw"} {
 		if v, ok := seen[e]; !ok {
 			t.Errorf("--engines 缺 %s 行", e)
 		} else if v != "none" {

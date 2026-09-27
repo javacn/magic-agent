@@ -4,5 +4,18 @@
     "url": "https://<host>/a2a/jsonrpc",
     "key": "<apikey>",
     "claw_id": "ci-xxxxxxxxxxxxxxxxxxxx"
+  },
+  "agents": [
+    {
+      "name": "MagicAI",
+      "url": "https://<host>/a2a/jsonrpc?apikey=<apikey>&clawId=ci-xxxxxxxxxxxxxxxxxxxx"
+    }
+  ],
+  "codebuddyGateway": {
+    "url": "http://127.0.0.1:8399",
+    "password": "<网关启动日志里打印的口令；--auth none 时可省略>",
+    "platform": "generic",
+    "sender": "magic-agent",
+    "conversation": ""
   }
 }

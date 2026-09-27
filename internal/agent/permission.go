@@ -158,15 +158,23 @@ func PermissionTiers() []string {
 
 // PermissionSupportOf 返回某引擎对四档模型的落地方式（机器可读，进 --engines 输出）：
 //
-//	"flag:--permission-mode"  claude / codebuddy：CLI 有原生 --permission-mode，
+//	"flag:--permission-mode"  claude / codebuddy / codebuddy-ai：CLI 有原生 --permission-mode，
 //	                          沙箱与 autoMode 经 --settings 注入（同族 flag 面）
 //	"none"                    其余引擎暂未接线（trae 的档位在 yaml 配置里、codex 是
 //	                          「沙箱 × 审批」两轴、llm 无工具语义、openclaw 走
-//	                          exec.mode 五档）—— 传 --permission 会**明确报错**，
+//	                          exec.mode 五档、arkclaw 由网关侧决定；dsh 只有
+//	                          read-only / workspace-write 两个配置层预设，没有
+//	                          「沙箱关闭 / 无审批」那一档，四档无法一一落地；
+//	                          codebuddy-gateway 的档位由**网关进程**的 --permission-mode
+//	                          决定，且网关会把远程任务的权限强制切到 bypassPermissions
+//	                          —— per-call 传四档没有落地通道）
+//	                          —— 传 --permission 会**明确报错**，
 //	                          而不是静默忽略一个安全设置
 func PermissionSupportOf(engine string) string {
+	// 具名 agent（如 MagicAI）先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
+	engine = CapabilityFamilyOf(engine)
 	switch engine {
-	case "claude", "codebuddy":
+	case "claude", "codebuddy", "codebuddy-ai":
 		return "flag:--permission-mode"
 	default:
 		return "none"

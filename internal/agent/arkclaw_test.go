@@ -2,10 +2,11 @@ package agent
 
 // arkclaw_test.go - ArkClaw（A2A JSON-RPC 网关）引擎单元测试。
 //
-// 覆盖：注册表、非流式契约（不得实现 Streamer）、message/send 请求体形状、
-// contextId 续接位置（必须在 message 内部）、401 纯文本鉴权失败、JSON-RPC
-// error、任务失败态、artifacts 兜底取文、空正文、凭据缺失、Continue 显式
-// 拒绝、JSONSchema 后处理、端点拼接与配置文件读取。
+// 覆盖：注册表、message/send 请求体形状、contextId 续接位置（必须在 message 内部）、
+// 401 纯文本鉴权失败、JSON-RPC error、任务失败态、artifacts 兜底取文、空正文、
+// 凭据缺失、Continue 显式拒绝、JSONSchema 后处理、端点拼接与配置文件读取。
+//
+// 流式通道（message/stream 的 SSE）在 arkclaw_stream_test.go。
 //
 // 全部走 httptest，不触网。
 
@@ -20,6 +21,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/darren/magic-agent/internal/config"
 )
 
 // arkClawRec 记录假网关收到的一次请求。
@@ -94,11 +98,10 @@ func TestArkClawIsEngine(t *testing.T) {
 	}
 }
 
-func TestArkClawNotStreamer(t *testing.T) {
-	// 需求明确「不需要流式」：引擎不得实现 Streamer，
-	// CLI 层因此走 "engine does not support streaming" 的报错路径。
-	if s := AsStreamer(&ArkClawEngine{}); s != nil {
-		t.Errorf("arkclaw 不应实现 Streamer, got %T", s)
+func TestArkClawStreamerMarkerIsSSE(t *testing.T) {
+	// 接口契约与 SSE 行为测试在 arkclaw_stream_test.go（那边覆盖流式通道本身）。
+	if got := streamArgsFor(&ArkClawEngine{}); len(got) != 1 || got[0] != "sse" {
+		t.Errorf("流式标记 = %v want [sse]", got)
 	}
 }
 
@@ -655,9 +658,11 @@ func TestArkClawNoModelNoWarning(t *testing.T) {
 }
 
 func TestDefaultArkClawTimeoutCoversObservedLatency(t *testing.T) {
-	// 实测单轮 8~23s；默认超时必须留出充分余量。
-	if DefaultArkClawTimeout < 2*60*1e9 {
-		t.Errorf("DefaultArkClawTimeout = %v, 实测延迟最大 ~23s，应留足余量", DefaultArkClawTimeout)
+	// 实测短问答 8~23s，但**带工具循环的长任务**要 5 分钟（2026-09-24：「生成周报」304s 才回，
+	// 期间每 15s 一个 working 心跳）。默认值必须留足余量，且**不得短于 CLI 的 -t 默认（600s）**
+	// —— 短了就会出现「什么都没显示 · 调用失败 context deadline exceeded」。
+	if DefaultArkClawTimeout < 10*time.Minute {
+		t.Errorf("DefaultArkClawTimeout = %v, 实测长任务 304s + CLI -t 默认 600s，应 ≥ 10 分钟", DefaultArkClawTimeout)
 	}
 }
 
@@ -671,5 +676,152 @@ func clearArkClawEnv(t *testing.T) {
 		"MAGIC_AGENT_ARKCLAW_CLAW_ID",
 	} {
 		t.Setenv(k, "")
+	}
+}
+
+/* ── 具名 A2A agent（2026-09-23）──
+ * 用户原话：「应该放在 ~/.magic-agent/ 下，新增 <url> 名字叫 MagicAI」。
+ * 落地 = 配置的 `agents` 数组，每个条目注册成一个 ArkClawEngine（只换名字与端点）。
+ * 下面几条钉住：名字生效、URL 内嵌凭据算「配齐」、空名/重名被跳过、注册出来的引擎真能用。 */
+
+func TestArkClawDisplayNameBecomesEngineName(t *testing.T) {
+	if got := (&ArkClawEngine{}).Name(); got != "arkclaw" {
+		t.Errorf("空 DisplayName 的 Name() = %q want arkclaw（老行为不许变）", got)
+	}
+	if got := (&ArkClawEngine{DisplayName: "MagicAI"}).Name(); got != "MagicAI" {
+		t.Errorf("Name() = %q want MagicAI", got)
+	}
+	// 只有空白也算「没给」——否则 `-e " "` 这种名字会进注册表。
+	if got := (&ArkClawEngine{DisplayName: "   "}).Name(); got != "arkclaw" {
+		t.Errorf("空白 DisplayName 的 Name() = %q want arkclaw", got)
+	}
+}
+
+func TestArkClawURLHasCreds(t *testing.T) {
+	cases := []struct {
+		url      string
+		wantKey  bool
+		wantClaw bool
+	}{
+		{"https://h/a2a/jsonrpc?apikey=K&clawId=C", true, true},
+		{"https://h/a2a/jsonrpc?apikey=K", true, false},
+		{"https://h/a2a/jsonrpc?clawId=C", false, true},
+		{"https://h/a2a/jsonrpc", false, false},
+		{"https://h/a2a/jsonrpc?apikey=&clawId=", false, false}, // 空值不算带
+		{"", false, false},
+		{"://bad", false, false},
+	}
+	for _, c := range cases {
+		gotKey, gotClaw := arkClawURLHasCreds(c.url)
+		if gotKey != c.wantKey || gotClaw != c.wantClaw {
+			t.Errorf("arkClawURLHasCreds(%q) = (%v,%v) want (%v,%v)", c.url, gotKey, gotClaw, c.wantKey, c.wantClaw)
+		}
+	}
+}
+
+func TestArkClawDetectReadyWhenCredsEmbeddedInURL(t *testing.T) {
+	clearArkClawEnv(t)
+	url := "https://h/a2a/jsonrpc?apikey=K&clawId=C"
+	e := &ArkClawEngine{
+		DisplayName: "MagicAI",
+		URL:         url,
+		ConfigPath:  filepath.Join(t.TempDir(), "不存在.json"), // 隔离真机配置
+	}
+	ok, info := e.Detect()
+	if !ok {
+		t.Fatalf("URL 里已带 apikey/clawId 应判为配齐，got: %s", info)
+	}
+	if info != url {
+		t.Errorf("Detect 信息 = %q want 端点原样 %q（--engines 的 bin 用它）", info, url)
+	}
+}
+
+func TestArkClawDetectStillNeedsCredsWhenNotInURL(t *testing.T) {
+	clearArkClawEnv(t)
+	e := &ArkClawEngine{URL: "https://h/a2a/jsonrpc", ConfigPath: filepath.Join(t.TempDir(), "不存在.json")}
+	ok, info := e.Detect()
+	if ok {
+		t.Fatal("光有 url、凭据也没有 → 不该判为可用")
+	}
+	// 报错要点名是哪个引擎、缺什么（具名 agent 时尤其重要：它不在 arkclaw 那一节）
+	if !strings.Contains(info, "key") || !strings.Contains(info, "claw_id") {
+		t.Errorf("缺失说明应列出 key/claw_id，got %q", info)
+	}
+}
+
+func TestAgentEnginesFromSkipsEmptyAndDuplicateNames(t *testing.T) {
+	existing := []Engine{&ClaudeEngine{}, &ArkClawEngine{}}
+	got := agentEnginesFrom([]config.AgentConfig{
+		{Name: "", URL: "https://x"},          // 空名 → 跳过
+		{Name: "  ", URL: "https://x"},        // 全空白 → 跳过
+		{Name: "arkclaw", URL: "https://dup"}, // 与内置重名 → 跳过
+		{Name: "Claude", URL: "https://dup"},  // 重名不分大小写 → 跳过
+		{Name: "MagicAI", URL: "https://h/a2a/jsonrpc?apikey=K&clawId=C"},
+		{Name: "MagicAI", URL: "https://again"}, // 同批里重复 → 只留第一条
+	}, existing)
+	if len(got) != 1 {
+		t.Fatalf("应只注册 1 个（MagicAI），got %d: %v", len(got), got)
+	}
+	if got[0].Name() != "MagicAI" {
+		t.Errorf("Name() = %q want MagicAI", got[0].Name())
+	}
+	if ok, info := got[0].Detect(); !ok {
+		t.Errorf("注册出来的引擎应可用（URL 内嵌凭据），got: %s", info)
+	}
+}
+
+func TestAgentEnginesFromEmptyInput(t *testing.T) {
+	// 老配置没有 agents 节 → 不注册任何东西（老行为一字不变）。
+	if got := agentEnginesFrom(nil, []Engine{&ArkClawEngine{}}); got != nil {
+		t.Errorf("无 agents 条目时应返回 nil，got %v", got)
+	}
+}
+
+/* 能力表要按**协议家族**归属，不能按名字 —— 否则具名 agent 会落进 default 那一行。
+ * 实测踩到（2026-09-23）：MagicAI 一开始被报成 `workspace=cwd` / `attachments=prompt`，
+ * 而它实际是 `none` / `part:file`（后者会让界面白白警告「图贴了但模型看不到」）。 */
+func TestNamedAgentInheritsProtocolCapabilities(t *testing.T) {
+	if got := (&ArkClawEngine{}).CapabilityFamily(); got != "arkclaw" {
+		t.Fatalf("ArkClawEngine 的家族名 = %q want arkclaw", got)
+	}
+	/* 注册一个探针引擎（名字唯一，不碰真配置）：CapabilityFamilyOf 走的是**包级注册表**，
+	 * 不注册进去就查不到家族 —— 那正是线上会走通的路径，所以这里照走。
+	 * 注册表只增不减；前缀下划线保证不与任何真实引擎或其它用例撞名。 */
+	const probe = "__capfam_probe__"
+	Register(&ArkClawEngine{DisplayName: probe, URL: "https://h/a2a/jsonrpc?apikey=K&clawId=C"})
+
+	if got := CapabilityFamilyOf(probe); got != "arkclaw" {
+		t.Fatalf("CapabilityFamilyOf(%q) = %q want arkclaw", probe, got)
+	}
+	if got, want := WorkspaceSupportOf(probe), WorkspaceSupportOf("arkclaw"); got != want {
+		t.Errorf("workspace = %q want %q（具名 agent 不许退回 default 的 cwd）", got, want)
+	}
+	if got := AttachmentSupportOf(probe); got != "part:file" {
+		t.Errorf("attachments = %q want part:file（不许退回 default 的 prompt）", got)
+	}
+	if got := PermissionSupportOf(probe); got != "none" {
+		t.Errorf("permission = %q want none", got)
+	}
+	if AskSupportsEngine(probe) {
+		t.Error("ask 应为不支持（A2A 网关无 AskUserQuestion）")
+	}
+	if AppendSupportOf(probe) {
+		t.Error("append 应为 false（A2A 无追加通道）")
+	}
+	if ToolsSwitchableOf(probe) {
+		t.Error("tools 应为不可切换（工具循环在网关侧）")
+	}
+	if got := InstallCommandOf(probe); got != "" {
+		t.Errorf("install = %q want 空（HTTP 引擎没有可执行安装命令）", got)
+	}
+	// 内置引擎与未知名必须一字不变（家族解析只对「注册表里认得、且声明了家族」的名字生效）
+	if got := CapabilityFamilyOf("claude"); got != "claude" {
+		t.Errorf("CapabilityFamilyOf(claude) = %q want claude", got)
+	}
+	if got := CapabilityFamilyOf("__没这个引擎__"); got != "__没这个引擎__" {
+		t.Errorf("未知名应原样返回，got %q", got)
+	}
+	if got := CapabilityFamilyOf(""); got != "" {
+		t.Errorf("空名应返回空串，got %q", got)
 	}
 }

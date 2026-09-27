@@ -163,18 +163,42 @@ done
 
 func TestAppendSupportOf(t *testing.T) {
 	for engine, want := range map[string]bool{
-		"claude":    true,
-		"codebuddy": true,
-		"trae":      false,
-		"codex":     false,
-		"llm":       false,
-		"openclaw":  false,
-		"arkclaw":   false,
-		"unknown":   false,
+		"claude":       true,
+		"codebuddy":    true,
+		"codebuddy-ai": true,
+		// dsh：SDK 通道下对同一 sessionId 继续 session/prompt 即续接同一会话
+		//（官方 Python SDK 文档「reuse a harness, home, and id」）。
+		"dsh":      true,
+		"trae":     false,
+		"codex":    false,
+		"llm":      false,
+		"openclaw": false,
+		"arkclaw":  false,
+		"unknown":  false,
 	} {
 		if got := AppendSupportOf(engine); got != want {
 			t.Errorf("AppendSupportOf(%q) = %v want %v", engine, got, want)
 		}
+	}
+}
+
+// 常驻会话的**默认值**按引擎区分：claude/codebuddy 默认开，dsh 默认关（要显式 --keep-alive）。
+func TestAppendDefaultOn(t *testing.T) {
+	for engine, want := range map[string]bool{
+		"claude":       true,
+		"codebuddy":    true,
+		"codebuddy-ai": true,
+		"dsh":          false, // 显式 --keep-alive 才开
+		"trae":         false,
+		"unknown":      false,
+	} {
+		if got := AppendDefaultOn(engine); got != want {
+			t.Errorf("AppendDefaultOn(%q) = %v want %v", engine, got, want)
+		}
+	}
+	// 默认关的引擎也必须「支持」（否则显式 --keep-alive 会被能力表挡下）。
+	if !AppendSupportOf("dsh") || AppendDefaultOn("dsh") {
+		t.Error("dsh 应是「支持但默认关」")
 	}
 }
 

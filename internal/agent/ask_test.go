@@ -395,7 +395,7 @@ func TestEncodeAskFollowUp(t *testing.T) {
 const AskPrefixForTest = AskAnswerPrefix
 
 func TestAskSupportOf(t *testing.T) {
-	for _, e := range []string{"claude", "codebuddy", "CLAUDE"} {
+	for _, e := range []string{"claude", "codebuddy", "codebuddy-ai", "CLAUDE"} {
 		if got := AskSupportOf(e); got != "tool:AskUserQuestion" {
 			t.Errorf("AskSupportOf(%q) = %q", e, got)
 		}
@@ -403,13 +403,16 @@ func TestAskSupportOf(t *testing.T) {
 			t.Errorf("AskSupportsEngine(%q) 应为 true", e)
 		}
 	}
-	for _, e := range []string{"trae", "llm", "codex", "openclaw", "arkclaw", "", "nope"} {
+	for _, e := range []string{"trae", "llm", "codex", "openclaw", "dsh", "arkclaw", "", "nope"} {
 		if got := AskSupportOf(e); got != "none" {
 			t.Errorf("AskSupportOf(%q) = %q，期望 none", e, got)
 		}
 	}
 	if !AskInterruptSupportOf("codebuddy") || AskInterruptSupportOf("claude") {
 		t.Error("interrupt 支持判定不对（只有 codebuddy 的官方文档写了该字段）")
+	}
+	if !AskInterruptSupportOf("codebuddy-ai") {
+		t.Error("codebuddy-ai 与 codebuddy 同族同协议，应支持 interrupt")
 	}
 }
 

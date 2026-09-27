@@ -42,7 +42,7 @@ package agent
 //	3. allow 时 updatedInput **必填**，且必须原样回传 questions 数组 —— EncodeAskAnswer
 //	   用「原始 input + answers」的方式保证这一点（不做字段级重建，免得漏字段）。
 //
-// 其余引擎（trae / llm / codex / openclaw / arkclaw）实测均无 AskUserQuestion 与
+// 其余引擎（trae / llm / codex / openclaw / dsh / arkclaw）实测均无 AskUserQuestion 与
 // can_use_tool 协议，能力表 AskSupportOf 返回 "none"（ACP 系的 session/request_permission
 // 是另一族协议，本项目尚未接入，不在本文件冒充支持）。
 
@@ -486,7 +486,9 @@ func EncodeAskFollowUp(req *AskRequest, ans AskAnswer) string {
 // 注：trae / cursor / iflow / qwen 等走的是 ACP 的 session/request_permission（另一族
 // 协议：选项带 optionId + kind=allow_once/reject_once…），本项目尚未接入，因此如实报 none。
 func AskSupportOf(engine string) string {
-	if equalFold(engine, "claude") || equalFold(engine, "codebuddy") {
+	// 具名 agent（如 MagicAI）先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
+	engine = CapabilityFamilyOf(engine)
+	if equalFold(engine, "claude") || equalFold(engine, "codebuddy") || equalFold(engine, "codebuddy-ai") {
 		return "tool:AskUserQuestion"
 	}
 	return "none"
@@ -498,12 +500,18 @@ func AskSupportsEngine(engine string) bool { return AskSupportOf(engine) != "non
 // AskInterruptSupportOf 拒绝时是否支持 interrupt（拒绝并中断整个会话）。
 //
 // 只有 codebuddy 的官方文档写了该字段；claude 的 SDK 文档只给 behavior/message，
-// 故对 claude 不渲染（见 EncodeAskAnswer）。
-func AskInterruptSupportOf(engine string) bool { return equalFold(engine, "codebuddy") }
+// 故对 claude 不渲染（见 EncodeAskAnswer）。codebuddy-ai 与 codebuddy 同族同协议，同样支持。
+func AskInterruptSupportOf(engine string) bool {
+	// 具名 agent 先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
+	engine = CapabilityFamilyOf(engine)
+	return equalFold(engine, "codebuddy") || equalFold(engine, "codebuddy-ai")
+}
 
 // askHeaderLimit claude 侧 header 的字符上限（官方 SDK 文档：最多 12 字符）。
 // codebuddy 无此限制，返回 0 表示不限。
 func askHeaderLimit(engine string) int {
+	// 具名 agent 先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
+	engine = CapabilityFamilyOf(engine)
 	if equalFold(engine, "claude") {
 		return 12
 	}

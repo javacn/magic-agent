@@ -1,6 +1,6 @@
 {
   "name": "magic-agent",
-  "version": "0.2.0",
+  "version": "0.3.9",
   "description": "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae / llm / codex / openclaw 引擎",
   "license": "MIT",
   "bin": {
@@ -9,6 +9,7 @@
   "scripts": {
     "build": "node npm/build.js",
     "build:current": "node npm/build.js --current",
+    "bump": "node npm/bump.js",
     "prepack": "node npm/build.js",
     "postinstall": "node npm/install.js"
   },

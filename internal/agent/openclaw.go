@@ -54,8 +54,10 @@ package agent
 // CLI 路径解析顺序：显式 BinPath → MAGIC_AGENT_OPENCLAW_BIN → 常见安装位 → PATH
 // （探测链统一收敛在 engine_base.go 的 cliBase）。
 //
-// 不实现 Stream：openclaw --json 是单次 envelope 协议；流式能力由后续 CLI
-// 版本补齐。CLI 层面对 nil Streamer 有明确报错路径（see cli/ask.go）。
+// 流式（Stream）走**另一条通道**：`openclaw acp`（ACP server over stdio，背后接本地 Gateway），
+// 能拿到逐字正文增量与 tool_call/tool_call_update（思考流协议侧不支持）。
+// 见 openclaw_acp.go —— 那里还把「桥不可用时回退到本文件的 Complete（内嵌一次性调用）」
+// 一并收口，所以两条路可以共存：嵌录取正文，ACP 取增量。
 
 import (
 	"bufio"
@@ -67,6 +69,38 @@ import (
 	"strings"
 	"time"
 )
+
+/* isOpenClawAuthFailure 判「这是不是一条凭据类失败」（2026-09-23 加）。
+ *
+ * 为什么需要它：`--local` 嵌入式路径的 provider key **取自 shell 环境变量**
+ * （openclaw 官方 help 原文：Run the embedded agent locally (requires model provider
+ * API keys in your shell)），**openclaw.json 的 `models.providers.*.apiKey` 在这条路上不被采用**。
+ * 于是「key 只配在 openclaw.json、环境里没有对应变量」时必然 401 —— 实测本机：
+ *   `openclaw agent --local --agent main --json --model minimax/MiniMax-M3` → exit 1
+ *   + `401 invalid api key (2049)`；同一把 key 直连 api.minimaxi.com 是 200，
+ *   走 Gateway 路径（去掉 --local）也正常出正文。
+ * 判据只认「凭据类」的特征词 —— 别把超时 / 目录 / 会话接不上那类失败也拖进来重试
+ * （那些换条路也一样失败，白多一次往返）。
+ * ⚠️ 不用正则：`401` 单独出现时可能是 token 计数等无关数字，所以要求它带上下文
+ * （`http 401` / `(401)` / `401 invalid`）或直接命中那几句固定文案。 */
+func isOpenClawAuthFailure(stdout, stderr string) bool {
+	s := strings.ToLower(stderr + "\n" + stdout)
+	for _, marker := range []string{
+		"invalid api key",
+		"authentication failed",
+		"re-authenticate",
+		"unauthorized",
+		"http 401",
+		"(401)",
+		"401 invalid",
+		"(2049)", // MiniMax 的「key 无效」错误码
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // OpenClawEngine 通过 OpenClaw CLI --local 模式实现 Engine。
 type OpenClawEngine struct {
@@ -130,6 +164,39 @@ type openclawEnvelope struct {
 		AgentMeta  openclawAgentMeta `json:"agentMeta"`
 		Aborted    bool              `json:"aborted"`
 	} `json:"meta"`
+	/* ⚠️ **Gateway 路径多包一层 `result`**（2026-09-23 补）：两条路的 envelope 形状不同 ——
+	     · `--local`（嵌入式）：`{payloads:[…], meta:{agentMeta:{…}}}`
+	     · Gateway（不带 --local）：`{runId, status, summary, result:{payloads:[…], meta:{…}}}`
+	   实测（本机 openclaw 2026.6.11）：Gateway 那次 stdout 近 50KB 的 pretty JSON，
+	   正文在 `result.payloads[0].text`，而老解析器只认顶层 `payloads` → 明明拿到了正文，
+	   却报「未在 stdout 中找到有效 JSON envelope」。回退 Gateway 就是靠这条才真正跑通。 */
+	Result *struct {
+		Payloads []struct {
+			Text     string  `json:"text"`
+			MediaURL *string `json:"mediaUrl"`
+		} `json:"payloads"`
+		Meta struct {
+			DurationMs int               `json:"durationMs"`
+			AgentMeta  openclawAgentMeta `json:"agentMeta"`
+			Aborted    bool              `json:"aborted"`
+		} `json:"meta"`
+	} `json:"result"`
+	// Gateway 独有的外层字段（失败判定用：status=ok 才是成功）
+	Status  string `json:"status"`
+	Summary string `json:"summary"`
+}
+
+// unwrap 把两种形状归一成「顶层 payloads/meta」：Gateway 的 result 层被提上来。
+// ⚠️ 只在顶层真的空（payloads 为空）时才下沉到 result —— 万一将来某个版本两层都有，
+// 顶层那份才是 `--local` 的原生形状，优先它。
+func (e openclawEnvelope) unwrap() openclawEnvelope {
+	if len(e.Payloads) > 0 || e.Result == nil {
+		return e
+	}
+	out := openclawEnvelope{Status: e.Status, Summary: e.Summary}
+	out.Payloads = e.Result.Payloads
+	out.Meta = e.Result.Meta
+	return out
 }
 
 // openclawSession 对应 openclaw sessions --json 单条会话。
@@ -220,6 +287,30 @@ func (e *OpenClawEngine) Complete(ctx context.Context, req Request) (Response, e
 	// workspace：openclaw 无 per-call 工作目录 flag（workspace 由 openclaw agents 绑定），
 	// 子进程 cwd 是唯一可用的方式
 	stdout, stderr, runErr := runCLIIn(ctx, req.Workspace, bin, args...)
+
+	/* ⚠️ 嵌入式凭据失败 → 回退 Gateway 路径（2026-09-23 修，见 isOpenClawAuthFailure）。
+	 *
+	 * 为什么要这条兜底：`--local` 的 provider key 只从 **shell 环境变量**取，openclaw.json 里
+	 * 配好的 key 在这条路上用不上 → 「模型只配在 openclaw.json」的用户必然 401，
+	 * 而 Gateway 路径（去掉 `--local`）会正常读配置里的 key。两条路的差异是上游事实，
+	 * 不是本项目的选择，所以**换一条能跑通的路**才是对用户有用的动作。
+	 * 代价与边界（刻意收窄）：
+	 *   · 只在**凭据类失败**上重试（`isOpenClawAuthFailure`）—— 超时 / 会话接不上换条路也一样失败；
+	 *   · **只重试一次**，且 Gateway 也失败时**保留原始失败**（只往 stderr 补一句说明）——
+	 *     不能让「Gateway 没起」把原本清楚的 401 覆盖成一句连接错误；
+	 *   · 走这条路时 stderr 留一行痕迹（不静默换路）。 */
+	if runErr != nil && isOpenClawAuthFailure(stdout, stderr) {
+		fmt.Fprintln(os.Stderr, "magic-agent: openclaw 嵌入式路径（--local）认证失败"+
+			"（该路径的 provider key 取自 shell 环境变量，openclaw.json 里配的用不上）→ 改用 Gateway 路径重试一次")
+		gwOut, gwErr, gwRunErr := runCLIIn(ctx, req.Workspace, bin, e.buildArgsMode(req, sessionID, msgArgs, false)...)
+		if gwRunErr == nil {
+			stdout, stderr, runErr = gwOut, gwErr, nil
+		} else {
+			stderr = strings.TrimRight(stderr, "\n") + "\n(magic-agent: 已改走 Gateway 路径，同样失败：" +
+				lastNonEmptyLine(gwErr) + ")"
+		}
+	}
+
 	// 即便非零退出也尝试解析 envelope(plugin 错误后仍可能输出有效 JSON)。
 	resp, perr := e.parseStdout(stdout)
 	if resp.Latency == 0 {
@@ -253,16 +344,20 @@ func (e *OpenClawEngine) Complete(ctx context.Context, req Request) (Response, e
 
 // parseStdout 从 stdout(可能含 plugin 日志)中抽出顶层 JSON envelope 并解析。
 // 找不到 envelope 时返回 ("", false)。
+// ⚠️ 两种形状都认（见 openclawEnvelope.unwrap）：`--local` 顶层 payloads、Gateway 的 result 层。
 func (e *OpenClawEngine) parseStdout(stdout string) (Response, error) {
 	env := openclawEnvelope{}
 	// 方案 A:整段就是 JSON(短输出)
-	if err := json.Unmarshal([]byte(stdout), &env); err == nil && len(env.Payloads) > 0 {
+	if err := json.Unmarshal([]byte(stdout), &env); err == nil && len(env.unwrap().Payloads) > 0 {
 		return envelopeToResponse(env), nil
 	}
 	// 方案 B:stdout 含 plugin 日志,逐行扫描
 	sc := bufio.NewScanner(strings.NewReader(stdout))
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	var collected strings.Builder
+	/* Gateway 明确宣告失败时（status != ok）把它的 summary 带出去 —— 否则调用方只会看到
+	   「未找到有效 JSON envelope」这种与真原因无关的话（用户报障的观感就是这么来的）。 */
+	lastStatus, lastSummary := "", ""
 	// 我们不知道 JSON 跨多少行,先按整段重试
 	for sc.Scan() {
 		collected.WriteString(sc.Text())
@@ -274,15 +369,28 @@ func (e *OpenClawEngine) parseStdout(stdout string) (Response, error) {
 		// 拿到第一个顶层 JSON 对象后再 unmarshal(map → json → envelope)
 		b, _ := json.Marshal(obj)
 		var env2 openclawEnvelope
-		if err := json.Unmarshal(b, &env2); err == nil && len(env2.Payloads) > 0 {
-			return envelopeToResponse(env2), nil
+		if err := json.Unmarshal(b, &env2); err == nil {
+			if env2.Status != "" {
+				lastStatus, lastSummary = env2.Status, env2.Summary
+			}
+			if len(env2.unwrap().Payloads) > 0 {
+				return envelopeToResponse(env2), nil
+			}
 		}
+	}
+	if lastStatus != "" && lastStatus != "ok" {
+		detail := strings.TrimSpace(lastSummary)
+		if detail != "" {
+			detail = "（" + detail + "）"
+		}
+		return Response{}, fmt.Errorf("openclaw Gateway 本轮未成功：status=%s%s", lastStatus, detail)
 	}
 	return Response{}, fmt.Errorf("openclaw: 未在 stdout 中找到有效 JSON envelope")
 }
 
-// envelopeToResponse 从 envelope 构造 Response。
+// envelopeToResponse 从 envelope 构造 Response（两种形状都先归一到顶层 payloads/meta）。
 func envelopeToResponse(env openclawEnvelope) Response {
+	env = env.unwrap()
 	text := ""
 	if len(env.Payloads) > 0 {
 		text = env.Payloads[0].Text
@@ -333,6 +441,22 @@ func mustMarshal(v any) []byte {
 	return b
 }
 
+// lastNonEmptyLine 取多行文本的最后一条非空行（stderr 摘要用）。
+//
+// ⚠️ 为什么是**最后**一条而不是第一条：CLI 的 stderr 前面常是环境噪声
+// （`[state-migrations] Legacy state migration warnings:`、plugin 加载日志…），
+// 真原因几乎总在末尾。与本仓 ask-envelope.cjs 的 `reasonFromStderr` 同一约定 ——
+// 两处都取尾行，同一次失败才不会在 CLI 与界面里写成两句不同的话。
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
 // agentID 返回构造时显式注入的 agent id;为空则用 "main" 作默认。
 func (e *OpenClawEngine) agentID() string {
 	if e.Agent != "" {
@@ -341,7 +465,7 @@ func (e *OpenClawEngine) agentID() string {
 	return "main"
 }
 
-// buildArgs 构造 `openclaw agent --local ...` 参数。
+// buildArgs 构造 `openclaw agent --local ...` 参数（嵌入式路径 = 默认路径）。
 //
 // 形态:
 //
@@ -349,8 +473,26 @@ func (e *OpenClawEngine) agentID() string {
 //	  [--model <provider/model>] [--session-id <id>]
 //	  [--message <text> | --message-file <path>]
 //	  [--timeout <sec>]
+//
+// ⚠️ 认证失败时由 Complete 改走 buildArgsMode(..., local=false)（Gateway 路径）——
+// 那条路会读 openclaw.json 里配的 provider key，见 isOpenClawAuthFailure。
 func (e *OpenClawEngine) buildArgs(req Request, sessionID string, msgArgs []string) []string {
-	args := []string{"agent", "--local", "--agent", e.agentID(), "--json"}
+	return e.buildArgsMode(req, sessionID, msgArgs, true)
+}
+
+// buildArgsMode 与 buildArgs 同形，`local` 决定加不加 `--local`：
+//
+//	true  → 嵌入式（embedded agent，不需要 Gateway 在跑；provider key 取自 shell 环境变量）
+//	false → Gateway 路径（需要本地 Gateway；provider key 由 openclaw.json 的 providers 解析）
+//
+// 两条路的**其余参数完全一致**（--agent / --json / --model / --session-id / 消息 / --timeout），
+// 所以回退时只差一个 flag，不必再拼一遍。
+func (e *OpenClawEngine) buildArgsMode(req Request, sessionID string, msgArgs []string, local bool) []string {
+	args := []string{"agent"}
+	if local {
+		args = append(args, "--local")
+	}
+	args = append(args, "--agent", e.agentID(), "--json")
 	if m := stripModelPrefix(req.Model); m != "" {
 		args = append(args, "--model", m)
 	} else if e.Model != "" {

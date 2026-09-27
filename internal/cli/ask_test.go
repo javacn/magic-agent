@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -444,6 +445,49 @@ func TestAskUnknownEngine(t *testing.T) {
 	}
 }
 
+// streamTimeoutEngine 记录流式调用收到的 req.Timeout（回归：-t 必须透传到引擎）。
+type streamTimeoutEngine struct {
+	name        string
+	lastTimeout time.Duration
+}
+
+func (s *streamTimeoutEngine) Name() string           { return s.name }
+func (s *streamTimeoutEngine) Detect() (bool, string) { return true, "fake://" + s.name }
+func (s *streamTimeoutEngine) Complete(context.Context, agent.Request) (agent.Response, error) {
+	return agent.Response{Text: "ok"}, nil
+}
+func (s *streamTimeoutEngine) Stream(_ context.Context, req agent.Request, onEvent func(agent.StreamEvent)) (agent.StreamResult, error) {
+	s.lastTimeout = req.Timeout
+	onEvent(agent.StreamEvent{Kind: agent.KindText, Text: "ok"})
+	return agent.StreamResult{Response: agent.Response{Engine: s.name, Text: "ok"}}, nil
+}
+
+// 回归（2026-09-24）：流式路径必须把调用方**显式**给的 -t 透传给引擎。
+//
+// 以前流式路径从不设 req.Timeout → 引擎只能用自己的默认值（arkclaw 是 3 分钟），
+// 于是桌面壳传的 `-t 600s` 被静默忽略；而网关侧带工具循环的任务要 5 分钟
+// （实测「生成周报」304s 才回）→ 3 分钟必被砍，界面上就是「什么都没显示 · 调用失败」。
+func TestStreamPassesExplicitTimeoutToEngine(t *testing.T) {
+	eng := &streamTimeoutEngine{name: "fake-stream-timeout"}
+	registerFake(eng)
+
+	if _, _, err := runAskCmd(t, "", "-e", "fake-stream-timeout", "--stream", "-t", "900s", "hi"); err != nil {
+		t.Fatalf("--stream -t 900s: %v", err)
+	}
+	if eng.lastTimeout != 900*time.Second {
+		t.Errorf("引擎收到的 req.Timeout = %v want 15m（显式 -t 未透传）", eng.lastTimeout)
+	}
+
+	// 没给 -t → 不透传：别去覆盖引擎自己的默认（如 llm 的条目级 timeout、openclaw 的 600s）。
+	eng.lastTimeout = -1
+	if _, _, err := runAskCmd(t, "", "-e", "fake-stream-timeout", "--stream", "hi"); err != nil {
+		t.Fatalf("--stream: %v", err)
+	}
+	if eng.lastTimeout != 0 {
+		t.Errorf("未给 -t 时 req.Timeout = %v want 0（不该覆盖引擎默认）", eng.lastTimeout)
+	}
+}
+
 func TestAskBadFormat(t *testing.T) {
 	_, _, err := runAskCmd(t, "", "-e", "claude", "-o", "yaml", "hi")
 	if err == nil {
@@ -642,12 +686,17 @@ func TestEnginesFlagSkipsPrompt(t *testing.T) {
 // modelListEngine 假引擎：在 stringEngine 之上实现 agent.ModelLister。
 type modelListEngine struct {
 	stringEngine
-	models []string
-	err    error
+	models  []string
+	err     error
+	credits map[string]string // 非 nil 时实现 agent.ModelCreditLister
 }
 
 func (m *modelListEngine) ListModels(context.Context) ([]string, error) {
 	return m.models, m.err
+}
+
+func (m *modelListEngine) ModelCredits(context.Context) map[string]string {
+	return m.credits
 }
 
 // stubModelProbe 把 CLI 层的模型探测限制在假引擎上：
@@ -663,6 +712,15 @@ func stubModelProbe(t *testing.T) {
 		return nil, agent.ErrNoModelSource
 	}
 	t.Cleanup(func() { probeEngineModels = prev })
+	// 倍率探测与模型探测同链：只放行假引擎，防止真实引擎读真机缓存。
+	prevC := probeEngineCredits
+	probeEngineCredits = func(_ context.Context, l agent.ModelCreditLister) map[string]string {
+		if _, ok := l.(*modelListEngine); ok {
+			return l.ModelCredits(context.Background())
+		}
+		return nil
+	}
+	t.Cleanup(func() { probeEngineCredits = prevC })
 }
 
 // enginesRow --engines 输出的一行（只看本用例关心的字段）。
@@ -723,6 +781,60 @@ func TestEnginesFlagIncludesModels(t *testing.T) {
 	if !strings.Contains(bad.ModelsNote, "probe failed: boom") {
 		t.Errorf("models_note = %q, want probe error", bad.ModelsNote)
 	}
+}
+
+// --engines 对实现 ModelCreditLister 的引擎带 model_credits（积分倍率表）；
+// 未给倍率的引擎省略该字段。
+func TestEnginesFlagIncludesModelCredits(t *testing.T) {
+	withCredits := &modelListEngine{
+		stringEngine: stringEngine{name: "fake-credits"},
+		models:       []string{"fast-model", "deepseek-v4.1-flash", "custom-local:X"},
+		credits:      map[string]string{"fast-model": "0.34", "deepseek-v4.1-flash": "0.00"},
+	}
+	withoutCredits := &modelListEngine{
+		stringEngine: stringEngine{name: "fake-no-credits"},
+		models:       []string{"m-a"},
+	}
+	registerFake(withCredits)
+	registerFake(withoutCredits)
+	stubModelProbe(t)
+
+	stdout, _, err := runAskCmd(t, "", "--engines")
+	if err != nil {
+		t.Fatalf("--engines: %v", err)
+	}
+	var rows []struct {
+		Engine       string            `json:"engine"`
+		Models       []string          `json:"models"`
+		ModelCredits map[string]string `json:"model_credits"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	for _, r := range rows {
+		switch r.Engine {
+		case "fake-credits":
+			if !equalStrMap(r.ModelCredits, map[string]string{"fast-model": "0.34", "deepseek-v4.1-flash": "0.00"}) {
+				t.Errorf("model_credits = %v", r.ModelCredits)
+			}
+		case "fake-no-credits":
+			if r.ModelCredits != nil {
+				t.Errorf("engine without credits should omit model_credits, got %v", r.ModelCredits)
+			}
+		}
+	}
+}
+
+func equalStrMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // --engines --no-models 完全不触发探测（不启动任何 CLI）。

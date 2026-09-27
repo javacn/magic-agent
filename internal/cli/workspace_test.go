@@ -100,7 +100,7 @@ func TestWorkspaceUnsupportedWarnText(t *testing.T) {
 			t.Errorf("workspaceUnsupportedWarn(%q) = %q，应说明被忽略", engine, warn)
 		}
 	}
-	for _, engine := range []string{"claude", "codebuddy", "trae", "codex"} {
+	for _, engine := range []string{"claude", "codebuddy", "codebuddy-ai", "trae", "codex"} {
 		if warn := workspaceUnsupportedWarn(engine); warn != "" {
 			t.Errorf("workspaceUnsupportedWarn(%q) = %q，支持 workspace 的引擎不该提示", engine, warn)
 		}
@@ -115,6 +115,7 @@ func TestEnginesFlagCarriesWorkspaceCapability(t *testing.T) {
 	registerFake(&wsCaptureEngine{name: "llm"})
 	registerFake(&wsCaptureEngine{name: "arkclaw"})
 	registerFake(&wsCaptureEngine{name: "claude"})
+	registerFake(&wsCaptureEngine{name: "dsh"})
 	registerFake(&wsCaptureEngine{name: "ws-cap-unlisted"})
 
 	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
@@ -138,6 +139,7 @@ func TestEnginesFlagCarriesWorkspaceCapability(t *testing.T) {
 		"llm":             "none",
 		"arkclaw":         "none",
 		"claude":          "cwd",
+		"dsh":             "cwd", // 调用目录即 workspace 根（子进程 cwd）
 		"ws-cap-unlisted": "cwd", // 未识别的引擎按默认（子进程 cwd）处理
 	} {
 		if got[engine] != want {

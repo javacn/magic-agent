@@ -134,7 +134,7 @@ func TestAttachFlagBadPathIsUsageError(t *testing.T) {
 
 func TestAttachmentPromptFallbackWarnUnit(t *testing.T) {
 	// 有原生通道 → 无提示
-	for _, e := range []string{"claude", "codebuddy", "codex", "llm", "arkclaw"} {
+	for _, e := range []string{"claude", "codebuddy", "codebuddy-ai", "codex", "llm", "arkclaw"} {
 		if got := attachmentPromptFallbackWarn(e, 1, true); got != "" {
 			t.Errorf("%s 有原生通道，不该提示: %q", e, got)
 		}
@@ -155,6 +155,17 @@ func TestAttachmentPromptFallbackWarnUnit(t *testing.T) {
 	}
 	if !strings.Contains(gotOff, "--engines") {
 		t.Errorf("提示应指引到 --engines 的 attachments 字段: %q", gotOff)
+	}
+	// dsh / openclaw：同样无原生通道，但 --tools 在它们身上没有落地通道
+	//（自带工具循环）→ 提示里**不该**出现「请改用 --tools on」（传了也不改变行为）。
+	for _, e := range []string{"dsh", "openclaw"} {
+		got := attachmentPromptFallbackWarn(e, 1, true)
+		if !strings.Contains(got, e) || !strings.Contains(got, "没有附件输入通道") {
+			t.Errorf("%s 应提示降级: %q", e, got)
+		}
+		if strings.Contains(got, "--tools on") {
+			t.Errorf("%s 的 --tools 无落地通道，不该提 --tools on: %q", e, got)
+		}
 	}
 }
 
@@ -191,6 +202,7 @@ func TestEnginesFlagCarriesAttachmentsCapability(t *testing.T) {
 	registerFake(&stringEngine{name: "claude"})
 	registerFake(&stringEngine{name: "arkclaw"})
 	registerFake(&stringEngine{name: "trae"})
+	registerFake(&stringEngine{name: "dsh"})
 
 	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
 	if err != nil {
@@ -212,6 +224,7 @@ func TestEnginesFlagCarriesAttachmentsCapability(t *testing.T) {
 		"claude":  "stdin:stream-json",
 		"arkclaw": "part:file",
 		"trae":    "prompt",
+		"dsh":     "prompt", // headless 无附件参数 → 路径写进提示词
 	} {
 		if got[engine] != want {
 			t.Errorf("--engines 里 %s 的 attachments = %q want %q", engine, got[engine], want)

@@ -284,3 +284,168 @@ func TestOpenClawEnvelopeRoundTrip(t *testing.T) {
 		t.Errorf("tokens = %+v", resp)
 	}
 }
+
+/* ── 嵌入式凭据失败 → 回退 Gateway（2026-09-23）──
+ *
+ * 现场（用户报障「openclaw 的引擎没对接好 不显示」的下半场）：`--local` 嵌入式路径的
+ * provider key 只从 **shell 环境变量**取，`openclaw.json` 里配好的 key 在这条路上用不上
+ * → 「模型只配在 openclaw.json」的用户必然 `401 invalid api key (2049)`。
+ * 桩复刻这个形状：**带 `--local` 就 401、不带就正常出 envelope**。 */
+
+// openclawAuthStub 造一个「--local 必 401、Gateway 路径正常」的桩，返回 bin 与调用日志路径。
+// ⚠️ 日志把 argv 里的换行压成空格（`tr '\n' ' '`）：prompt 经 FlattenPrompt 后自带换行，
+// 不压平会让「一次调用」在日志里占两行 —— 按行数断言就必然假红（实测踩过）。
+func openclawAuthStub(t *testing.T, dir string) (bin, log string) {
+	t.Helper()
+	log = filepath.Join(dir, "calls.log")
+	bin = filepath.Join(dir, "openclaw")
+	script := `#!/bin/sh
+printf '%s\n' "$*" | tr '\n' ' ' >> ` + log + `
+echo >> ` + log + `
+case "$*" in
+  *--local*)
+    echo 'FailoverError: Authentication failed (provider returned HTTP 401). detail=401 invalid api key (2049)' >&2
+    exit 1
+    ;;
+esac
+echo '{"payloads":[{"text":"收到"}],"meta":{"agentMeta":{"sessionId":"gw-1","model":"minimax/MiniMax-M3"}}}'
+exit 0
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, log
+}
+
+func TestOpenClawAuthFailureFallsBackToGateway(t *testing.T) {
+	dir := t.TempDir()
+	bin, log := openclawAuthStub(t, dir)
+	e := &OpenClawEngine{BinPath: bin, Agent: "main"}
+	resp, err := e.Complete(context.Background(), Request{
+		Model:    "minimax/MiniMax-M3",
+		Messages: []Message{{Role: "user", Content: "只回两个字：收到"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete 应回退 Gateway 后成功, got err = %v", err)
+	}
+	if resp.Text != "收到" {
+		t.Errorf("Text = %q want 收到", resp.Text)
+	}
+	if resp.SessionID != "gw-1" {
+		t.Errorf("SessionID = %q want gw-1（取自 Gateway 那次 envelope）", resp.SessionID)
+	}
+	data, _ := os.ReadFile(log)
+	var calls []string
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		// 桩用 `tr '\n' ' '` 压平 argv，末尾会留一个空格（被换掉的那个换行）→ 统一去掉再比。
+		calls = append(calls, strings.TrimRight(strings.TrimRight(ln, "\r"), " "))
+	}
+	if len(calls) != 2 {
+		t.Fatalf("应恰好两次调用（嵌入式 → Gateway），got %d: %q", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "--local") {
+		t.Errorf("第 1 次应走嵌入式（带 --local）: %q", calls[0])
+	}
+	if strings.Contains(calls[1], "--local") {
+		t.Errorf("第 2 次应走 Gateway（去掉 --local）: %q", calls[1])
+	}
+	// 两次的**其余参数必须完全一致**（只差一个 flag）—— 否则回退会把模型 / 会话丢掉。
+	if strings.Replace(calls[0], " --local", "", 1) != calls[1] {
+		t.Errorf("回退时除 --local 外不该有别的差异:\n  嵌入式: %q\n  Gateway: %q", calls[0], calls[1])
+	}
+}
+
+func TestOpenClawNonAuthFailureDoesNotRetry(t *testing.T) {
+	// 非凭据类失败（超时 / 会话接不上）**不许**重试：换条路也一样失败，白多一次往返。
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls.log")
+	bin := filepath.Join(dir, "openclaw")
+	script := `#!/bin/sh
+printf '%s\n' "$*" | tr '\n' ' ' >> ` + log + `
+echo >> ` + log + `
+echo 'openclaw: 会话已过期，无法续接' >&2
+exit 1
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &OpenClawEngine{BinPath: bin}
+	if _, err := e.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err == nil {
+		t.Fatal("应报错")
+	}
+	data, _ := os.ReadFile(log)
+	if n := len(strings.Split(strings.TrimSpace(string(data)), "\n")); n != 1 {
+		t.Errorf("非凭据类失败只该调一次, got %d 次: %q", n, string(data))
+	}
+}
+
+/* ── Gateway envelope 多包一层 result（2026-09-23）──
+ * 实测：`--local` 是顶层 `payloads`，Gateway 是 `{runId,status,summary,result:{payloads,meta}}`。
+ * 只认前者的话，回退 Gateway 明明拿到了正文却报「未找到有效 JSON envelope」。 */
+func TestOpenClawGatewayEnvelopeShape(t *testing.T) {
+	// 复刻实测形状：pretty JSON + 前面混 plugin 日志 + 后面还有别的输出
+	stdout := `[plugins] openviking: loaded plugin config
+{
+  "runId": "e0dda575-3a50-482d-9ab0-e6df7f9db86a",
+  "status": "ok",
+  "summary": "completed",
+  "result": {
+    "payloads": [ { "text": "收到", "mediaUrl": null } ],
+    "meta": { "durationMs": 1479, "agentMeta": {
+      "sessionId": "ff91a857-0d63-4ebc-ad81-6f03dfdc8427",
+      "provider": "minimax", "model": "MiniMax-M3" } }
+  }
+}
+[state-migrations] 尾部噪声`
+	e := &OpenClawEngine{}
+	resp, err := e.parseStdout(stdout)
+	if err != nil {
+		t.Fatalf("Gateway 形状应能解析, got err = %v", err)
+	}
+	if resp.Text != "收到" {
+		t.Errorf("Text = %q want 收到", resp.Text)
+	}
+	if resp.SessionID != "ff91a857-0d63-4ebc-ad81-6f03dfdc8427" {
+		t.Errorf("SessionID = %q（应取自 result.meta.agentMeta）", resp.SessionID)
+	}
+	if resp.Model != "MiniMax-M3" {
+		t.Errorf("Model = %q want MiniMax-M3", resp.Model)
+	}
+}
+
+func TestOpenClawGatewayStatusErrorSurfaces(t *testing.T) {
+	// Gateway 明确失败（status != ok）→ 错误里要带 status/summary，不许只说「找不到 envelope」
+	stdout := `{"runId":"x","status":"error","summary":"provider 鉴权失败"}`
+	if _, err := (&OpenClawEngine{}).parseStdout(stdout); err == nil {
+		t.Fatal("应报错")
+	} else if !strings.Contains(err.Error(), "status=error") || !strings.Contains(err.Error(), "provider 鉴权失败") {
+		t.Errorf("错误应带 status 与 summary, got %q", err.Error())
+	}
+}
+
+func TestIsOpenClawAuthFailure(t *testing.T) {
+	yes := []string{
+		"FailoverError: Authentication failed (provider returned HTTP 401).",
+		"401 invalid api key (2049)",
+		"error: Unauthorized",
+		"your provider token may have expired — re-authenticate this provider",
+	}
+	for _, s := range yes {
+		if !isOpenClawAuthFailure("", s) {
+			t.Errorf("应判为凭据失败: %q", s)
+		}
+	}
+	no := []string{
+		"openclaw: 会话已过期，无法续接",
+		"context deadline exceeded",
+		"gateway connect failed: connection refused",
+		"usage: input=1401 output=22", // 1401 里的 401 不是状态码
+	}
+	for _, s := range no {
+		if isOpenClawAuthFailure("", s) {
+			t.Errorf("不该判为凭据失败: %q", s)
+		}
+	}
+}

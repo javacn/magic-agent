@@ -35,6 +35,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -152,10 +153,37 @@ func streamArgsFor(e Engine) []string {
 		return []string{"stream-json"}
 	case *CodeBuddyEngine:
 		return []string{"stream-json"}
+	case *CodeBuddyAIEngine:
+		return []string{"stream-json"}
 	case *TraeEngine:
 		return []string{"stream-json"}
 	case *LLMEngine:
 		return []string{"stream"} // llm prompt 默认流式（纯文本 stdout）
+	case *DshEngine:
+		// dsh 默认走 SDK profile 的 stdio JSON-RPC（session.event 帧）：推理、正文
+		// 逐 step、工具调用都有；该 profile 不可用时回退 headless（只有推理增量走
+		// stderr、正文一次性走 stdout）。标 sdk-jsonrpc 便于排查时一眼看出这一族。
+		return []string{"sdk-jsonrpc"}
+	case *OpenClawEngine:
+		// openclaw 的流式走 **ACP**（`openclaw acp`，stdio + JSON-RPC，背后接本地 Gateway）：
+		// 正文逐字增量 + tool_call/tool_call_update（思考流协议侧不支持）。
+		// ⚠️ 它比别的引擎多一个外部依赖（Gateway 在跑 + ACP 桥的 scope 已批）：
+		// 桥不可用时 Stream 会**自动回退**内嵌一次性调用（见 openclaw_acp.go 文件头）。
+		return []string{"acp"}
+	case *ArkClawEngine:
+		// arkclaw 的流式走 A2A 官方的 **SSE** 通道（`message/stream`，text/event-stream）。
+		// ⚠️ 与「逐字」不是一回事：实测本网关只发「受理帧（working，空正文）+ 终帧
+		//（completed，整段正文）」两帧 —— 正文仍是一次性到达，见 arkclaw_stream.go 文件头。
+		// 标 sse 便于排查时一眼看出这一族（也是 WebSocket 走不通后的唯一正路）。
+		return []string{"sse"}
+	case *CodeBuddyGatewayEngine:
+		// codebuddy-gateway 也走 SSE（`GET /api/v1/runs/{runId}/stream`），但它同时是
+		// **非流式路径的唯一取文通道**（投递响应里没有正文），所以 --stream 与非 --stream
+		// 走的都是这条路。⚠️ 实测（2026-09-24）该网关目前只推终帧、**不发增量帧** ——
+		// 「流式」的成色与 arkclaw 一样是「整段到达」，别当成打字机；
+		// 增量解析已按协议实现，网关将来吐 chunk 时零改动即可接住。
+		// 见 codebuddy_gateway_stream.go 文件头。
+		return []string{"sse"}
 	}
 	return nil
 }
@@ -307,6 +335,123 @@ func runStreamCLIStdinReaderIn(ctx context.Context, dir string, extraEnv []strin
 		case <-time.After(10 * time.Second):
 		}
 		return fmt.Errorf("process group killed: %w", ctx.Err())
+	}
+}
+
+// runStreamStderrIn 启动 CLI 并把它的 **stderr 逐行回调**，收尾返回 stdout 全文与 stderr 全文。
+//
+// 为什么需要它（与上面几个 helper 正好相反）：其余引擎的增量走 stdout，
+// 而 dsh 的 headless 把**推理增量写到 stderr**（"dsh: reasoning:" 起头），
+// 最终正文才一次性打到 stdout。要把它接成 Streamer，就必须扫 stderr 而不是 stdout。
+//
+// 管道与 Wait 的处理沿用上面同一条经验（自建管道 + 自己 drain，不让 cmd.Wait 等
+// Go 的内部拷贝 goroutine，否则后代进程握着写端时 Wait 永不返回）。
+func runStreamStderrIn(ctx context.Context, dir string, bin string, args []string, onStderrLine func(line string) error) (string, string, error) {
+	cmd := newStreamCmdIn(dir, bin, args)
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return "", "", fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		return "", "", fmt.Errorf("stderr pipe: %w", err)
+	}
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
+	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		return "", "", err
+	}
+	notifySpawn(ctx, cmd.Process.Pid) // 会话登记表据此记住引擎子进程 pid
+	stdoutW.Close()                   // 父进程不再持有写端；EOF 只取决于子进程一侧
+	stderrW.Close()
+
+	// stdout 只做收集（最终正文），不逐行回调。
+	stdoutDone := make(chan error, 1)
+	go func() {
+		defer stdoutR.Close()
+		_, cerr := io.Copy(&stdoutBuf, stdoutR)
+		stdoutDone <- cerr
+	}()
+
+	// stderr 逐行扫 + 回调（推理增量）。
+	stderrDone := make(chan error, 1)
+	go func() {
+		defer stderrR.Close()
+		sc := bufio.NewScanner(stderrR)
+		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			stderrBuf.WriteString(line)
+			stderrBuf.WriteByte('\n')
+			if onStderrLine == nil {
+				continue
+			}
+			if herr := onStderrLine(line); herr != nil {
+				killProcessGroup(cmd)
+				stderrDone <- herr
+				return
+			}
+		}
+		stderrDone <- sc.Err()
+	}()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	// result 收尾：把两条管道读干净（都限时，防后代进程握着写端永久挂起），
+	// 再把缓冲里的内容交出去。
+	result := func(err error) (string, string, error) {
+		waitDrainedBounded(stderrDone, 5*time.Second)
+		waitDrainedBounded(stdoutDone, 5*time.Second)
+		return stdoutBuf.String(), stderrBuf.String(), err
+	}
+
+	select {
+	case werr := <-waitErr:
+		return result(werr)
+	case serr := <-stderrDone:
+		if serr == nil {
+			// stderr 先 EOF（罕见）：仍要等进程退出才算收尾。
+			select {
+			case werr := <-waitErr:
+				return result(werr)
+			case <-ctx.Done():
+				killProcessGroup(cmd)
+				return result(fmt.Errorf("process group killed: %w", ctx.Err()))
+			}
+		}
+		// 回调报错（或读流失败）：杀组后收尾。
+		killProcessGroup(cmd)
+		select {
+		case <-waitErr:
+		case <-time.After(10 * time.Second):
+		}
+		return result(serr)
+	case <-ctx.Done():
+		killProcessGroup(cmd)
+		select {
+		case <-waitErr:
+		case <-time.After(10 * time.Second):
+		}
+		return result(fmt.Errorf("process group killed: %w", ctx.Err()))
+	}
+}
+
+// waitDrainedBounded 等一个 drain goroutine 收尾，最多等 d（超时即放弃，防挂死）。
+func waitDrainedBounded(ch <-chan error, d time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(d):
 	}
 }
 

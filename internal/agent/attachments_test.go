@@ -108,13 +108,15 @@ func TestNewAttachmentFallsBackToExtension(t *testing.T) {
 
 func TestAttachmentSupportOf(t *testing.T) {
 	want := map[string]string{
-		"codex":     "flag:-i",
-		"claude":    "stdin:stream-json",
-		"codebuddy": "stdin:stream-json",
-		"llm":       "flag:-a",
-		"arkclaw":   "part:file",
-		"trae":      "prompt",
-		"openclaw":  "prompt",
+		"codex":        "flag:-i",
+		"claude":       "stdin:stream-json",
+		"codebuddy":    "stdin:stream-json",
+		"codebuddy-ai": "stdin:stream-json",
+		"llm":          "flag:-a",
+		"arkclaw":      "part:file",
+		"trae":         "prompt",
+		"openclaw":     "prompt",
+		"dsh":          "prompt",
 	}
 	for engine, w := range want {
 		if got := AttachmentSupportOf(engine); got != w {

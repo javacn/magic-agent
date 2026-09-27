@@ -103,9 +103,9 @@ func TestClaudePermissionModeMapping(t *testing.T) {
 	}
 }
 
-// TestPermissionSupportOf 能力表：只有 claude / codebuddy 接线。
+// TestPermissionSupportOf 能力表：只有 claude / codebuddy / codebuddy-ai 接线。
 func TestPermissionSupportOf(t *testing.T) {
-	for _, e := range []string{"claude", "codebuddy"} {
+	for _, e := range []string{"claude", "codebuddy", "codebuddy-ai"} {
 		if !PermissionSupported(e) {
 			t.Errorf("%s 应支持四档模型", e)
 		}
@@ -114,7 +114,7 @@ func TestPermissionSupportOf(t *testing.T) {
 		}
 	}
 	// 未接线的引擎必须报 none —— CLI 层据此 exit 2，而不是静默忽略。
-	for _, e := range []string{"trae", "llm", "codex", "openclaw", "arkclaw"} {
+	for _, e := range []string{"trae", "llm", "codex", "openclaw", "dsh", "arkclaw"} {
 		if PermissionSupported(e) {
 			t.Errorf("%s 不应报告支持四档模型", e)
 		}

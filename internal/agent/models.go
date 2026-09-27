@@ -8,11 +8,14 @@ package agent
 //	引擎      动态来源
 //	claude    ~/.claude/settings.json（顶层 model + env 里 ANTHROPIC_*_MODEL[*_NAME]）①
 //	codebuddy `codebuddy --help` 里 --model 描述自带的 "Currently supported: (...)" 清单
+//	          （codebuddy-ai 例外：扩展来源链 = 远程配置缓存 ∪ App 包 product.json ③）
 //	trae      `trae-cli models --json`
 //	llm       `llm models`（用户经 llm CLI 自注册的模型）
 //	codex     `codex debug models`（raw model catalog）
 //	openclaw  `openclaw models list --json`
 //	arkclaw   无 —— 模型由网关按 claw_id 绑定，返回 ErrNoModelSource ②
+//	dsh       `$DSH_HOME/settings.yaml` 里已配置的模型（llm-pi-ai.providers.<route>.models，
+//	          无则回落 agent-default-model）；输出 `route/model`，SDK 通道下就是 -m 的可取值
 //
 // ① claude 没有 models 子命令（--help 只有 agents/auth/doctor/mcp/plugin/
 //    project/... ），可用的模型标识只能从用户配置里读：settings.json 的
@@ -21,6 +24,12 @@ package agent
 //    MODEL / MODEL_NAME」过滤键名，不写死具体模型名。
 // ② 探测失败/无来源都不算致命：CLI 层把原因写进 models_note，models 字段
 //    留空（见 cli/root.go runEngines）。
+// ③ codebuddy-ai 的清单链（2026-09-21 定稿）：客户端合并配置缓存
+//    ~/.workbuddy-ai/cache/acc-product-config-v*.json（客户端模型选择器同源，
+//    27 条 = 23 预制 + 4 custom-local，含 deepseek-v4.1-flash / gpt-5.6-*）
+//    → 客户端未运行过时回退「远程配置缓存 ∪ App 包 product.json」超集近似
+//    → 回退 --help（4 个分层别名）。WorkBuddy 端不启用扩展链：其 --help 已是
+//    完整用户清单。
 //
 // 各引擎的 ListModels 都是**只读**子命令（不发起推理、不消耗额度），
 // 但会真的启动 CLI 进程（openclaw ~2.5s 最慢），因此探测并发执行、
@@ -31,7 +40,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -57,6 +69,39 @@ type ModelLister interface {
 func ModelListerOf(e Engine) ModelLister {
 	l, _ := e.(ModelLister)
 	return l
+}
+
+// ModelCreditLister 可选接口：引擎能给出各模型的**积分倍率**（与客户端计费口径
+// 一致）。返回 map[模型id]倍率，倍率是规范化后的数字字符串（客户端的
+// "x0.34 credits" / "x0.77" → "0.34" / "0.77"）；客户端不给倍率的模型
+// （如 custom-local）不出现在 map 里。探测失败 / 无来源返回 nil。
+type ModelCreditLister interface {
+	ModelCredits(ctx context.Context) map[string]string
+}
+
+// ModelCreditListOf 返回引擎的 ModelCreditLister 实现（未实现返回 nil）。
+func ModelCreditListOf(e Engine) ModelCreditLister {
+	l, _ := e.(ModelCreditLister)
+	return l
+}
+
+// parseCreditMultiplier 把客户端计费字段规范化成纯倍率数字字符串：
+//
+//	"x2.20 credits" -> "2.20"    "x0.77" -> "0.77"    "  X1.5 CREDITS " -> "1.5"
+//
+// 其他形态（空 / 缺 x / 非数字）返回 ""（该模型不计入倍率表）。
+func parseCreditMultiplier(raw string) string {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	s = strings.TrimSuffix(strings.TrimSpace(s), "credits")
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "x")
+	if s == "" {
+		return ""
+	}
+	if _, err := strconv.ParseFloat(s, 64); err != nil {
+		return ""
+	}
+	return s
 }
 
 // probeCLI 执行只读探测子命令并返回 stdout（stderr 只在失败时并入错误信息）。
@@ -206,6 +251,150 @@ func parseCodebuddyHelpModels(help string) []string {
 		rest = rest[:k]
 	}
 	return dedupeModels(strings.Split(rest, ","))
+}
+
+// productJSONPath 从 CLI 二进制位置推导同 App 包内的 product.json：
+//
+//	<App>.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy
+//	  -> <App>.app/Contents/Resources/app.asar.unpacked/cli/product.json
+//
+// 即上溯两层（bin/codebuddy → bin → cli）再拼 product.json。
+// 路径不匹配时返回的路径不存在，readProductJSONModels 会静默返回 nil。
+func productJSONPath(bin string) string {
+	if bin == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(filepath.Dir(bin)), "product.json")
+}
+
+// readProductJSONModels 读取并解析 App 包 product.json 的模型清单。
+// 任何失败（文件不存在 / 权限 / 格式变了）都返回 nil，由调用方回退 --help
+// —— product.json 是可选增强来源，不是硬依赖。
+func readProductJSONModels(path string) []string {
+	ids, _ := readProductJSONCatalog(path)
+	return ids
+}
+
+// readProductJSONCatalog 同上，但同时返回积分倍率表（parseProductJSONCatalog）。
+func readProductJSONCatalog(path string) ([]string, map[string]string) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	return parseProductJSONCatalog(data)
+}
+
+// parseProductJSONCatalog 抽取 product.json 形态配置的模型 id 与积分倍率：
+//
+//	{"models":[{"id":"gpt-5.5","name":"GPT-5.5","credits":"x3.31 credits",...},...]}
+//
+// 只取 id 与 credits（其余元数据 --engines 用不上）；保留文件内顺序；
+// id 去重；倍率经 parseCreditMultiplier 规范化，缺省/非法的不进倍率表。
+func parseProductJSONCatalog(data []byte) ([]string, map[string]string) {
+	var doc struct {
+		Models []struct {
+			ID      string `json:"id"`
+			Credits string `json:"credits"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, nil
+	}
+	var ids []string
+	credits := map[string]string{}
+	for _, m := range doc.Models {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+		if c := parseCreditMultiplier(m.Credits); c != "" {
+			credits[id] = c
+		}
+	}
+	ids = dedupeModels(ids)
+	if len(ids) == 0 {
+		// 空清单按「无来源」处理，调用方据此回退 --help（而非当成零个模型）。
+		return nil, nil
+	}
+	return ids, credits
+}
+
+// parseProductJSONModels 只取清单（积分倍率见 parseProductJSONCatalog）。
+func parseProductJSONModels(data []byte) []string {
+	ids, _ := parseProductJSONCatalog(data)
+	return ids
+}
+
+// readRemoteConfigCacheModels 读取 CodeBuddy 远程配置的本地缓存，返回其中
+// models[].id 的并集（积分倍率见 remoteConfigCacheCatalog）。
+func readRemoteConfigCacheModels(localStorageDir string) []string {
+	ids, _ := remoteConfigCacheCatalog(localStorageDir)
+	return ids
+}
+
+// remoteConfigCacheCatalog 同上，但同时返回各模型的积分倍率表。
+//
+// 客户端模型选择器的真实数据源是网关（CloudProductManager 经 /v3/config）下发的
+// 远程配置，落地在 <config_dir>/local_storage/entry_*.info：
+//
+//	[{"userId":"...","data":{"models":[{"id":"deepseek-v4.1-flash","credits":"x0.03",...},...],...}}, ...]
+//
+// 多账号条目取并集；同一模型多账号倍率不同时取先出现者。同目录还有其他形态的
+// 条目（feature-flags 对象、base64+gzip 大对象、坏文件），解析不进上面的结构
+// 就跳过。目录不存在 / 无可用条目 → (nil, nil)（调用方回退下一来源）。
+func remoteConfigCacheCatalog(localStorageDir string) ([]string, map[string]string) {
+	if localStorageDir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(localStorageDir)
+	if err != nil {
+		return nil, nil
+	}
+	var ids []string
+	credits := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".info") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(localStorageDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var docs []struct {
+			Data struct {
+				Models []struct {
+					ID      string `json:"id"`
+					Credits string `json:"credits"`
+				} `json:"models"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(data, &docs) != nil {
+			continue
+		}
+		for _, doc := range docs {
+			for _, m := range doc.Data.Models {
+				id := strings.TrimSpace(m.ID)
+				if id == "" {
+					continue
+				}
+				ids = append(ids, id)
+				if c := parseCreditMultiplier(m.Credits); c != "" {
+					if _, dup := credits[id]; !dup {
+						credits[id] = c
+					}
+				}
+			}
+		}
+	}
+	ids = dedupeModels(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return ids, credits
 }
 
 // parseLLMModelsText 解析 `llm models` 的纯文本输出：

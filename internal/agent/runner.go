@@ -59,12 +59,18 @@ func (r *Runner) defaultTimeout() time.Duration {
 		return DefaultClaudeTimeout
 	case *CodeBuddyEngine:
 		return DefaultCodeBuddyTimeout
+	case *CodeBuddyAIEngine:
+		return DefaultCodeBuddyTimeout // 同族 CLI，超时语义一致
 	case *TraeEngine:
 		return DefaultTraeTimeout
 	case *LLMEngine:
 		return DefaultLLMTimeout
 	case *ArkClawEngine:
 		return DefaultArkClawTimeout
+	case *CodeBuddyGatewayEngine:
+		return DefaultCBGatewayTimeout
+	case *DshEngine:
+		return DefaultDshTimeout
 	}
 	return 5 * time.Minute
 }

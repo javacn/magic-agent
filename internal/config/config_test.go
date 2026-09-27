@@ -269,6 +269,10 @@ func TestPathExpandsTilde(t *testing.T) {
 
 func TestPathUsesXDGConfigHome(t *testing.T) {
 	clearEnv(t)
+	// ⚠️ 必须把 HOME 指到空临时目录：探测链第 2 档是 `~/.magic-agent/config.json`，
+	// 而**开发机上这个文件是真实存在的**（用户 2026-09-23 定稿的新位置）——
+	// 不隔离 HOME，本用例就会拿真机文件当输入，在别人的机器上假红/假绿。
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdg")
 	if got, want := Path(), filepath.Join("/tmp/xdg", "magic-agent", "config.json"); got != want {
 		t.Errorf("Path() = %q want %q", got, want)
@@ -277,12 +281,95 @@ func TestPathUsesXDGConfigHome(t *testing.T) {
 
 func TestPathFallsBackToHomeConfig(t *testing.T) {
 	clearEnv(t)
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		t.Skip("无法取得 home 目录")
-	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	if got, want := Path(), filepath.Join(home, ".config", "magic-agent", "config.json"); got != want {
 		t.Errorf("Path() = %q want %q", got, want)
+	}
+}
+
+/* ~/.magic-agent/config.json 的优先级（2026-09-23 加，用户：「应该放在 ~/.magic-agent/ 下」）。
+ * 两条一起钉才有意义：**存在时用它**、**不存在时不顶掉老位置** ——
+ * 只钉前者会把「老配置被静默忽略」这个最坏的回归放过去。 */
+func TestPathPrefersMagicAgentHomeConfig(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	newPath := filepath.Join(home, ".magic-agent", "config.json")
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, []byte(`{"systemPrompt":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 老位置**同时存在**：新位置必须赢（否则「文件放对了却不生效」）。
+	oldDir := filepath.Join(home, ".config", "magic-agent")
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "config.json"), []byte(`{"systemPrompt":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := Path(); got != newPath {
+		t.Errorf("Path() = %q want %q（~/.magic-agent/config.json 存在时应优先）", got, newPath)
+	}
+}
+
+func TestPathKeepsOldLocationWhenNewMissing(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	old := filepath.Join(home, ".config", "magic-agent", "config.json")
+	if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, []byte(`{"systemPrompt":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 新位置**不存在** → 老位置必须照旧生效（不能因为「新位置优先」就把它顶掉）。
+	if got := Path(); got != old {
+		t.Errorf("Path() = %q want %q（新位置不存在时不许顶掉老位置）", got, old)
+	}
+}
+
+/* agents 数组的解析（2026-09-23）：两种写法都要认 —— 凭据内嵌在 URL 里 / 分开写字段；
+ * 键名别名与 arkclaw 节同一套（url/endpoint、key/apikey/api_key、claw_id/clawId/clawID）。 */
+func TestAgentsParsedWithBothCredentialStyles(t *testing.T) {
+	p := writeConfig(t, `{
+	  "agents": [
+	    { "name": "MagicAI", "url": "https://h/a2a/jsonrpc?apikey=K&clawId=C" },
+	    { "name": "Second", "endpoint": "https://h2/a2a/jsonrpc", "apikey": "K2", "clawId": "C2" }
+	  ]
+	}`)
+	c, err := LoadFrom(p)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if len(c.Agents) != 2 {
+		t.Fatalf("Agents = %d 条，want 2", len(c.Agents))
+	}
+	a := c.Agents[0]
+	if a.Name != "MagicAI" || a.URL != "https://h/a2a/jsonrpc?apikey=K&clawId=C" {
+		t.Errorf("第 1 条 = %+v（URL 里内嵌凭据的写法）", a)
+	}
+	b := c.Agents[1]
+	if b.Name != "Second" || b.URL != "https://h2/a2a/jsonrpc" || b.Key != "K2" || b.ClawID != "C2" {
+		t.Errorf("第 2 条 = %+v（字段分开写 + 别名 endpoint/apikey/clawId）", b)
+	}
+}
+
+func TestAgentsAbsentIsNotAnError(t *testing.T) {
+	// 老配置（没有 agents 节）必须照旧可用 —— 新增字段不许把存量配置打成「解析失败」。
+	p := writeConfig(t, `{"arkclaw":{"url":"u","key":"k","claw_id":"c"}}`)
+	c, err := LoadFrom(p)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if len(c.Agents) != 0 {
+		t.Errorf("Agents = %v，want 空", c.Agents)
+	}
+	if !c.ArkClaw.Ready() {
+		t.Error("arkclaw 节应照旧解析出来")
 	}
 }
 
