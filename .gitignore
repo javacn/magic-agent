@@ -10,3 +10,6 @@ config.json
 # 工作记忆 / agent 状态（与 magic-test 的 .gitignore 对齐）
 .workbuddy/
 .openclaw/
+
+# HTML 报告的导出 zip（是仓库里那些 .html 报告的副本，可重新生成）
+.trae-html-share-packages/
