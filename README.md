@@ -6,15 +6,11 @@
 
 | 能力 | 说明 |
 |------|------|
-| **多引擎统一调用** | `magic-agent -e claude\|codebuddy\|trae\|llm\|codex\|openclaw\|dsh\|arkclaw\|codebuddy-gateway ...` 一条命令，10 个引擎同一套参数（`-m` / `-s` / `--stream` / `--append` / `--max-tokens` / `--temperature` / `--json-schema`） |
-| **引擎与模型清单** | `magic-agent --engines` 输出当前可用的引擎 + 每个引擎的模型列表 + 积分倍率（`codebuddy` / `codebuddy-ai`）。详情见「`--engines`」一节 |
-| **一键安装 / 升级** | `--engines` 的 `install` 字段直接给 shell 命令，不可用的引擎拿去执行就装上，已装的引擎重跑就是升最新版 |
-| **流式输出** | `--stream` 走每引擎原生协议：claude / codebuddy 走 stream-json，openclaw 走 ACP，arkclaw / codebuddy-gateway 走 SSE，llm / trae / codex / dsh 走各自机制 |
-| **常驻会话 + 追加需求** | `--keep-alive` 默认开；中途补需求直接 `--append "再加点..."`，不用重启进程（claude / codebuddy / codebuddy-ai 支持） |
-| **多模态附件** | 图片 / 文件按各引擎原生通道送（claude / codebuddy / arkclaw 原生图片；trae / openclaw / dsh / codebuddy-gateway 把路径拼进 prompt） |
-| **用户选择** | 引擎里 `tool:AskUserQuestion` 触发的提问走统一 wire，CLI 端与上层 UI 共用同一个收口 |
-| **四档权限模型** | `--permission manual\|accept-edits\|auto\|full`，claude / codebuddy 直通，其它引擎明确报错不静默 |
-| **客户端契约面** | `magic-agent --contract` 给固定 schema（`contractVersion` + `engines[].capabilities`），桌面 / 移动客户端插件启动时按它做能力降级，不带不匹配的能力瞎跑 |
+| **多引擎统一调用** | 一条命令串起 claude / codebuddy / trae / llm / codex / openclaw / dsh / arkclaw / codebuddy-gateway 这十种后端，参数语义统一 |
+| **引擎与模型清单** | `--engines` 给出当前可用的引擎、模型列表与积分倍率；`install` 字段给出一键装/升级命令 |
+| **流式 + 追加需求** | `--stream` 走各引擎原生协议；`--keep-alive` / `--append` 支持常驻会话里中途补需求 |
+| **统一 wire** | 多模态附件、用户选择（`AskUserQuestion`）、四档权限模型都收成同一套协议，CLI 端与上层 UI 共用收口 |
+| **客户端契约面** | `--contract` 给固定 schema（`contractVersion` + `engines[].capabilities`），桌面 / 移动端插件启动时按它做能力降级 |
 
 ## 安装
 
