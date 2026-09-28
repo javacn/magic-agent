@@ -1,8 +1,20 @@
 # magic-agent
 
-专业的 agent CLI 代理工具 —— 把 **claude / codebuddy / trae / llm / codex / openclaw / dsh** 七家 CLI 与 **arkclaw**（A2A JSON-RPC 网关）、**codebuddy-gateway**（CodeBuddy Code HTTP 网关，webhook + SSE）的非交互调用统一成一条命令，提供一致的引擎/模型切换、超时与重试、固定输出格式与稳定退出码。适合脚本化编排与上层工具（如 magic-video）集成。
+统一的 agent CLI 代理 —— 把 **claude / codebuddy / trae / llm / codex / openclaw / dsh** 七家 CLI 与 **arkclaw**（A2A JSON-RPC 网关）、**codebuddy-gateway**（CodeBuddy Code HTTP 网关）的非交互调用收成一条命令，提供一致的引擎/模型切换、超时与重试、固定输出格式与稳定退出码。适合脚本化编排与上层工具集成。
 
-从 [magic-video](../magic-video) 的 `base/llm/codebuddy.go` / `base/llm/trae.go` / `base/engine.go` 剥离而来，独立演进。其中 `-e llm` 包装 [simonw/LLM](https://github.com/simonw/LLM) —— 用它屏蔽背后全部模型差异（OpenAI / Anthropic / MiniMax / ollama / 开源端点…），模型注册、密钥、端点全部由 llm 自管。
+## 能做什么
+
+| 能力 | 说明 |
+|------|------|
+| **多引擎统一调用** | `magic-agent -e claude\|codebuddy\|trae\|llm\|codex\|openclaw\|dsh\|arkclaw\|codebuddy-gateway ...` 一条命令，10 个引擎同一套参数（`-m` / `-s` / `--stream` / `--append` / `--max-tokens` / `--temperature` / `--json-schema`） |
+| **引擎与模型清单** | `magic-agent --engines` 输出当前可用的引擎 + 每个引擎的模型列表 + 积分倍率（`codebuddy` / `codebuddy-ai`）。详情见「`--engines`」一节 |
+| **一键安装 / 升级** | `--engines` 的 `install` 字段直接给 shell 命令，不可用的引擎拿去执行就装上，已装的引擎重跑就是升最新版 |
+| **流式输出** | `--stream` 走每引擎原生协议：claude / codebuddy 走 stream-json，openclaw 走 ACP，arkclaw / codebuddy-gateway 走 SSE，llm / trae / codex / dsh 走各自机制 |
+| **常驻会话 + 追加需求** | `--keep-alive` 默认开；中途补需求直接 `--append "再加点..."`，不用重启进程（claude / codebuddy / codebuddy-ai 支持） |
+| **多模态附件** | 图片 / 文件按各引擎原生通道送（claude / codebuddy / arkclaw 原生图片；trae / openclaw / dsh / codebuddy-gateway 把路径拼进 prompt） |
+| **用户选择** | 引擎里 `tool:AskUserQuestion` 触发的提问走统一 wire，CLI 端与上层 UI 共用同一个收口 |
+| **四档权限模型** | `--permission manual\|accept-edits\|auto\|full`，claude / codebuddy 直通，其它引擎明确报错不静默 |
+| **客户端契约面** | `magic-agent --contract` 给固定 schema（`contractVersion` + `engines[].capabilities`），桌面 / 移动客户端插件启动时按它做能力降级，不带不匹配的能力瞎跑 |
 
 ## 安装
 
@@ -136,12 +148,13 @@ $ magic-agent --engines --no-models     # 只列引擎与可用性，不启动�
 | `version` | **该引擎当前版本号**（2026-09-23 新增，尽力而为）：跑 `<bin> --version`，取**第一行**第一个 semver。拿不到（桌面端 GUI 应用不认 `--version`、llm 走 venv 脚本、A2A 网关无本机 CLI、`--no-models` 时跳过探测）就**不给**该字段 —— 是「升级到底有没有生效」的唯一依据，调用方**不许拿它当可用性判据** |
 | `models` | **该引擎当前支持的模型**（动态探测，见下） |
 | `models_note` | 拿不到 `models` 时的原因（无动态来源 / 探测失败） |
+| `model_credits` | **模型的积分倍率表**（model → 倍率数字字符串，如 `"fast-model":"0.34"`）。`codebuddy` / `codebuddy-ai` 给出，与 `models` 同源同链；其他引擎不给（客户端没计费口径）。客户端按这张表给模型加"限免/夜间免费"等角标与结算。 |
 | `workspace` | 「指定工作目录」的落地方式：`flag:-C`（codex）/ `cwd`（claude、codebuddy、trae、dsh）/ `none`（llm、arkclaw、openclaw、codebuddy-gateway） |
-| `streaming` | 是否支持 `--stream`（**10 个引擎都实现了 Streamer**，但「流式」的成色不同：dsh 走 SDK 通道时推理 / 正文 / 工具调用全流式，回退 headless 后只有推理增量、正文收尾一次性给出；openclaw 走 `openclaw acp`（见「openclaw 流式（ACP 桥）」）；arkclaw 走 A2A SSE 但**正文整段到达**（见「arkclaw 流式（A2A SSE）」）；codebuddy-gateway 也走 SSE，**实测同样只推终帧、正文整段到达**（见「codebuddy-gateway 引擎」）。openclaw 的 ACP 桥不可用时该字段会临时变 `false`） |
-| `attachments` | 「收附件」的落地方式：`flag:-i`（codex）/ `stdin:stream-json`（claude、codebuddy）/ `flag:-a`（llm）/ `part:file`（arkclaw）/ `prompt`（trae、openclaw、dsh、codebuddy-gateway，只能把路径写进提示词） |
-| `append` | 是否支持常驻会话 + 追加消息（`--keep-alive` / `--append`）：`claude` / `codebuddy` / `codebuddy-ai`（默认开）与 `dsh`（默认关，需显式 `--keep-alive`；靠 SDK 通道对同一会话继续 prompt） |
+| `streaming` | 是否支持 `--stream`。openclaw 走 `openclaw acp`（见「openclaw 流式（ACP 桥）」）；arkclaw 走 A2A SSE、codebuddy-gateway 走 SSE；openclaw 的 ACP 桥不可用时该字段临时变 `false` |
+| `attachments` | 「收附件」的落地方式：`stdin:stream-json`（claude、codebuddy，原生图片）/ `part:file`（arkclaw）/ `flag:-i`（codex）/ `flag:-a`（llm）/ `prompt`（trae、openclaw、dsh、codebuddy-gateway，把路径写进提示词） |
+| `append` | 是否支持常驻会话 + 追加消息（`--keep-alive` / `--append`）。`claude` / `codebuddy` / `codebuddy-ai` 默认开；`dsh` 默认关，需显式 `--keep-alive` |
 | `ask` | 「需要用户选择」的落地方式：`tool:AskUserQuestion`（claude、codebuddy）/ `none`（其余）。见「需要用户选择」 |
-| `permission` | 四档权限模型（`manual` / `accept-edits` / `auto` / `full`）的落地方式：`flag:--permission-mode`（claude、codebuddy）/ `none`（其余引擎传 `--permission` 会 exit 2 报错）。见「四档权限模型」 |
+| `permission` | 四档权限模型（`manual` / `accept-edits` / `auto` / `full`）。`claude` / `codebuddy` 走 `--permission-mode`；其他引擎无原生权限档，传 `--permission` 会报错。见「四档权限模型」 |
 | `capabilities` | **该引擎的静态能力 id 集合**（字典序、无重复；`--contract` 与 `--engines` 都给）。它回答「**能做什么**」，与上表那些回答「此刻如何」的字段（`ok` / `streaming` / `models` / `version`）严格分开 —— 客户端按 `capabilities` 定界面形态，按运行态字段定按钮可用与降级提示。id 与推导见 `internal/agent/capability.go`：`session.stream` / `session.append` / `session.ask` / `session.permission` / `workspace.select` / `attachment.native` / `attachment.prompt` / `model.list` / `model.credits` / `engine.install` |
 
 `--json` 为兼容旧调用保留（行为相同）。
