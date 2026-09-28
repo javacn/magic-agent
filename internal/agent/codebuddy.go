@@ -10,9 +10,13 @@ package agent
 // 两者同为 CodeBuddy Code v2.x：非交互协议与 claude 同源、flag 面一致、Bearer 令牌
 // 各自独立。模型注册表按后端不同：
 //
-//	WorkBuddy  hy3 / glm / kimi / deepseek 等国内模型（--help 动态下发，23 条）
+//	WorkBuddy  hy3 / glm / kimi / deepseek 等国内模型（清单同下）
 //	AI 端      客户端所见 ~23 个预制模型（分层别名 + gpt-5.x/5.6 + deepseek-v4.1-flash
 //	           等；--help 只有 4 个分层别名，完整清单见 listModels 的三级来源链）
+//
+// 两端的**清单与积分倍率现已同源同链**（都走扩展链，见 listModels）——此前只有
+// codebuddy-ai 启用，codebuddy 的清单按 --help、倍率按 acc 缓存，导致同一引擎的
+// models / model_credits 读自两个文件、官方预制模型大面积缺失（见 listModels）。
 //
 // codebuddy-ai 默认不强制 --model（交 CLI 自身默认，旧静态清单里的 kimi-k3-1 等
 // 实测被国际后端 400 拒绝）。
@@ -75,10 +79,10 @@ type codebuddyCore struct {
 	// extraEnv 追加给子进程的环境变量（Go exec：重复 key 取最后 → 覆盖继承值）。
 	// codebuddy-ai 用它把 CODEBUDDY_CONFIG_DIR 指向独立配置目录（见 codebuddyAIExtraEnv）。
 	extraEnv []string
-	// extendedModelSources 启用扩展模型清单来源（仅 codebuddy-ai）：
-	// ① AI 桌面客户端合并配置缓存 acc-product-config（客户端模型选择器同源，
-	// 见 codebuddyAIAccConfigPath）→ ② 远程配置缓存 ∪ App 包 product.json
-	// → ③ --help。WorkBuddy 端不启用。
+	// extendedModelSources 启用扩展模型清单来源（两个 codebuddy 引擎均为 true）：
+	// ① 桌面客户端合并配置缓存 acc-product-config（客户端模型选择器同源，
+	// 见 codebuddyAIAccConfigPath / codebuddyAccConfigPath）→ ② 远程配置缓存
+	// ∪ App 包 product.json → ③ --help。
 	extendedModelSources bool
 	// modelCacheDirs 远程配置缓存的 local_storage 目录（按优先级），两个用途：
 	// extendedModelSources=true 时是扩展清单链 ②；一律用于 modelCredits 的兜底 ②
@@ -107,14 +111,26 @@ func (c codebuddyCore) detect() (bool, string) {
 	return true, p + " (default model: " + c.model + ")"
 }
 
-// extendedModelCatalog 扩展来源链（仅 codebuddy-ai 启用）：返回（模型清单, 积分倍率表, 是否命中）。
+// selectorModels 返回客户端模型选择器的显式清单（agents[].models），取自优先级最高的
+// 远程配置缓存目录；没有则返回 nil（**无权威清单** → acc 缓存不过滤，宁可多不可少）。
+func (c codebuddyCore) selectorModels() []string {
+	for _, dir := range c.modelCacheDirs {
+		if ids, ok := agentSelectorModels(dir); ok {
+			return ids
+		}
+	}
+	return nil
+}
+
+// extendedModelCatalog 扩展来源链（两个 codebuddy 引擎均启用）：返回（模型清单, 积分倍率表, 是否命中）。
 //
-// ① 客户端合并配置缓存 acc-product-config（客户端模型选择器同源，清单与倍率同文件）
+// ① 客户端合并配置缓存 acc-product-config（注册表），按**客户端选择器清单**
+//    agents[].models 过滤（见 agentSelectorModels / readAccCatalog）
 // ② 远程配置缓存 ∪ App 包 product.json（超集近似，含国内后端条目）
 //
 // 命中 ① 时 ② 不再叠加 —— ① 就是客户端所见，别无二义。倍率表与清单同源同链。
 func (c codebuddyCore) extendedModelCatalog(bin string) ([]string, map[string]string, bool) {
-	if ids, credits := readProductJSONCatalog(c.accConfigPath); len(ids) > 0 {
+	if ids, credits := readAccCatalog(c.accConfigPath, c.selectorModels()); len(ids) > 0 {
 		return ids, credits, true
 	}
 	var ids []string
@@ -145,13 +161,12 @@ func (c codebuddyCore) extendedModelCatalog(bin string) ([]string, map[string]st
 // modelCredits 返回各模型的**积分倍率表**（model → 规范化数字字符串，如 "0.34"，
 // 源自客户端 "x0.34 credits"）。来源链与 extendedModelCatalog 完全一致
 // （① acc 缓存 → ② 远程配置缓存 ∪ ③ App 包 product.json），但**只取倍率、
-// 不改变模型清单来源**：codebuddy-ai 的清单本来就走同一条扩展链；codebuddy 的
-// 清单仍按 --help（见 listModels），倍率单独补齐 —— 两张表按 model id 对上，
-// acc 缓存里多出的条目（清单里没有的模型）自然不会被任何清单引用。
+// 不改变模型清单来源**：两个引擎的清单都走同一条扩展链（见 listModels），
+// 倍率表与清单同源同链、按 model id 对上。
 func (c codebuddyCore) modelCredits(bin string) map[string]string {
 	// ① 客户端合并配置缓存（与 extendedModelCatalog 同源同语义：**有模型即钉死**，
 	// 哪怕一条倍率都没有也不穿透 ②③ 去混别处的倍率 —— 客户端不给就是不显示）
-	if ids, credits := readProductJSONCatalog(c.accConfigPath); len(ids) > 0 {
+	if ids, credits := readAccCatalog(c.accConfigPath, c.selectorModels()); len(ids) > 0 {
 		if len(credits) == 0 {
 			return nil
 		}
@@ -181,17 +196,25 @@ func (c codebuddyCore) modelCredits(bin string) map[string]string {
 
 // listModels 实现 ModelLister 的共享逻辑。
 //
-// 两个来源策略，按引擎择一：
+// 两个引擎**同一条三级来源链**：
 //
-//	codebuddy      --help 里 --model 描述自带的 "Currently supported: (...)" 清单
-//	codebuddy-ai  客户端合并配置缓存 acc-product-config（客户端同源）
-//	              → 客户端未运行过时回退「远程配置缓存 ∪ product.json」
-//	              → 再回退 --help（只有 4 个分层别名）
+//	① 客户端合并配置缓存 acc-product-config（客户端模型选择器同源）
+//	② 远程配置缓存 ∪ App 包 product.json（超集近似）
+//	③ --help 里 --model 描述自带的 "Currently supported: (...)" 清单
 //
-// 实测（2026-09-21）：AI 端各单一来源都不等于客户端所见 —— acc 缓存 27 条
-// （23 预制 + 4 custom-local，含 deepseek-v4.1-flash / gpt-5.6-*）才是客户端
-// 模型选择器的真实数据源；远程配置缓存（52 条）混着国内后端条目但没有 gpt；
-// product.json（26 条）没有 deepseek-v4.1-flash；--help 只有 4 个分层别名。
+// 命中 ① 时 ② 不再叠加 —— ① 就是客户端所见，别无二义。
+//
+// 实测（2026-09-21 / 2026-09-28）：
+//
+//   - AI 端 acc 缓存 27 条（23 预制 + 4 custom-local，含 deepseek-v4.1-flash /
+//     gpt-5.6-*）；远程配置缓存（52 条）混着国内后端条目但没有 gpt；product.json
+//     （26 条）没有 deepseek-v4.1-flash；--help 只有 4 个分层别名。
+//   - WorkBuddy 端 acc 缓存 61 条（53 预制 + 8 custom-local）。**--help 只有 17 条**
+//     （9 预制 + 全部 8 个 custom-local）—— 官方预制只放行 9 个、且恰好不是客户端
+//     主力模型（hy3 / hy4-preview / deepseek-v4.1-flash / glm-5.3 全部不在内）。
+//     故 2026-09-28 起两端一致走扩展链：此前 codebuddy 只按 --help 出清单、倍率却按
+//     acc 缓存取，同一引擎两个字段读自两个文件，`model_credits` 里能查到倍率而
+//     `models` 里查不到该模型。
 //
 // ⚠️ --help 路径必须带 extraEnv：清单由登录后端下发，跟随配置目录。不带隔离
 // 环境时 codebuddy-ai 会读到共享 ~/.codebuddy 里 WorkBuddy 后端的清单。
@@ -276,7 +299,7 @@ func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request,
 	if err != nil {
 		return Response{}, err
 	}
-	acc := &streamAccumulator{Engine: c.name}
+	acc := &streamAccumulator{Engine: c.name, OnSessionID: req.OnSessionID}
 	var fin streamJSONResult
 	seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, strings.NewReader(stdin), acc, &fin)
 	if err != nil {
@@ -386,7 +409,7 @@ func (c codebuddyCore) stream(ctx context.Context, req Request, onEvent func(Str
 			stdin = strings.NewReader(line)
 		}
 		args = streamJSONArgs(c.buildArgsBase(req), prompt, true)
-		acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent}
+		acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent, OnSessionID: req.OnSessionID}
 		var fin streamJSONResult
 		seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, stdin, acc, &fin)
 		if err != nil {
@@ -493,16 +516,18 @@ const DefaultCodeBuddyTimeout = 5 * time.Minute
 const DefaultCodeBuddyModel = "hy3"
 
 // core 返回共享实现核心。
-// 扩展清单链（extendedModelSources）不启用：codebuddy 的模型清单按 --help
-// （见 listModels 的说明）；积分倍率走 modelCredits（来源见 codebuddyAccConfigPath）。
+// 扩展清单链（extendedModelSources）启用：与 codebuddy-ai 同源同链，清单按
+// acc 缓存（客户端模型选择器真实数据源）→ 远程配置缓存 ∪ product.json → --help；
+// 积分倍率走 modelCredits（同一条链，见 codebuddyAccConfigPath）。
 func (e *CodeBuddyEngine) core() codebuddyCore {
 	return codebuddyCore{
-		name:           "codebuddy",
-		base:           codebuddyBase,
-		binPath:        e.BinPath,
-		model:          DefaultCodeBuddyModel,
-		accConfigPath:  codebuddyAccConfigPath(),
-		modelCacheDirs: codebuddyModelCacheDirs(),
+		name:                 "codebuddy",
+		base:                 codebuddyBase,
+		binPath:              e.BinPath,
+		model:                DefaultCodeBuddyModel,
+		extendedModelSources: true,
+		accConfigPath:        codebuddyAccConfigPath(),
+		modelCacheDirs:       codebuddyModelCacheDirs(),
 	}
 }
 
@@ -650,10 +675,16 @@ func codebuddyAIModelCacheDirs() []string {
 	return dirs
 }
 
-// codebuddyModelCacheDirs 返回 codebuddy（非 ai）倍率兜底的远程配置缓存目录。
-// 引擎自身不注入 CODEBUDDY_CONFIG_DIR；用户显式设置时只信该目录（与 CLI 的
-// 实际读取一致），否则共享 ~/.codebuddy（桌面 daemon 持续把网关下发的远程
-// 配置刷在那里，实测 2026-09-21）。只读缓存文件，不触碰凭据。
+// codebuddyModelCacheDirs 返回 codebuddy（非 ai）远程配置缓存目录，**按可信度排序**。
+// 引擎自身不注入 CODEBUDDY_CONFIG_DIR；用户显式设置时只信该目录（与 CLI 的实际
+// 读取一致）。只读缓存文件，不触碰凭据。
+//
+// ⚠️ 首选 `~/.workbuddy/local_storage`（**与 acc 缓存同源**，客户端当前账号正在
+// 持续刷它，实测 10:48 更新），共享 `~/.codebuddy/local_storage` 只作兜底：那里
+// 可能还留着**别的账号**的旧条目（实测同一份 d43e… 缓存里 userId=f231e9af 的
+// 清单是 hy4-preview-f、ed6c16d4 的是 hy4-preview，mtime 相同）。选择器清单按本
+// 目录优先级取「mtime 最新那一条」，所以目录顺序 = 账号可信度顺序，错了会把
+// 上一账号的型号混进 -m 清单。
 func codebuddyModelCacheDirs() []string {
 	if dir := os.Getenv("CODEBUDDY_CONFIG_DIR"); dir != "" {
 		return []string{filepath.Join(dir, "local_storage")}
@@ -662,7 +693,12 @@ func codebuddyModelCacheDirs() []string {
 	if err != nil || home == "" {
 		home = os.Getenv("HOME")
 	}
-	return []string{filepath.Join(home, ".codebuddy", "local_storage")}
+	own := filepath.Join(home, ".workbuddy", "local_storage")
+	shared := filepath.Join(home, ".codebuddy", "local_storage")
+	if shared != own {
+		return []string{own, shared}
+	}
+	return []string{own}
 }
 
 // codebuddyAIDir codebuddy-ai 引擎的专用配置目录（~/.codebuddy-ai）。

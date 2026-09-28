@@ -12,6 +12,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -214,7 +215,12 @@ func TestEngineListModelsWithFakeCLI(t *testing.T) {
 
 // 探测失败（CLI 报错 / 输出里没有清单）必须报错而非返回空清单。
 func TestEngineListModelsFailures(t *testing.T) {
-	// --help 里没有 "Currently supported" → ErrNoModelSource 语义的错误。
+	// 隔离 HOME 与配置目录：codebuddy 的清单现在先读扩展来源（acc 缓存 /
+	// 远程配置缓存），不隔离会吃到真机的 ~/.workbuddy 缓存而"意外成功"。
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEBUDDY_CONFIG_DIR", filepath.Join(t.TempDir(), "cfg"))
+
+	// 三级来源全空、--help 里也没有 "Currently supported" → ErrNoModelSource 语义的错误。
 	w, _ := argsCaptureCLI(t, t.TempDir(), "codebuddy", `echo 'no model list'`)
 	if _, err := (&CodeBuddyEngine{BinPath: w.bin}).ListModels(context.Background()); err == nil {
 		t.Error("codebuddy without list should error")
@@ -378,7 +384,11 @@ func TestCodeBuddyListModelsAccConfig(t *testing.T) {
 	  {"id":"gpt-5.5","credits":"x3.31"},{"id":"gpt-6-astra","credits":"x6.67"},{"id":"custom-local:MiniMax-M3"}
 	]}`
 	// 旧版本的清单不同，用于验证「取 mtime 最新」。
-	accV2 := `{"models":[{"id":"stale-model"}]}`
+	accV2 := `{"models":[{"id":"stale-model","credits":"x1.11"}]}`
+
+	// 客户端选择器清单（agents[].models）：acc 清单按它过滤，只留客户端展示的
+	// 具名模型 + custom-local:*。stale-model 也列进来，供 B) 用。
+	writeSelectorList(t, ".codebuddy-ai", "fast-model", "deepseek-v4.1-flash", "gpt-5.5", "gpt-6-astra", "stale-model")
 
 	// A) acc 缓存命中 → 精确返回客户端清单（哪怕远程配置缓存 / product.json
 	//    里有别的模型也不并入）；ModelCredits 给出规范化倍率，custom-local 不进表。
@@ -404,7 +414,7 @@ func TestCodeBuddyListModelsAccConfig(t *testing.T) {
 		t.Error("acc 缓存命中时不应启动 CLI 取 --help")
 	}
 
-	// B) 只有旧版本 → 一样生效（glob 不写死版本号）；无倍率字段 → ModelCredits 为 nil。
+	// B) 只有旧版本 → 一样生效（glob 不写死版本号）。
 	if err := os.Remove(filepath.Join(cacheDir, "acc-product-config-v3.json")); err != nil {
 		t.Fatal(err)
 	}
@@ -415,13 +425,41 @@ func TestCodeBuddyListModelsAccConfig(t *testing.T) {
 	if !equalStrings(got, []string{"stale-model"}) {
 		t.Errorf("v2-only got %v", got)
 	}
-	if gotC := ai.ModelCredits(context.Background()); gotC != nil {
-		t.Errorf("v2-only ModelCredits = %v want nil", gotC)
+
+	// C) acc 缓存按**客户端选择器清单**过滤：清单外的条目（补全 codewise-* /
+	//    图像 hunyuan-image-* / 历史别名 default-1.* …）不进清单 —— 全量注册表
+	//    铺给 -m 会比客户端多太多。过滤后一条不剩按「无来源」处理，回退下一级
+	//    来源（这里是 product.json）。
+	accNoise := `{"models":[{"id":"codewise-completions"},{"id":"hunyuan-image-alpha"},
+	  {"id":"default-1.1"},{"id":"kimi-k2-instruct-taiji"}]}`
+	writeAcc("acc-product-config-v3.json", accNoise, time.Now())
+	got, err = ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(noise): %v", err)
+	}
+	if !equalStrings(got, []string{"gpt-5.5"}) {
+		t.Errorf("清单外的补全/图像/别名应被剔除，实际 got %v", got)
+	}
+
+	// D) 混合：选择器内的具名模型 + custom-local 保留，清单外的剔除，倍率表同步收窄。
+	writeSelectorList(t, ".codebuddy-ai", "hy3", "glm-5.3")
+	accMixed := `{"models":[{"id":"hy3","credits":"x0.00"},{"id":"codewise-jump"},
+	  {"id":"custom-local:MiniMax-M3"},{"id":"glm-5.3","credits":"x0.79"}]}`
+	writeAcc("acc-product-config-v3.json", accMixed, time.Now())
+	got, err = ai.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(mixed): %v", err)
+	}
+	if !equalStrings(got, []string{"hy3", "custom-local:MiniMax-M3", "glm-5.3"}) {
+		t.Errorf("mixed got %v", got)
+	}
+	if gotC := ai.ModelCredits(context.Background()); !equalMaps(gotC, map[string]string{"hy3": "0.00", "glm-5.3": "0.79"}) {
+		t.Errorf("mixed ModelCredits = %v", gotC)
 	}
 }
 
-// codebuddy-ai 的清单链：远程配置缓存 ∪ product.json → 都没有时回退 --help；
-// WorkBuddy 端两条扩展来源都不启用。
+// codebuddy 两端的清单链：acc 缓存 → 远程配置缓存 ∪ product.json → 回退 --help。
+// 2026-09-28 起 codebuddy（WorkBuddy 端）也启用扩展链，故 D 段与 AI 端同构。
 func TestCodeBuddyListModelsProductJSON(t *testing.T) {
 	// 隔离 HOME：扩展来源扫 ~/.codebuddy-ai 与 ~/.codebuddy 的缓存，不隔离会吃到真机缓存。
 	t.Setenv("HOME", t.TempDir())
@@ -491,18 +529,71 @@ func TestCodeBuddyListModelsProductJSON(t *testing.T) {
 		t.Errorf("fallback got %v", got)
 	}
 
-	// D) WorkBuddy 端：缓存和 product.json 就在旁边也必须忽略，走 --help。
-	writeCache(sharedCache, cacheBody)
+	// D) WorkBuddy 端（2026-09-28 起与 AI 端同链）：先 acc 缓存（客户端同源），
+	//    按选择器清单过滤，命中即独占、不并入 ②、也不启动 CLI —— 官方预制模型
+	//    （hy3 / deepseek-v4.1-flash）只能从这里来，--help 的清单里并没有。
+	wbAccBody := `{"models":[
+	  {"id":"hy3","credits":"x0.00"},{"id":"hy4-preview","credits":"x0.29"},
+	  {"id":"deepseek-v4.1-flash","credits":"x0.11"},{"id":"codewise-jump"},
+	  {"id":"custom-local:MiniMax-M3.1-Flash-Preview"}
+	]}`
+	wbAccDir := filepath.Join(os.Getenv("HOME"), ".workbuddy", "cache")
+	if err := os.MkdirAll(wbAccDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wbAccDir, "acc-product-config-v3.json"), []byte(wbAccBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 选择器清单里没有 codewise-jump（行内补全）→ 应被剔除。
+	writeSelectorList(t, ".workbuddy", "hy3", "hy4-preview", "deepseek-v4.1-flash")
 	const wbHelp = `Options:
   --model <model>  Model ID. Currently supported: (auto, hy3, glm-5.3)
 `
-	binWB, _ := appPkgCLI(t, wbHelp, aiProduct)
-	got, err = (&CodeBuddyEngine{BinPath: binWB}).ListModels(context.Background())
+	binWB, wbArgsLog := appPkgCLI(t, wbHelp, aiProduct)
+	cbWB := &CodeBuddyEngine{BinPath: binWB}
+	got, err = cbWB.ListModels(context.Background())
 	if err != nil {
-		t.Fatalf("ListModels(workbuddy): %v", err)
+		t.Fatalf("ListModels(workbuddy acc): %v", err)
+	}
+	wantWB := []string{"hy3", "hy4-preview", "deepseek-v4.1-flash", "custom-local:MiniMax-M3.1-Flash-Preview"}
+	if !equalStrings(got, wantWB) {
+		t.Errorf("workbuddy acc got %v want %v", got, wantWB)
+	}
+	// 倍率与清单同源同链：acc 里的 custom-local 无倍率则不进表，官方四条都在。
+	if gotC := cbWB.ModelCredits(context.Background()); !equalMaps(gotC, map[string]string{
+		"hy3": "0.00", "hy4-preview": "0.29", "deepseek-v4.1-flash": "0.11",
+	}) {
+		t.Errorf("workbuddy ModelCredits = %v", gotC)
+	}
+	if _, err := os.Stat(wbArgsLog); err == nil {
+		t.Error("workbuddy 命中 acc 缓存时不应启动 CLI 取 --help")
+	}
+
+	// D2) workbuddy 的 acc 缺席 → 回退 ② 远程配置缓存 ∪ product.json（仍不启 CLI）。
+	//    sharedCache 在 B) 已被删掉，这里先写回来（② 的远程配置缓存那一路）。
+	if err := os.RemoveAll(wbAccDir); err != nil {
+		t.Fatal(err)
+	}
+	writeCache(sharedCache, cacheBody)
+	got, err = cbWB.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(workbuddy ②): %v", err)
+	}
+	if !equalStrings(got, []string{"deepseek-v4.1-flash", "auto", "hy3", "fast-model", "gpt-5.5", "gemini-3.1-pro", "deepseek-v3-2-volc"}) {
+		t.Errorf("workbuddy ② got %v", got)
+	}
+
+	// D3) acc 与 ② 都没有 → 末级兜底 --help（此时才启动 CLI）。
+	binWB3, _ := appPkgCLI(t, wbHelp, "")
+	if err := os.RemoveAll(sharedCache); err != nil {
+		t.Fatal(err)
+	}
+	got, err = (&CodeBuddyEngine{BinPath: binWB3}).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels(workbuddy --help): %v", err)
 	}
 	if !equalStrings(got, []string{"auto", "hy3", "glm-5.3"}) {
-		t.Errorf("workbuddy got %v", got)
+		t.Errorf("workbuddy --help got %v", got)
 	}
 
 	// E) 用户显式设置 CODEBUDDY_CONFIG_DIR：只信该目录，共享缓存不兜底。
@@ -518,9 +609,10 @@ func TestCodeBuddyListModelsProductJSON(t *testing.T) {
 	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
 }
 
-// codebuddy（非 ai）的倍率链：acc 缓存（~/.workbuddy）→ 远程配置缓存 ∪ product.json；
-// **清单始终按 --help**（扩展清单链不启用 —— 与 codebuddy-ai 的关键差异）。
-// 同时验证 ModelCredits 全程不启动 CLI（倍率只读缓存文件）。
+// codebuddy（非 ai）的清单 / 倍率链：acc 缓存（~/.workbuddy）→ 远程配置缓存 ∪
+// product.json → --help。**两端同链**（2026-09-28 起 codebuddy 也启用扩展清单链：
+// 此前它只按 --help 出清单、倍率却按 acc 缓存取，同一引擎两个字段读自两个文件）。
+// 同时验证清单与倍率全程不启动 CLI（acc 命中时只读缓存文件）。
 func TestCodeBuddyModelCredits(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CODEBUDDY_CONFIG_DIR", "")
@@ -548,37 +640,39 @@ func TestCodeBuddyModelCredits(t *testing.T) {
 		}
 	}
 
-	// A) acc 缓存命中 → 倍率只来自 acc（hy3=0.00，而非缓存 9.99 / product 7.77）；
-	//    acc 里清单外的模型（only-in-acc）照常进表；**清单仍是 --help 的**。
+	// A) acc 缓存命中 → 清单与倍率**同源**（2026-09-28 起两端一致，都按 acc）：
+	//    倍率只来自 acc（hy3=0.00，而非缓存 9.99 / product 7.77）；acc 独占、
+	//    不并入 ②，且不启动 CLI。清单按选择器清单过滤：only-in-acc 不在客户端
+	//    选择器里 → 剔除（这正是「比客户端多太多」的根因）。
 	writeFile(filepath.Join(accDir, "acc-product-config-v3.json"), accBody)
 	writeFile(filepath.Join(sharedCache, "entry_cache.info"), cacheBody)
+	writeSelectorList(t, ".workbuddy", "hy3", "fast-model", "balanced-model")
 	bin, argsLog := appPkgCLI(t, help, product)
 	cb := &CodeBuddyEngine{BinPath: bin}
 	got, err := cb.ListModels(context.Background())
 	if err != nil {
 		t.Fatalf("ListModels: %v", err)
 	}
-	if !equalStrings(got, []string{"hy3", "fast-model", "deep-model"}) {
-		t.Errorf("清单应仍按 --help，got %v", got)
+	if !equalStrings(got, []string{"hy3", "fast-model", "balanced-model"}) {
+		t.Errorf("清单应按 acc 缓存 ∩ 选择器清单，got %v", got)
 	}
-	wantA := map[string]string{"hy3": "0.00", "fast-model": "0.34", "balanced-model": "0.65", "only-in-acc": "1.00"}
+	wantA := map[string]string{"hy3": "0.00", "fast-model": "0.34", "balanced-model": "0.65"}
 	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantA) {
 		t.Errorf("ModelCredits = %v want %v", gotC, wantA)
 	}
-	// ModelCredits 不应再启动 CLI：argsLog 还是 ListModels 那一次的（mtime 不变）。
-	fiBefore, err := os.Stat(argsLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotC := cb.ModelCredits(context.Background()); !equalMaps(gotC, wantA) {
-		t.Errorf("ModelCredits(2) = %v want %v", gotC, wantA)
-	}
-	if fiAfter, err := os.Stat(argsLog); err != nil || !fiAfter.ModTime().Equal(fiBefore.ModTime()) {
-		t.Errorf("ModelCredits 不应启动 CLI（argsLog mtime 变了）: %v / %v", fiAfter, err)
+	// 清单与倍率都不应启动 CLI（acc 命中，压根用不到 --help）。
+	if _, err := os.Stat(argsLog); err == nil {
+		t.Error("acc 命中时不应启动 CLI")
 	}
 
 	// B) acc 缺席 → 远程配置缓存 ∪ product.json 合并（缓存优先：hy3 取 9.99）。
+	//    选择器目录也删掉：避免 A 段的选择器清单继续命中（acc 已删，readAccCatalog
+	//    应直接回退 ②，否则选择器变成 ①→② 之间的伪来源）。
 	if err := os.RemoveAll(accDir); err != nil {
+		t.Fatal(err)
+	}
+	selectorDir := filepath.Join(os.Getenv("HOME"), ".workbuddy", "local_storage")
+	if err := os.RemoveAll(selectorDir); err != nil {
 		t.Fatal(err)
 	}
 	wantB := map[string]string{"hy3": "9.99", "fast-model": "1.23"}
@@ -599,6 +693,25 @@ func TestCodeBuddyModelCredits(t *testing.T) {
 	bin2, _ := appPkgCLI(t, help, "")
 	if gotC := (&CodeBuddyEngine{BinPath: bin2}).ModelCredits(context.Background()); gotC != nil {
 		t.Errorf("ModelCredits(empty) = %v want nil", gotC)
+	}
+}
+
+// writeSelectorList 在 <home>/<appHome>/local_storage/entry_selector.info 写下客户端
+// 模型选择器清单（agents[].models，acc 清单按它过滤 —— 见 agentSelectorModels）。
+// appHome 传 ".workbuddy" 或 ".workbuddy-ai"。
+func writeSelectorList(t *testing.T, appHome string, models ...string) {
+	t.Helper()
+	dir := filepath.Join(os.Getenv("HOME"), appHome, "local_storage")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := json.Marshal(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `[{"userId":"u1","data":{"agents":[{"modelTags":["craft"],"models":` + string(ids) + `}]}}]`
+	if err := os.WriteFile(filepath.Join(dir, "entry_selector.info"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

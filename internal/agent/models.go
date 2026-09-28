@@ -7,8 +7,9 @@ package agent
 //
 //	引擎      动态来源
 //	claude    ~/.claude/settings.json（顶层 model + env 里 ANTHROPIC_*_MODEL[*_NAME]）①
-//	codebuddy `codebuddy --help` 里 --model 描述自带的 "Currently supported: (...)" 清单
-//	          （codebuddy-ai 例外：扩展来源链 = 远程配置缓存 ∪ App 包 product.json ③）
+//	codebuddy 扩展来源链（两端同链 ③）：客户端合并配置缓存 acc-product-config
+//	          → 远程配置缓存 ∪ App 包 product.json → `codebuddy --help` 的
+//	          "Currently supported: (...)" 清单（末级兜底）
 //	trae      `trae-cli models --json`
 //	llm       `llm models`（用户经 llm CLI 自注册的模型）
 //	codex     `codex debug models`（raw model catalog）
@@ -24,12 +25,15 @@ package agent
 //    MODEL / MODEL_NAME」过滤键名，不写死具体模型名。
 // ② 探测失败/无来源都不算致命：CLI 层把原因写进 models_note，models 字段
 //    留空（见 cli/root.go runEngines）。
-// ③ codebuddy-ai 的清单链（2026-09-21 定稿）：客户端合并配置缓存
-//    ~/.workbuddy-ai/cache/acc-product-config-v*.json（客户端模型选择器同源，
-//    27 条 = 23 预制 + 4 custom-local，含 deepseek-v4.1-flash / gpt-5.6-*）
+// ③ codebuddy 两端的清单链（2026-09-21 定稿，2026-09-28 两端对齐）：客户端合并
+//    配置缓存 <appHome>/cache/acc-product-config-v*.json（客户端模型选择器同源；
+//    AI 端 27 条 = 23 预制 + 4 custom-local，WorkBuddy 端 61 条 = 53 预制 +
+//    8 custom-local）
 //    → 客户端未运行过时回退「远程配置缓存 ∪ App 包 product.json」超集近似
-//    → 回退 --help（4 个分层别名）。WorkBuddy 端不启用扩展链：其 --help 已是
-//    完整用户清单。
+//    → 回退 --help。**两端都走这条链**：WorkBuddy 端的 --help 只有 17 条
+//    （9 预制 + 8 custom-local），官方主力模型 hy3 / hy4-preview /
+//    deepseek-v4.1-flash / glm-5.3 全不在内，只按 --help 出清单会大面积缺失
+//    （且与同引擎的 model_credits 读自不同文件，倍率查得到、清单查不到）。
 //
 // 各引擎的 ListModels 都是**只读**子命令（不发起推理、不消耗额度），
 // 但会真的启动 CLI 进程（openclaw ~2.5s 最慢），因此探测并发执行、
@@ -293,6 +297,10 @@ func readProductJSONCatalog(path string) ([]string, map[string]string) {
 //
 // 只取 id 与 credits（其余元数据 --engines 用不上）；保留文件内顺序；
 // id 去重；倍率经 parseCreditMultiplier 规范化，缺省/非法的不进倍率表。
+//
+// ⚠️ 这里**不过滤**：product.json 的 credits 覆盖不完整（WorkBuddy 端实测 48 条里
+// 只有 9 条带 credits，hy3 / minimax-m3 / glm-5.1 等主力模型都在另外 39 条里），
+// 按「有倍率」筛会把真模型全砍掉。acc 缓存那份才够格过滤，见 readAccCatalog。
 func parseProductJSONCatalog(data []byte) ([]string, map[string]string) {
 	var doc struct {
 		Models []struct {
@@ -321,6 +329,107 @@ func parseProductJSONCatalog(data []byte) ([]string, map[string]string) {
 		return nil, nil
 	}
 	return ids, credits
+}
+
+// readAccCatalog 读 acc-product-config 缓存，返回清单与倍率表。
+//
+// acc 缓存是客户端的**全量注册表**（WorkBuddy 端实测 61 条），不是模型选择器 ——
+// 直接铺给 -m 会比客户端多太多。allowlist 是客户端显式下发的选择器清单
+// （agents[].models，见 agentSelectorModels），为 nil 时**不过滤**（宁可多不可少）。
+//
+// 三类条目才进 -m 清单：
+//
+//  1. 在 allowlist 里（客户端展示的具名模型）→ 保留，倍率取注册表；
+//  2. custom-local:*（用户自己加的，客户端同样展示、只是不计倍率）→ 保留；
+//  3. 其余（补全 codewise-* / 图像 hunyuan-image-* / 历史别名 default-1.* 等）→ 剔除。
+//
+// ⚠️ "auto" 特例：客户端选择器首条，但**不在注册表里**（注册表只列具名模型）——
+// CLI 的 --help 认、客户端确实展示，故按 allowlist 命中处理并补进清单首位。
+//
+// 返回空清单 = 当无来源，调用方回退 ②（远程配置缓存 ∪ product.json）。
+func readAccCatalog(path string, allowlist []string) ([]string, map[string]string) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	var doc struct {
+		Models []struct {
+			ID      string `json:"id"`
+			Credits string `json:"credits"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, nil
+	}
+	on := map[string]bool{}
+	for _, id := range allowlist {
+		on[id] = true
+	}
+	var ids []string
+	credits := map[string]string{}
+	seen := map[string]bool{}
+	// ① auto 等「在 allowlist 但不在注册表」的条目，按清单顺序补在前面。
+	//    仅当该 id 是客户端合成项（auto 等少数特例，客户端用、注册表不列）才补；
+	//    注册表为空时更不能拿选择器里随便一条顶替（那相当于把注册表的选择器
+	//    当 ② 用，违反「注册表权威」语义 —— 应当回退 ② 拿真实数据）。
+	for _, id := range allowlist {
+		if seen[id] {
+			continue
+		}
+		if !inAccRegistry(doc.Models, id) && isSyntheticSelectorID(id) {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, m := range doc.Models {
+		id := strings.TrimSpace(m.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		// ② 用户自定义模型：客户端同样展示，只是不计倍率。
+		custom := strings.HasPrefix(id, "custom-local:")
+		// ③ 具名模型：只在客户端选择器清单里才展示。
+		if !custom && !(len(allowlist) > 0 && on[id]) {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+		if rate := parseCreditMultiplier(m.Credits); rate != "" {
+			credits[id] = rate
+		}
+	}
+	ids = dedupeModels(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return ids, credits
+}
+
+// isSyntheticSelectorID 判断某个不在 acc 注册表里的 id 是否是客户端的合成项（始终保留）。
+//
+// 实测 acc 注册表**只列具名模型**，不列客户端用作"自动选择"的合成项。最常见的就是
+// `auto` —— 客户端用它表示「由后端挑模型」，CLI 的 --help 也认。
+//
+// ⚠️ 此名单必须保守：宁可漏掉一两个真合成项（表现为客户端能选、-m 取不到），
+// 也不要把具名模型 id 误判进合成清单（那会让它绕过过滤、无限兜底进清单）。
+func isSyntheticSelectorID(id string) bool {
+	return id == "auto"
+}
+
+// inAccRegistry 判断某 id 是否在 acc 注册表里（区分「客户端列了但注册表没有」）。
+func inAccRegistry(models []struct {
+	ID      string `json:"id"`
+	Credits string `json:"credits"`
+}, id string) bool {
+	for _, m := range models {
+		if strings.TrimSpace(m.ID) == id {
+			return true
+		}
+	}
+	return false
 }
 
 // parseProductJSONModels 只取清单（积分倍率见 parseProductJSONCatalog）。
@@ -395,6 +504,87 @@ func remoteConfigCacheCatalog(localStorageDir string) ([]string, map[string]stri
 		return nil, nil
 	}
 	return ids, credits
+}
+
+// agentSelectorModels 从远程配置缓存里抽**客户端模型选择器真正展示的清单**
+// —— agents[].models 数组：
+//
+//	[{"userId":"...","data":{"agents":[{"modelTags":["craft"],
+//	   "models":["auto","hy4-preview","hy3","deepseek-v4.1-flash",...]}]}}]
+//
+// 这份清单是**显式下发**的，比「按倍率猜」准得多：倍率只说明客户端能计费，
+// 不等于会展示 —— hy3-b / hy3-c / hy4-preview-dev / minimax-m2.5 / kimi-k2.5 /
+// glm-4.6 都有倍率也都在注册表里，但客户端选择器里没有（它们是灰度 / 按
+// modelTags 分档放的）。反之补全类（supportsExtra=true）连倍率都没有。
+//
+// ⚠️ **只取 mtime 最新的那一个条目**，不跨条目/跨账号取并集：共享 ~/.codebuddy 里
+// 可能同时躺着多个账号的缓存（实测 WorkBuddy 端 d43e… 缓存里 userId=f231e9af 的
+// 清单用的是 hy4-preview-f，而 ed6c16d4 的是 hy4-preview —— 并集会把上一账号的
+// 型号混进来）。最新条目就是当前登录账号刚下发的。
+//
+// 目录不存在 / 无 agents 字段 / 解析失败 → (nil, false)：**没有权威清单**，
+// 调用方据此跳过交集过滤、保留 acc 缓存全量（宁可多不可少，见 extendedModelCatalog）。
+//
+// ⚠️ auto：客户端清单里首条是 "auto"（自动选模型），它**不在 acc 缓存注册表里**
+// （注册表只列具名模型）但 CLI 的 --help 认、且客户端确实展示，故调用方须放行。
+func agentSelectorModels(localStorageDir string) ([]string, bool) {
+	if localStorageDir == "" {
+		return nil, false
+	}
+	entries, err := os.ReadDir(localStorageDir)
+	if err != nil {
+		return nil, false
+	}
+	type hit struct {
+		mod time.Time
+		ids []string
+	}
+	var best hit
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".info") {
+			continue
+		}
+		p := filepath.Join(localStorageDir, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var docs []struct {
+			Data struct {
+				Agents []struct {
+					Models []string `json:"models"`
+				} `json:"agents"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(data, &docs) != nil {
+			continue
+		}
+		var ids []string
+		for _, doc := range docs {
+			for _, a := range doc.Data.Agents {
+				for _, m := range a.Models {
+					if id := strings.TrimSpace(m); id != "" {
+						ids = append(ids, id)
+					}
+				}
+			}
+		}
+		ids = dedupeModels(ids)
+		if len(ids) == 0 {
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if best.ids == nil || fi.ModTime().After(best.mod) {
+			best = hit{mod: fi.ModTime(), ids: ids}
+		}
+	}
+	if best.ids == nil {
+		return nil, false
+	}
+	return best.ids, true
 }
 
 // parseLLMModelsText 解析 `llm models` 的纯文本输出：
