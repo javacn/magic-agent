@@ -13,3 +13,16 @@ config.json
 
 # HTML 报告的导出 zip（是仓库里那些 .html 报告的副本，可重新生成）
 .trae-html-share-packages/
+
+# 个人探索产物 / 拆解报告 / 视觉复刻截图（不属于仓库主线）
+magic-client-插件方案设计.md
+codebuddy-model-menu.png
+agents-anywhere-teardown/
+magic-client-mobile-ui/
+cli-subagent-model-config/
+agent-permission-modes-unified.html
+SHOTS-ours-list.png
+SHOTS/
+magic-pair-qr.png
+magic-pair-qr-public.png
+magic-test-mobile-1.0.0-debug.apk
