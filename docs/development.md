@@ -55,6 +55,40 @@ CI 发版走另一条路：`.github/workflows/release.yml` 从 **git tag** 解�
 > 平台不支持或产物缺失时，`postinstall` 会尝试用本机 Go 现场编译；两者都没有则只告警，不阻断安装。
 > 同一个 `postinstall` 还会安装 **llm CLI**（simonw/LLM，`-e llm` 引擎的依赖）：已有安装（`MAGIC_AGENT_LLM_BIN` / `~/.llm-venv` / PATH / brew）则跳过；否则建 `~/.llm-venv` 隔离安装，失败只告警不阻断。
 
+## CI 发版（GitHub Actions → npmjs）
+
+`.github/workflows/release.yml` 是**唯一往 npmjs 发包的路径**（本地 `npm run bump` + `npm pack` 只产出 tgz，不上传）：
+
+| 触发 | 行为 |
+|---|---|
+| push tag `v*.*.*` | **正式发布**：版本号取 tag 名（`v0.3.10` → `0.3.10`），`npm publish --access public --ignore-scripts` |
+| `workflow_dispatch`（手动） | **dry-run**：版本用 `0.0.0-rc.<run_id>`，只跑 `npm publish --dry-run`，不真发（npm 收 prerelease，不会污染主版本号） |
+
+两个 job：
+
+1. **build** —— 5 平台矩阵，各自 `npm run build -- --current` 后上传 artifact：
+   `ubuntu-22.04`（linux-x64）/ `ubuntu-22.04` + QEMU（linux-arm64）/ `macos-13`（darwin-x64）/ `macos-14`（darwin-arm64）/ `windows-2022`（win32-x64）。
+2. **publish-npm** —— 单 runner（ubuntu-22.04）下载 5 个 artifact 合并进 `npm/dist/<plat>/`，
+   从 tag 解析版本号写回 `package.json`，再 `npm publish`。
+
+前置：仓库 secret **`NPM_TOKEN`**（npm **Automation** token，带 publish 作用域；
+生成入口 npmjs → Settings → Tokens → Generate New Token → Automation）。缺它 publish 会 401。
+
+正式发布后 workflow 会 `npm view magic-agent version` 校验一次，版本不一致直接判失败 ——
+避免「以为发出去了、其实 npm 上还是旧版」。
+
+⚠️ 两个注意点：
+
+- 本 workflow **不发 GitHub Release asset**，只发 npm。想要 Release 页的附件，
+  在 publish job 末尾加一步 `softprops/action-gh-release@v2` 即可。
+- 别和本地 `npm run bump` 混用：CI 从 tag 解析版本，本地 bump 改的是 `package.json`
+  （`bump.js` 刻意不调 `npm version`，避免顺手 commit + 打 tag）。两条路各管各的。
+
+包名 `magic-agent`，bin 也是 `magic-agent`（`npm/bin/magic-agent.js` 转发到平台二进制）。
+⚠️ 截至 **2026-09-28**，npmjs 上还查不到 `magic-agent`（`npm view magic-agent version` → 404），
+即**首次正式发布尚未发生**。在那之前 `npm install -g magic-agent` 装不上，
+请用本地 tgz（`npm pack --ignore-scripts`）或源码构建。
+
 ## 架构
 
 ```

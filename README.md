@@ -15,14 +15,17 @@
 ## 安装
 
 ```bash
-npm install -g magic-agent       # 全局安装（推荐，无需 Go）
-npm install -g ./magic-agent-<version>.tgz   # 从本地 tgz 安装（离线 / 内网）
+npm install -g magic-agent                      # 从 npmjs 全局安装（无需 Go）
+npm install -g ./magic-agent-<version>.tgz      # 从本地 tgz 安装（离线 / 内网）
 go build -o bin/magic-agent ./cmd/magic-agent   # 从源码构建（Go 1.26+）
 ```
 
+> ⚠️ 截至 2026-09-28，npmjs 上还查不到 `magic-agent`（首次正式发布尚未发生），
+> 所以 `npm install -g magic-agent` 暂时装不上 —— 先用本地 tgz 或源码构建。
+
 平台产物缺失时 `postinstall` 会用本机 Go 现场编译；两者都没有只告警，不阻断安装。同一个 `postinstall` 还会按需安装 **llm CLI**（`-e llm` 的依赖，隔离在 `~/.llm-venv`）。
 
-维护者发布流程（升版本号 / 交叉编译 / 装两份全局前缀）见 [docs/development.md](docs/development.md)。
+发布由 **GitHub Actions** 完成：推 `v*.*.*` tag 触发 5 平台交叉编译并 `npm publish` 到 npmjs；手动触发走 dry-run。流程细节、`NPM_TOKEN` 配置与本地打包见 [docs/development.md](docs/development.md)。
 
 ## 引擎依赖
 
@@ -362,7 +365,7 @@ EOF
 | [docs/streaming.md](docs/streaming.md) | 各引擎流式的实现路径与实测差异（openclaw ACP 桥、arkclaw A2A SSE、dsh SDK 通道） |
 | [docs/tools-and-permissions.md](docs/tools-and-permissions.md) | `--tools` 工具白名单与四档权限模型的落地细节 |
 | [docs/notes.md](docs/notes.md) | 需要用户选择的统一格式、在 WorkBuddy / CodeBuddy 会话内使用时的注意事项 |
-| [docs/development.md](docs/development.md) | 打包发布流程、改动落地四步曲、架构与真机验证记录 |
+| [docs/development.md](docs/development.md) | CI 发版（GitHub Actions → npmjs）、本地打包流程、改动落地四步曲、架构与真机验证记录 |
 | [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md) | 客户端契约面（magic-client 插件对接用） |
 
 ## License
