@@ -230,7 +230,13 @@ svg{display:block}
   body[data-mobile="chat"] .slot--chat{display:flex}
   .device{width:100%;height:100dvh;border:0;border-radius:0;box-shadow:none}
   .dock{display:none}
-  .switcher{display:flex}
+  /* 「列表 / 对话」切换器是**桌面演示**用的：手机视口下它浮在底部，正压在列表最后两行上
+     （实测：切换器 390×42 悬在 y=784~826，会话行恰好同区间；它 z-index 60 还盖住 FAB，
+     被压的那两行点不动）。而它提供的导航手机上本来就有 —— 点会话行进对话、点引擎进对话、
+     点右下 + 开新会话、对话页顶部的返回/会话键回列表。所以手机上直接不显示它。 */
+  /* 底部留出 FAB 的高度（56 + 28 + 余量）：不留的话最后一行永远滚不到 FAB 上方，
+     那一行会被永远压住 —— 这是列表类界面很常见的一个坑。 */
+  .scroll{padding-bottom:96px}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
@@ -294,11 +300,16 @@ svg{display:block}
 
           <div class="chips" id="chips"></div>
 
-          <button class="section">会话（core 登记表）<svg width="15" height="15"><use href="#i-chevron"/></svg></button>
-          <ul class="list" id="sessionList"></ul>
-
+          <!-- ⚠️ 顺序是有意的：**项目自己的模块在前，通用的 agent 控制台在后**。
+               以前「会话（core 登记表）」排在业务模块前面，于是手机首屏全是通用 agent 的东西
+               （契约 / 引擎 / 全机器共用的会话登记表），项目自己的视图被压在一屏之外 ——
+               集成方会以为「这 App 显示的不是我们项目的内容」。
+               （注释必须是 HTML 注释：这里是文档正文区，写成 /* */ 会当文字显示出来。） -->
           <button class="section" id="moduleSection" style="display:none">业务模块<svg width="15" height="15"><use href="#i-chevron"/></svg></button>
           <ul class="list" id="moduleList"></ul>
+
+          <button class="section">会话（core 登记表 · 本机共用）<svg width="15" height="15"><use href="#i-chevron"/></svg></button>
+          <ul class="list" id="sessionList"></ul>
 
           <button class="section">引擎<svg width="15" height="15"><use href="#i-chevron"/></svg></button>
           <ul class="list" id="engineList"></ul>
@@ -709,10 +720,17 @@ svg{display:block}
       row.appendChild(g);
       var main = el('span', 'row__main');
       var title = el('span', 'row__title');
-      title.appendChild(document.createTextNode(short(s.session_id || s.run_id || '(未命名)')));
+      /* 标题优先用 prompt_head（提示词首行）—— 那是这个登记表里**唯一人能读**的字段。
+         ⚠️ 以前这里用的是 session_id 前 8 位，于是整个列表看起来就是一串十六进制，
+         会让人以为「显示的不是我的会话」；其实接口一直回了 prompt_head，是界面把它丢了。
+         只有老记录 / 空提示词时才退回 id。 */
+      var head = String(s.prompt_head || '').trim();
+      title.appendChild(document.createTextNode(head || short(s.session_id || s.run_id || '(未命名)')));
       if (s.state === 'running') title.appendChild(el('span', 'badge badge--run', '运行中'));
       main.appendChild(title);
-      main.appendChild(el('span', 'row__sub', [s.engine || '?', s.state || ''].filter(Boolean).join(' · ')));
+      /* 副行带上工作目录末段：同一个项目下常跑很多次，光看提示词分不清是哪一次。 */
+      var dir = String(s.workspace || '').replace(/\/+$/, '').split('/').pop() || '';
+      main.appendChild(el('span', 'row__sub', [s.engine || '?', s.state || '', dir].filter(Boolean).join(' · ')));
       row.appendChild(main);
       row.appendChild(el('span', 'row__meta', rel(s)));
       var more = el('span', 'row__glyph'); more.innerHTML = '<svg width="16" height="16"><use href="#i-overflow"/></svg>';
@@ -886,6 +904,13 @@ svg{display:block}
       state.profile = await (await api('/desk/profile')).json();
       var eng = await (await api('/desk/engines')).json();
       state.engines = Array.isArray(eng) ? eng : [];
+
+      /* profile 声明了 ui.defaultView 就照它决定开局落在哪一屏。
+         ⚠️ 这个字段以前只在 profile.go 里声明、界面从没读过：手机上打开永远落在
+         「列表」，而 profile 里明明写着 chat —— 声明与行为不一致，比不声明更难查。
+         只在 list/chat 两个合法值时生效，写别的值就不动（不因为一个笔误把界面弄空白）。 */
+      var dv = (state.profile.ui && state.profile.ui.defaultView) || '';
+      if (dv === 'chat' || dv === 'list') setMobileView(dv);
 
       var name = (state.profile.app && state.profile.app.name) || 'magic-client';
       $('wordmark').textContent = name;
