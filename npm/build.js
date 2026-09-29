@@ -4,8 +4,9 @@
 // build.js - 把 Go 源码交叉编译成 npm 包内的平台二进制。
 //
 // 用法：
-//   node npm/build.js             # 全部目标（prepack 默认走这条）
-//   node npm/build.js --current   # 仅当前平台（本地开发更快）
+//   node npm/build.js                        # 全部目标（prepack 默认走这条）
+//   node npm/build.js --current              # 仅当前平台（本地开发更快）
+//   node npm/build.js --target=linux-arm64   # 仅指定平台（CI 矩阵用：与 runner 架构解耦）
 //
 // 版本号从 package.json 注入到 internal/cli.Version。
 
@@ -24,7 +25,23 @@ if (!go) {
   process.exit(1);
 }
 
-const targets = onlyCurrent ? [currentTarget()] : TARGETS;
+// --target=<dir>：显式指定目标。CI 里每个矩阵 job 只编译自己那一个平台，
+// 用的是 runner 上的 go 交叉编译（CGO_ENABLED=0，纯 Go 无需 QEMU），
+// 所以「目标平台」与「runner 自身架构」无关 —— 不能拿 --current 充当。
+const targetArg = (process.argv.find((a) => a.startsWith("--target=")) || "").slice("--target=".length);
+let targets;
+if (targetArg) {
+  const t = TARGETS.find((x) => x.dir === targetArg);
+  if (!t) {
+    console.error(
+      `magic-agent: 未知目标 ${JSON.stringify(targetArg)}（可用：${TARGETS.map((x) => x.dir).join(" | ")}）`
+    );
+    process.exit(2);
+  }
+  targets = [t];
+} else {
+  targets = onlyCurrent ? [currentTarget()] : TARGETS;
+}
 const ldflags = `-s -w -X github.com/darren/magic-agent/internal/cli.Version=${pkg.version}`;
 
 console.log(`magic-agent: 使用 ${go} 编译 v${pkg.version}，共 ${targets.length} 个目标`);

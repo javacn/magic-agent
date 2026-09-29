@@ -5,11 +5,15 @@
 #   - workflow_dispatch    （手动跑，默认 dry-run 模式：发布 0.0.0-rc.<run_id>，npm 不会拒覆盖但也不会污染主版本）
 #
 # 链路（与 magic-stock 同款思路，但 magic-agent 只有一个 npm 包）：
-#   1) build job（5 平台矩阵: ubuntu/macos-arm64/macos-x64/windows-2022 + linux-arm64 QEMU 交叉编译）：
+#   1) build job（5 平台矩阵: ubuntu-22.04(linux-x64 / linux-arm64) + macos-15 / macos-15-intel + windows-2022）：
 #        - setup-go 走 go.mod
 #        - npm ci（拉前端 npm wrapper 依赖）
-#        - npm run build（→ npm/build.js 交叉编译，prepack 默认走这条）
+#        - npm run build -- --target=<label>（→ npm/build.js 交叉编译，prepack 默认走全量）
 #        - 上传 artifact: magic-agent-<plat>
+#
+#   注：纯 Go + CGO_ENABLED=0，各平台的二进制由 go 交叉编译产出，不需要 QEMU；
+#       「目标平台」由 --target=<label> 显式指定，不能用 --current（那会编译出 runner 自身的架构）。
+#       macOS Intel 镜像 macos-13 已于 2025-12-04 下线，改用 macos-15-intel。
 #   2) publish job（依赖 build，单 runner ubuntu-22.04）：
 #        - 下载 5 个 artifact，把二进制合并到 npm/dist/<plat>/magic-agent[.exe]
 #        - 从 tag 解析版本号，写回 package.json
@@ -49,10 +53,9 @@ jobs:
             apt: ''
           - os: ubuntu-22.04
             label: linux-arm64
-            use-cross: true
-          - os: macos-13
+          - os: macos-15-intel
             label: darwin-x64
-          - os: macos-14
+          - os: macos-15
             label: darwin-arm64
           - os: windows-2022
             label: win32-x64
@@ -71,20 +74,14 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Enable QEMU for cross-compile (linux-arm64 on amd64 runner)
-        if: matrix.use-cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
-
       - name: npm ci
         run: npm ci || npm install
 
       - name: Build prebuilt for ${{ matrix.label }}
-        run: npm run build -- --current
+        run: npm run build -- --target=${{ matrix.label }}
 
       - name: Verify binary produced
+        shell: bash
         run: |
           if [ "${{ matrix.label }}" = "win32-x64" ]; then
             ls -la npm/dist/win32-x64/magic-agent.exe
