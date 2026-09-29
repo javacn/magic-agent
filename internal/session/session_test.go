@@ -180,7 +180,7 @@ func TestFinishKeepsStoppedState(t *testing.T) {
 
 	h, _ := Begin(BeginOptions{Engine: "claude", PID: os.Getpid()})
 	// 模拟「被 --stop 停掉」：磁盘上写 stopped
-	h.Finish("", StateStopped)
+	h.Finish("", StateCancelled)
 	// 被杀的本进程随后以 failed 收尾 → 不能把 stopped 覆盖掉
 	h.Finish("sid-x", StateFailed)
 
@@ -188,8 +188,8 @@ func TestFinishKeepsStoppedState(t *testing.T) {
 	if !found {
 		t.Fatal("记录丢了")
 	}
-	if got.State != StateStopped {
-		t.Errorf("state = %q want %q（不能覆盖 stopped）", got.State, StateStopped)
+	if got.State != StateCancelled {
+		t.Errorf("state = %q want %q（不能覆盖 cancelled）", got.State, StateCancelled)
 	}
 }
 

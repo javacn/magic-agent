@@ -279,7 +279,7 @@ func TestEncodeAskAnswerErrors(t *testing.T) {
 		ans    AskAnswer
 		want   string
 	}{
-		{"引擎不支持", "trae", q0Req(t), AskAnswer{}, "does not expose AskUserQuestion"},
+		{"引擎不支持（无已知答案形状）", "trae", q0Req(t), AskAnswer{}, "has no known ask-answer protocol shape"},
 		{"问题原文重复（文本 key 无法区分）", "claude", dupReq, AskAnswer{Choices: []AskChoice{
 			{QuestionID: "q0", Labels: []string{"是"}}, {QuestionID: "q1", Labels: []string{"否"}},
 		}}, "appears more than once"},
@@ -395,7 +395,7 @@ func TestEncodeAskFollowUp(t *testing.T) {
 const AskPrefixForTest = AskAnswerPrefix
 
 func TestAskSupportOf(t *testing.T) {
-	for _, e := range []string{"claude", "codebuddy", "codebuddy-ai", "CLAUDE"} {
+	for _, e := range []string{"claude", "CLAUDE"} {
 		if got := AskSupportOf(e); got != "tool:AskUserQuestion" {
 			t.Errorf("AskSupportOf(%q) = %q", e, got)
 		}
@@ -403,11 +403,14 @@ func TestAskSupportOf(t *testing.T) {
 			t.Errorf("AskSupportsEngine(%q) 应为 true", e)
 		}
 	}
-	for _, e := range []string{"trae", "llm", "codex", "openclaw", "dsh", "arkclaw", "", "nope"} {
+	// codebuddy 族：模型看不到 AskUserQuestion（2026-09-28 七种配置实测，见 AskSupportOf 注释）。
+	// 回归保护：曾按"同族协议"推断成 tool:AskUserQuestion，导致上层 UI 承诺永不出现的决策卡。
+	for _, e := range []string{"codebuddy", "codebuddy-ai", "trae", "llm", "codex", "openclaw", "dsh", "arkclaw", "", "nope"} {
 		if got := AskSupportOf(e); got != "none" {
 			t.Errorf("AskSupportOf(%q) = %q，期望 none", e, got)
 		}
 	}
+	// interrupt 是 codebuddy 的**协议形状**（当前真机走不到，见 AskInterruptSupportOf 注释）。
 	if !AskInterruptSupportOf("codebuddy") || AskInterruptSupportOf("claude") {
 		t.Error("interrupt 支持判定不对（只有 codebuddy 的官方文档写了该字段）")
 	}

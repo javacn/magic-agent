@@ -50,31 +50,50 @@ func TestExpandHome(t *testing.T) {
 	}
 }
 
-// TestNpmGlobalBinDirs npm 全局前缀解析：读 NPM_CONFIG_PREFIX / npm_config_prefix，
-// 拼成 <prefix>/bin，同前缀去重，未设置时为空。
+// TestNpmGlobalBinDirs npm 全局前缀解析：env（NPM_CONFIG_PREFIX / npm_config_prefix）
+// 给出的前缀排在前，其后是**标准全局前缀兜底**（GUI 进程 PATH 窄时要靠它，
+// 见 engine_base.go 的 npmGlobalBinDirs 注释；2026-09-28 为 codebuddy 独立 CLI 加的）。
 func TestNpmGlobalBinDirs(t *testing.T) {
 	t.Setenv("NPM_CONFIG_PREFIX", "")
 	t.Setenv("npm_config_prefix", "")
-	if got := npmGlobalBinDirs(); len(got) != 0 {
-		t.Errorf("未设置时应为空, got %v", got)
+
+	// 未设 env：只剩标准前缀兜底 —— 不能为空（否则 GUI 侧探测不到 /opt/homebrew/bin）
+	base := npmGlobalBinDirs()
+	if len(base) == 0 {
+		t.Fatal("标准全局前缀兜底不该为空")
+	}
+	if base[0] != "/opt/homebrew/bin" {
+		t.Errorf("标准前缀应排在首位（无 env 前缀时），got %v", base)
 	}
 
+	// 设了 env：env 前缀排在标准前缀**之前**（优先级不因新增兜底而变）
 	t.Setenv("NPM_CONFIG_PREFIX", "/p/upper")
-	if got := npmGlobalBinDirs(); len(got) != 1 || got[0] != "/p/upper/bin" {
-		t.Errorf("got %v, want [/p/upper/bin]", got)
+	got := npmGlobalBinDirs()
+	if len(got) == 0 || got[0] != "/p/upper/bin" {
+		t.Errorf("env 前缀应排首位, got %v", got)
 	}
-
-	// 大小写两个变量指向同一前缀 → 去重
-	t.Setenv("npm_config_prefix", "/p/upper")
-	if got := npmGlobalBinDirs(); len(got) != 1 {
-		t.Errorf("同前缀应去重, got %v", got)
+	var hasStd bool
+	var upperCount int
+	for _, d := range got {
+		switch d {
+		case "/opt/homebrew/bin":
+			hasStd = true
+		case "/p/upper/bin":
+			upperCount++
+		}
+	}
+	if !hasStd {
+		t.Errorf("标准前缀应始终包含（env 存在也不能丢兜底）, got %v", got)
+	}
+	if upperCount != 1 {
+		t.Errorf("同前缀应去重（出现 %d 次）, got %v", upperCount, got)
 	}
 
 	// 大写为空时小写单独生效
 	t.Setenv("NPM_CONFIG_PREFIX", "")
 	t.Setenv("npm_config_prefix", "/p/lower")
-	if got := npmGlobalBinDirs(); len(got) != 1 || got[0] != "/p/lower/bin" {
-		t.Errorf("got %v, want [/p/lower/bin]", got)
+	if got := npmGlobalBinDirs(); len(got) == 0 || got[0] != "/p/lower/bin" {
+		t.Errorf("got %v, want 首位 /p/lower/bin", got)
 	}
 }
 
@@ -162,7 +181,7 @@ func TestResolveOrder(t *testing.T) {
 // 没有安装路径的（GUI 应用 / 配置文件类）如实留空 —— 不编跑不通的命令。
 func TestInstallCommandOf(t *testing.T) {
 	// 有安装命令：非空 + 形如一行 shell（不含换行）。
-	for _, engine := range []string{"claude", "codex", "openclaw", "dsh", "trae", "llm"} {
+	for _, engine := range []string{"claude", "codebuddy", "codebuddy-ai", "codex", "openclaw", "dsh", "trae", "llm"} {
 		got := InstallCommandOf(engine)
 		if got == "" {
 			t.Errorf("InstallCommandOf(%q) 为空，应给出一键安装命令", engine)
@@ -174,12 +193,14 @@ func TestInstallCommandOf(t *testing.T) {
 	}
 	// 具体命令取自各 CLI 官方安装方式（回归保护：防止手滑改坏包名）。
 	cases := map[string]string{
-		"claude":   "npm install -g @anthropic-ai/claude-code",
-		"codex":    "npm install -g @openai/codex",
-		"openclaw": "npm install -g openclaw@latest",
-		"dsh":      "npm i -g @deepseek-ai/dsh",
-		"trae":     `sh -c "$(curl -L https://trae.cn/trae-cli/install.sh)"`,
-		"llm":      "python3 -m venv ~/.llm-venv && ~/.llm-venv/bin/pip install llm",
+		"claude":       "npm install -g @anthropic-ai/claude-code",
+		"codebuddy":    "npm install -g @tencent-ai/codebuddy-code",
+		"codebuddy-ai": "npm install -g @tencent-ai/codebuddy-code", // 同一个独立 CLI、两个账号
+		"codex":        "npm install -g @openai/codex",
+		"openclaw":     "npm install -g openclaw@latest",
+		"dsh":          "npm i -g @deepseek-ai/dsh",
+		"trae":         `sh -c "$(curl -L https://trae.cn/trae-cli/install.sh)"`,
+		"llm":          "python3 -m venv ~/.llm-venv && ~/.llm-venv/bin/pip install llm",
 	}
 	for engine, want := range cases {
 		if got := InstallCommandOf(engine); got != want {
@@ -187,7 +208,7 @@ func TestInstallCommandOf(t *testing.T) {
 		}
 	}
 	// 没有可执行安装路径的引擎：留空（原因在 note 里）。
-	for _, engine := range []string{"codebuddy", "codebuddy-ai", "arkclaw", "unknown", ""} {
+	for _, engine := range []string{"arkclaw", "codebuddy-gateway", "unknown", ""} {
 		if got := InstallCommandOf(engine); got != "" {
 			t.Errorf("InstallCommandOf(%q) = %q，应为空（无安装命令）", engine, got)
 		}

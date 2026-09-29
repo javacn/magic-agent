@@ -13,10 +13,10 @@ v1 (verify_ma.py) 的两个检测缺陷：
   - PSEUDO: 文本正文里出现 <tool_call(s):...> 标签（模型编造）
   - NONE  : 明确回答 NO_TOOLS 或纯文本无标签
 """
-import json, os, re, secrets, subprocess, time
+import json, os, re, secrets, shutil, subprocess, time
 
 MA = "/tmp/ma_t"
-CB = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+CB = os.environ.get("MAGIC_AGENT_CODEBUDDY_BIN") or shutil.which("codebuddy") or ""
 ENV_MA = dict(os.environ)                       # 真实继承环境（SERVER__PORT 仍在）
 ENV_MA["MAGIC_AGENT_CODEBUDDY_BIN"] = CB
 ENV_CB = {k: v for k, v in os.environ.items() if not k.startswith("SERVER__")}

@@ -91,15 +91,18 @@ magic-agent --append 44a06ef5-… -p "【用户选择】
 其余校验（不静默降级）：漏答问题 / 选项 label 不在候选里 / 单选却给了多个 label / 问题 id 不存在 /
 引擎不支持（`AskSupportOf == "none"`）→ 一律报错；拒绝时 `message` 为空回 `"User declined"`。
 
-> 其它引擎（trae / llm / codex / openclaw / dsh / arkclaw）实测均无 `AskUserQuestion`，也无 `can_use_tool`。
+> 其它引擎（codebuddy / codebuddy-ai / trae / llm / codex / openclaw / dsh / arkclaw）实测均无
+> `AskUserQuestion` 可用。**codebuddy 族是"工具存在但模型看不到"**（2026-09-28 七种配置实测；
+> 官方文档列为内置工具，但只交给第一方宿主）——详见
+> [engines.md](engines.md) 的「提问（AskUserQuestion）：不支持」。
 > trae / Cursor / iFlow / Qwen 走的是 **ACP 的 `session/request_permission`**（另一族协议：选项带
 > `optionId` + `kind=allow_once/reject_once…`），本项目尚未接入，故 `ask` 字段如实报 `none`。
 
-真机验收（2026-09-18）：
+真机验收（2026-09-18；`ask` 字段 2026-09-28 更正）：
 
 ```bash
 magic-agent --engines --no-models | jq -c '.[] | {engine, ask}'
-# claude / codebuddy → "tool:AskUserQuestion"；其余 → "none"
+# claude → "tool:AskUserQuestion"；其余（含 codebuddy 族）→ "none"
 
 magic-agent --stream --keep-alive=false -e claude --tools on -o json \
   "请调用 AskUserQuestion 工具问我：午餐吃拉面还是盖饭。只问一次"

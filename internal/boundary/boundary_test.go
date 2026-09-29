@@ -115,7 +115,10 @@ func TestCoreDoesNotEmbedPluginAssets(t *testing.T) {
 	root := repoRoot(t)
 
 	// 插件资源目录（相对仓库根）。任何 embed 指令都不许点到它们。
-	forbiddenInEmbed := []string{"client-ui", "magic-client-mobile-ui"}
+	// ⚠️ 旧名是 magic-client-mobile-ui（已随目录改名失效）：只写旧名会让
+	// client-ui-mobile/ 变成无人看管的目录 —— 这个测试存在的意义正是「不许 embed」，
+	// 漏一个名字等于漏掉一份资源。两个名字都留着，新名在前。
+	forbiddenInEmbed := []string{"client-ui", "client-ui-mobile", "magic-client-mobile-ui"}
 
 	var scanned int
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {

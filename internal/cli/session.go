@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,7 +64,7 @@ func stopActiveSession() {
 		return
 	}
 	h.KillChild()
-	h.Finish("", session.StateStopped)
+	h.Finish("", session.StateCancelled)
 }
 
 // installSignalStop 注册「被终止时先带走引擎子进程」的处理。
@@ -322,7 +323,13 @@ func runSessions(cmd *cobra.Command, opts *askOptions) error {
 		PromptHead string `json:"prompt_head,omitempty"`
 		StartedAt  string `json:"started_at"`
 		UpdatedAt  string `json:"updated_at"`
+		// HasLog 这条会话有没有**可回放的事件日志**（`--session-log` 读的就是它）。
+		// 为什么让 CLI 来说这件事：日志**只在流式调用时写**（见 sessionlog.go 的 sessionWriter），
+		// 所以非流式跑出来的会话没有历史可回放 —— 客户端要拿它判断「这条点开有东西看吗」，
+		// 而让客户端自己去拼日志路径就是把本仓库的内部布局当接口用。
+		HasLog bool `json:"has_log"`
 	}
+	logDir, _ := sessionLogDir()
 	rows := make([]row, 0, len(records))
 	for _, r := range records {
 		rows = append(rows, row{
@@ -337,9 +344,74 @@ func runSessions(cmd *cobra.Command, opts *askOptions) error {
 			PromptHead: r.PromptHead,
 			StartedAt:  r.StartedAt.Format("2006-01-02 15:04:05"),
 			UpdatedAt:  r.UpdatedAt.Format("2006-01-02 15:04:05"),
+			HasLog:     hasSessionLog(logDir, r.SessionID),
 		})
 	}
 	return printJSON(cmd.OutOrStdout(), rows)
+}
+
+// hasSessionLog 这条记录有没有事件日志：日志按 `session_id` 命名，所以没有 id 的
+// （一次性调用）自然没有；还要看文件在不在、非空 —— 空文件等于没有可回放的内容。
+func hasSessionLog(dir, sessionID string) bool {
+	if dir == "" || sessionID == "" {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(dir, sessionID+".jsonl"))
+	return err == nil && st.Size() > 0
+}
+
+// runSessionLog 读一段会话的**事件历史**：`--session-log <id> [--after <seq>]`。
+//
+// 为什么这条命令必须存在：会话的「查询」原先只有 HTTP 插件能做（`/desk/session/{id}/messages`），
+// 而 magic-agent **自己不跑服务** —— 调用方（掌天瓶等）是 exec 本 CLI 来拿数据的。
+// 缺了它，调用方就只能自己去解析 <session_id>.jsonl 的磁盘格式，那是把内部格式当接口用。
+//
+// 输出形状与插件的同名接口**逐字段对齐**（全量 {session,events}；增量另带
+// count / after / lastSeq / snapshotRequired），这样两条路可以互换，调用方只写一份解析。
+//
+// 退出码：0 = 读到了（没有事件也是 0，空历史不是错）；1 = 读失败；2 = 参数错（空 id）。
+func runSessionLog(cmd *cobra.Command, opts *askOptions) error {
+	id := strings.TrimSpace(opts.sessionLog)
+	if id == "" {
+		return &usageError{fmt.Errorf("--session-log 需要会话 id：传 session_id 或 run_id（--sessions 可列出全部）")}
+	}
+	dir, err := sessionLogDir()
+	if err != nil {
+		return fmt.Errorf("--session-log %s: 找不到历史目录: %w", id, err)
+	}
+
+	if flagChanged(cmd, "after") {
+		evs, maxSeq, err := ReadSessionLogAfter(dir, id, opts.logAfter)
+		if err != nil {
+			return fmt.Errorf("--session-log %s: %w", id, err)
+		}
+		if evs == nil {
+			evs = []sessionEvent{}
+		}
+		return printJSON(cmd.OutOrStdout(), struct {
+			Session string         `json:"session"`
+			Events  []sessionEvent `json:"events"`
+			Count   int            `json:"count"`
+			After   uint64         `json:"after"`
+			LastSeq uint64         `json:"lastSeq"`
+			// 调用方游标比磁盘还新 ⇒ 增量不可信，去拉全量。
+			// ⚠️ 判据是**严格大于**：after == lastSeq 是「已经追平」，那是正常的空增量。
+			SnapshotRequired bool `json:"snapshotRequired"`
+		}{Session: id, Events: evs, Count: len(evs), After: opts.logAfter,
+			LastSeq: maxSeq, SnapshotRequired: opts.logAfter > maxSeq})
+	}
+
+	evs, err := ReadSessionLog(dir, id)
+	if err != nil {
+		return fmt.Errorf("--session-log %s: %w", id, err)
+	}
+	if evs == nil {
+		evs = []sessionEvent{}
+	}
+	return printJSON(cmd.OutOrStdout(), struct {
+		Session string         `json:"session"`
+		Events  []sessionEvent `json:"events"`
+	}{Session: id, Events: evs})
 }
 
 // runStop 停止指定会话：session_id 或 run_id 都收。

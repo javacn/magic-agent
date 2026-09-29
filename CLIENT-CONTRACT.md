@@ -153,8 +153,19 @@
 | `engine` | 必填；profile 的 `engines` 白名单之外的会被 403 |
 | `prompt` | 必填 |
 | `model` / `workspace` | 可选，透传给 core 的 `-m` / `-w` |
+| `permission` | 可选，四档授权模型（`manual` \| `accept-edits` \| `auto` \| `full`），透传给 core 的 `--permission`。**空 = 不传**，由 core 用它自己的默认档（`agent.DefaultPermissionTier`）—— 刻意没有默认预设，见下 |
 | `session` | 可选，续接一个已有会话（传 `/desk/sessions` 里的 id）→ core 的 `--session` |
 | `idle` | 可选，常驻会话空闲收工时长；默认 `0` = 本轮结束就收工 |
+
+关于 `permission` 的两条语义，客户端必须照做：
+
+1. **没选就原样不传，不要替 core 补默认值。** core 只在**显式传过** `--permission` 时
+   才校验该引擎支不支持（`internal/cli/ask.go::resolvePermissionTier`），替用户预设
+   会把「显式指定」与「沿用默认」混成一种，还会让不支持的引擎凭空报错。
+2. **档位定义以 `internal/agent/permission.go` 为唯一真相**，前端不要另排一套顺序或文案。
+   当前仅 `claude` / `codebuddy` / `codebuddy-ai` 接线，可从 `/desk/engines` 的
+   `capabilities` 里读 `permission`；读不到时前端应把选择器**禁用**而不是传过去。
+   `full` 等同 `--dangerously-skip-permissions`，两端界面都应把它显式标成危险档。
 
 `asks` 是**本进程内存里**的运行中轮次，`sessions` 是 core 的持久登记表 —— 两者不是一回事，
 界面上的「运行中 N」用前者，「最近会话」用后者。
@@ -176,7 +187,106 @@
 两条写死的约定：**事件只读**（模块不能改写对话流，否则基础版行为会随模块漂移）；
 **业务不进基础版数据**（模块的数据表由模块自己声明，插件不做领域假设）。
 
-## 三、三层的责任边界
+## 三、公共对话 UI 组件（对接方直接用它）
+
+插件只提供**基础对话 UI**：消息流 + 输入框 + 引擎/模型/授权三项选择。会话列表、
+工作区、业务视图等**不在这里** —— 那些由对接方按自己的界面实现，再把选中的会话交给组件。
+
+**magic-agent 自己不跑任何服务。** 组件也不连后端：数据从哪来由宿主注入一个
+`transport` 决定（掌天瓶走 IPC → CLI，别的对接方可能走 HTTP）。所以这里的对接方式是
+「宿主实现 transport + 把组件挂进自己的界面」，不存在「先起一个服务再连它」。
+
+### 3.1 两份宿主，一份实现
+
+| 文件 | 角色 |
+| --- | --- |
+| `client-ui/shared/conversation.js` | **组件本体**（渲染 + 流式 + 控制 + 三项选择器）。PC 与移动端共用，是唯一来源 |
+| `client-ui/shared/conversation.css` | 组件样式。结构尺寸共用；颜色走 3.3 的变量契约，由宿主供值 |
+| `client-ui/shared/transport-http.js` | 传输层的**可选参考实现**（HTTP 版，打 `/desk/*`）。组件不依赖它 |
+| `client-ui/index.html` | PC 宿主：oklch 令牌 + 一条顶栏 + 挂组件 |
+| `client-ui-mobile/index.html` | 移动端宿主：AA 安卓端那套十六进制令牌 + 移动形态顶栏 + 挂组件 |
+
+移动端打包时（magic-test 的 `tools/build-mobile-www.cjs`）会把 `client-ui/shared/`
+一并复制进 `www/shared/` —— 页面按同级 `shared/` 引用它，缺了这个复制对话区会是空白。
+
+### 3.2 组件 API
+
+```js
+const conv = MagicConversation.create({
+  el,            // 必填：把对话区 + 输入区挂进去的容器
+  transport,     // 必填：见下（组件不自己连后端）
+  session,       // 可选：传了就从这段会话开始（会走 transport.readSession）
+  engine, model, permission,   // 可选初始值（空 = 不传，core 用它自己的默认）
+  engines,       // 可选：给了就用这份清单，不给则调 transport.listEngines()
+  titleEl,       // 可选：宿主显示会话标题的元素
+  onEvent,       // 可选：每个 core 事件透传一份（只读，不许改写对话流）
+  onBusy,        // 可选：一轮开始/结束
+});
+conv.send('…');
+conv.interrupt(); conv.stop(); conv.answer('…');
+conv.setSession(sid, s); conv.newSession();
+conv.setEngine(n); conv.setModel(n); conv.setPermission(v); conv.setEngines(list);
+conv.refreshEngines(); conv.loadHistory(sid, after?); conv.destroy();
+```
+
+### 3.2.1 transport 契约（宿主实现，四个方法）
+
+```js
+{
+  listEngines()                         // → Promise<[{engine, ok, models, capabilities}]>
+  ask(payload, {onOpen, onEvent, onEnd})// payload: {engine, model?, permission?, session?, prompt}
+                                        // onOpen(runID) 给控制通道的落点
+                                        // onEnd(exitCode) **必须**被调一次，否则界面会一直卡在 busy
+  control({id, op, text?})              // op: interrupt | stop | answer → Promise
+  readSession(id, {after?})             // → Promise<{events, lastSeq?, snapshotRequired?}>
+}
+```
+
+掌天瓶那一侧的 transport 走 IPC → CLI；`transport-http.js` 是走 `/desk/*` 的现成实现。
+
+### 3.3 主题：颜色变量契约
+
+宿主必须给出下面这组变量的值（组件样式只用不定义）。两套现成的值可抄：
+PC 用 `index.html` 里的 oklch 组，移动端用 `client-ui-mobile/index.html` 里的
+AA 十六进制组 —— 换掉这组值就换掉整套调性，组件代码一行不用动。
+
+```
+基础  --canvas --ink --ink-soft --muted --faint --border --subtle --raised
+      --primary-action --on-primary-action --app-shadow
+对话  --bubble --bubble-text --code --status-neutral --status-neutral-text --activity
+md    --md-body --md-muted --md-border --md-code-bg --link --prompt --shimmer --panel --panel-border
+语义  --accent --warning --success --error-surface --error-border --error-text --error-icon
+      --running --transitioning --active
+几何  --r-card --r --r-full --font --mono
+```
+
+Profile 的 `ui.themeVars` 是同一套变量的运行时覆盖。
+
+### 3.4 会话数据：走 CLI，不走服务
+
+magic-agent 把会话的查询与修改都做成 CLI 命令，调用方 exec 即可（magic-test 的
+`desktop/agent-cli.cjs` 已经这么调）：
+
+| 操作 | 命令 |
+| --- | --- |
+| 列出会话 | `magic-agent --sessions` |
+| **读会话历史** | `magic-agent --session-log <session_id\|run_id>` → `{session, events}` |
+| 增量续读 | 追加 `--after <seq>` → 另带 `count / after / lastSeq / snapshotRequired` |
+| 停止会话 | `magic-agent --stop <session_id\|run_id>` |
+| 追加消息 | `magic-agent --append <session_id\|run_id> -p "…"` |
+| 跑一轮（流式 + 控制） | `magic-agent --stream --events --control -e <engine> -p "…"`，控制命令从 stdin 进 |
+
+`--session-log` 的输出形状与插件同名的 HTTP 接口**逐字段对齐**，两条路可互换。
+边界语义：`after == lastSeq` 是**追平**（正常空增量，`snapshotRequired=false`）；
+`after > lastSeq` 才要求重拉全量。
+
+### 3.5 两条不变量
+
+- **事件只读**：组件不接受对接方改写对话流，否则基础版行为会随对接方漂移。
+- **授权档位以 `internal/agent/permission.go` 为唯一真相**；`full` 等同
+  `--dangerously-skip-permissions`，两端界面都必须把它显式标成危险档。
+
+## 四、三层的责任边界
 
 | 层 | 负责 | 明确不做 |
 | --- | --- | --- |

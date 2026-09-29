@@ -18,6 +18,10 @@ config.json
 magic-client-插件方案设计.md
 codebuddy-model-menu.png
 agents-anywhere-teardown/
+# ⚠️ 旧名曾写作 magic-client-mobile-ui/，该目录已改名为 client-ui-mobile/ 并入库。
+# 现在这条只覆盖旧目录名（若本地还留着那份视觉复刻的产物）。真正的移动端界面在
+# client-ui-mobile/，由 magic-test 的 tools/build-mobile-www.cjs 组装成 mobile/www/
+# （产物已在 magic-test 侧忽略）。
 magic-client-mobile-ui/
 cli-subagent-model-config/
 agent-permission-modes-unified.html

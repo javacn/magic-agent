@@ -168,6 +168,7 @@ func streamEventPayload(ev agent.StreamEvent) any {
 		Text      string            `json:"text"`
 		Name      string            `json:"name,omitempty"`
 		ID        string            `json:"id,omitempty"`
+		ToolKind  string            `json:"tool_kind,omitempty"`
 		SessionID string            `json:"session_id,omitempty"`
 		Ask       *agent.AskRequest `json:"ask,omitempty"`
 	}{
@@ -175,7 +176,23 @@ func streamEventPayload(ev agent.StreamEvent) any {
 		Text:      ev.Text,
 		Name:      ev.Name,
 		ID:        ev.ID,
+		ToolKind:  toolKindOfEvent(ev),
 		SessionID: ev.SessionID,
 		Ask:       ev.Ask,
 	}
+}
+
+/* toolKindOfEvent 事件携带的工具子形态（2026-09-29 新增，见 agent/toolkind.go）。
+ *
+ * 只有**工具调用**事件带它：渲染层据此选卡（命令 / 文件变更 / 网页检索 / MCP /
+ * 子代理 / 提问 / 通用），不再靠工具名猜 —— 一处判定、两个界面共用。
+ *
+ * ⚠️ 工具**结果**事件不给：它的 Name 字段放的是「关联的 tool_use.id」（见 StreamEvent
+ * 的注释），拿它去判形态只会把 id 当成工具名。结果的形态由它配上的那张卡承担。
+ * ⚠️ 非工具事件一律空串 → `omitempty` 把它从 wire 上省掉，老消费者的字段集不受影响。 */
+func toolKindOfEvent(ev agent.StreamEvent) string {
+	if ev.Kind != agent.KindToolUse {
+		return ""
+	}
+	return agent.ToolKindFor(ev.Name, ev.Text)
 }

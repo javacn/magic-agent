@@ -46,8 +46,8 @@ func TestStopKillsRealProcessGroup(t *testing.T) {
 	if !res.Stopped {
 		t.Fatalf("应 stopped=true: %+v", res)
 	}
-	if res.Record.State != StateStopped {
-		t.Errorf("state = %q want %q", res.Record.State, StateStopped)
+	if res.Record.State != StateCancelled {
+		t.Errorf("state = %q want %q", res.Record.State, StateCancelled)
 	}
 	if agent.PIDAlive(pid) {
 		t.Errorf("pid %d 还活着 —— 没真停掉", pid)

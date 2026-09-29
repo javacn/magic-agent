@@ -1,29 +1,27 @@
 package agent
 
-// codebuddy.go - CodeBuddy（WorkBuddy / WorkBuddy AI）CLI 引擎。
+// codebuddy.go - CodeBuddy Code CLI 引擎（codebuddy / codebuddy-ai 两个账号）。
 //
-// 两个后端共用本文件的实现核心（codebuddyCore），只差引擎名 / 探测链 / 默认模型：
+// 两个引擎共用本文件的实现核心（codebuddyCore），差异只有三处：引擎名 / 账号 / 默认模型。
+// 二者跑的是**同一个独立安装的 CLI**（npm i -g @tencent-ai/codebuddy-code），
+// 不再使用桌面 App（WorkBuddy / WorkBuddy AI）内置的那一份 —— 那份的凭据由 App
+// 通过 sidecar 通道用受管密钥静态加密，独立进程解不开（at-rest 登记表里
+// read/write 全是 missing-key），引擎只能拿到空输出；见 engine_base.go 的
+// codebuddyBase 注释。
 //
-//	codebuddy      WorkBuddy.app 内置 CLI（后端网关 copilot.tencent.com）
-//	codebuddy-ai   WorkBuddy AI.app 内置 CLI（后端网关 www.workbuddy.ai）
+// 账号怎么分开（一个 CLI 挂两个账号）：
+// CLI 的票据路径是 sharedDataPath/auth/<authentication.id>.info，而 authentication.id
+// 的取值链里 **ACC_PRODUCT_CONFIG_V3（环境变量）优先于 CLI 包内的 product.json**。
+// 给两个子进程注入不同的 id，就等于让它们各用各的账号、互不顶号（2026-09-28 实测）。
 //
-// 两者同为 CodeBuddy Code v2.x：非交互协议与 claude 同源、flag 面一致、Bearer 令牌
-// 各自独立。模型注册表按后端不同：
+//	codebuddy     账号 id  codebuddy     →  auth/codebuddy.info
+//	codebuddy-ai  账号 id  codebuddy-ai  →  auth/codebuddy-ai.info
 //
-//	WorkBuddy  hy3 / glm / kimi / deepseek 等国内模型（清单同下）
-//	AI 端      客户端所见 ~23 个预制模型（分层别名 + gpt-5.x/5.6 + deepseek-v4.1-flash
-//	           等；--help 只有 4 个分层别名，完整清单见 listModels 的三级来源链）
+// 非交互协议与 claude 同源（CodeBuddy Code v2.x）、flag 面一致；模型清单与积分倍率
+// 走同一条扩展链（见 listModels）。
 //
-// 两端的**清单与积分倍率现已同源同链**（都走扩展链，见 listModels）——此前只有
-// codebuddy-ai 启用，codebuddy 的清单按 --help、倍率按 acc 缓存，导致同一引擎的
-// models / model_credits 读自两个文件、官方预制模型大面积缺失（见 listModels）。
-//
-// codebuddy-ai 默认不强制 --model（交 CLI 自身默认，旧静态清单里的 kimi-k3-1 等
-// 实测被国际后端 400 拒绝）。
-//
-// 配置目录隔离：codebuddy-ai 通过 CODEBUDDY_CONFIG_DIR=~/.codebuddy-ai 使用
-// 独立凭据库（见 codebuddyAIDir 注释）—— 共享 ~/.codebuddy 会被桌面 App
-// daemon 切换账号，导致登录态被顶、间歇性 401。
+// 默认模型：codebuddy = hy3；codebuddy-ai 故意留空（交 CLI 自身默认，旧静态清单里的
+// kimi-k3-1 等实测被国际后端 400 拒绝）。
 //
 // 非交互模式输出 envelope 实测有两种形态，解析需兼容：
 //
@@ -48,7 +46,9 @@ package agent
 //	                                 与 claude 同款 --settings 通道，见矩阵①）
 //
 // CLI 路径解析：显式 BinPath → MAGIC_AGENT_CODEBUDDY_BIN / MAGIC_AGENT_CODEBUDDY_AI_BIN
-// → 各自 App 内置路径 → PATH（探测链统一收敛在 engine_base.go 的 cliBase）。
+// → PATH 上的 `codebuddy` → npm 全局 bin 目录（探测链统一收敛在 engine_base.go 的
+// cliBase）。**已不再探测桌面 App 包内的路径** —— 那是导致 missing-key 空输出的那份，
+// 原因见 codebuddyBase 注释。
 //
 // ⚠️ 在 WorkBuddy 会话内调用时，父进程注入的 SERVER__PORT 会让 CLI 抢
 // 父会话已监听的端口 → EADDRINUSE → 永久挂起。子进程环境由 env.go
@@ -77,7 +77,8 @@ type codebuddyCore struct {
 	// model 默认模型（空 = 不传 --model，交 CLI 自身默认）。
 	model string
 	// extraEnv 追加给子进程的环境变量（Go exec：重复 key 取最后 → 覆盖继承值）。
-	// codebuddy-ai 用它把 CODEBUDDY_CONFIG_DIR 指向独立配置目录（见 codebuddyAIExtraEnv）。
+	// 两个引擎都用它注入「配置目录 + 账号标识（ACC_PRODUCT_CONFIG_V3）」，
+	// 从而实现「同一个 CLI、两个账号」，见 codebuddyAccountEnv。
 	extraEnv []string
 	// extendedModelSources 启用扩展模型清单来源（两个 codebuddy 引擎均为 true）：
 	// ① 桌面客户端合并配置缓存 acc-product-config（客户端模型选择器同源，
@@ -89,9 +90,14 @@ type codebuddyCore struct {
 	// （见 codebuddyAIModelCacheDirs / codebuddyModelCacheDirs）。
 	modelCacheDirs []string
 	// accConfigPath 该引擎对应桌面客户端的合并产品配置缓存路径（构造时算好：
-	// codebuddyAIAccConfigPath / codebuddyAccConfigPath）。两个用途：
-	// extendedModelSources=true 时是扩展清单链 ①；一律用于 modelCredits 的首选 ①。
+	// codebuddyAIAccConfigPath / codebuddyAccConfigPath）。三个用途：
+	// extendedModelSources=true 时是扩展清单链 ①；一律用于 modelCredits 的首选 ①；
+	// 以及**自定义模型端点同步**的来源（见 custom_models.go）。
 	accConfigPath string
+	// configDir 该引擎自己的配置目录（codebuddyDir / codebuddyAIDir），
+	// 即 CLI 读 models.json 的地方 —— 自定义模型端点同步的落点。
+	// 用户显式设了 CODEBUDDY_CONFIG_DIR 时以那个为准（见 effectiveConfigDir）。
+	configDir string
 }
 
 // bin 探测 CLI 路径（委托 cliBase 统一探测链）。
@@ -125,7 +131,9 @@ func (c codebuddyCore) selectorModels() []string {
 // extendedModelCatalog 扩展来源链（两个 codebuddy 引擎均启用）：返回（模型清单, 积分倍率表, 是否命中）。
 //
 // ① 客户端合并配置缓存 acc-product-config（注册表），按**客户端选择器清单**
-//    agents[].models 过滤（见 agentSelectorModels / readAccCatalog）
+//
+//	agents[].models 过滤（见 agentSelectorModels / readAccCatalog）
+//
 // ② 远程配置缓存 ∪ App 包 product.json（超集近似，含国内后端条目）
 //
 // 命中 ① 时 ② 不再叠加 —— ① 就是客户端所见，别无二义。倍率表与清单同源同链。
@@ -223,6 +231,9 @@ func (c codebuddyCore) listModels(ctx context.Context) ([]string, error) {
 	if bin == "" {
 		return nil, fmt.Errorf("%s CLI not found", c.name)
 	}
+	// 顺带补自定义模型端点（幂等，见 syncCustomModelEndpoints）：
+	// 清单与端点同源，只列清单不同步就会「选得出来、调用报没有 url」。
+	c.syncCustomModelEndpoints()
 	if c.extendedModelSources {
 		// ① 客户端合并配置缓存（客户端模型选择器同源）→ ② 远程配置缓存 ∪
 		// App 包 product.json（超集近似）→ 都没有时落 ③ --help（见函数头）。
@@ -241,6 +252,15 @@ func (c codebuddyCore) listModels(ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
+// syncCustomModelEndpoints 顺带把 App 里配好的自定义模型端点补进 CLI 的 models.json。
+//
+// 为什么放在 listModels：清单本身来自同一份 acc 缓存，**只列清单不同步端点**就会出现
+// 「模型选择器里列得出来、选了就报 has no endpoint url configured」。
+// best-effort（错误忽略）：同步失败不该让模型探测失败 —— 官方模型根本不读 models.json。
+func (c codebuddyCore) syncCustomModelEndpoints() {
+	_, _ = syncCustomModelsFromApp(c.accConfigPath, c.effectiveConfigDir())
+}
+
 // complete 单次调用的共享逻辑。
 func (c codebuddyCore) complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
@@ -248,6 +268,8 @@ func (c codebuddyCore) complete(ctx context.Context, req Request) (Response, err
 	if bin == "" {
 		return Response{}, fmt.Errorf("%s CLI not found; set %s", c.name, c.base.envVar)
 	}
+	// 自定义模型才补端点（用户可能刚在 App 里配好就直接 -m 调用，没打开过选择器）。
+	c.ensureCustomModelEndpoint(req.Model)
 
 	// 附件（截图）：与 claude 同族，--print 文本模式收不了图，走
 	// --input-format stream-json（图片 content block 经 stdin）。
@@ -389,6 +411,8 @@ func (c codebuddyCore) stream(ctx context.Context, req Request, onEvent func(Str
 	if bin == "" {
 		return StreamResult{}, fmt.Errorf("%s CLI not found; set %s", c.name, c.base.envVar)
 	}
+	// 自定义模型才补端点（同 complete，见 custom_models.go）。
+	c.ensureCustomModelEndpoint(req.Model)
 
 	args := c.buildArgs(req)
 	if req.Append != nil || hasImageAttachment(req.Attachments) {
@@ -497,9 +521,10 @@ func (c codebuddyCore) stream(ctx context.Context, req Request, onEvent func(Str
 	}, nil
 }
 
-// ── codebuddy：WorkBuddy.app 后端 ─────────────────────────────
+// ── codebuddy：主账号 ────────────────────────────────────────
 
-// CodeBuddyEngine 通过 WorkBuddy.app 内置的 codebuddy CLI 实现 Engine。
+// CodeBuddyEngine 通过**独立安装**的 CodeBuddy Code CLI 实现 Engine。
+// 账号标识 "codebuddy" → 票据 sharedDataPath/auth/codebuddy.info。
 type CodeBuddyEngine struct {
 	// BinPath 显式指定 CLI 路径（空 = 自动探测）。测试注入用。
 	BinPath string
@@ -525,9 +550,11 @@ func (e *CodeBuddyEngine) core() codebuddyCore {
 		base:                 codebuddyBase,
 		binPath:              e.BinPath,
 		model:                DefaultCodeBuddyModel,
+		extraEnv:             codebuddyAccountEnv(codebuddyDir(), codebuddyAuthID, codebuddyAuthIDEnv),
 		extendedModelSources: true,
 		accConfigPath:        codebuddyAccConfigPath(),
 		modelCacheDirs:       codebuddyModelCacheDirs(),
+		configDir:            codebuddyDir(),
 	}
 }
 
@@ -536,6 +563,16 @@ func (e *CodeBuddyEngine) bin() string { return e.core().bin() }
 
 // Detect 实现 Engine。
 func (e *CodeBuddyEngine) Detect() (bool, string) { return e.core().detect() }
+
+// LoginCommand 实现 LoginRunner：拉起交互式会话（进去执行 /login）。
+// 带上本引擎的账号环境，确保登录结果落进本引擎用的票据 auth/codebuddy.info。
+func (e *CodeBuddyEngine) LoginCommand() (string, []string, []string, error) {
+	bin := e.bin()
+	if bin == "" {
+		return "", nil, nil, fmt.Errorf("%s CLI not found; set %s", e.Name(), codebuddyBase.envVar)
+	}
+	return bin, nil, codebuddyAccountEnv(codebuddyDir(), codebuddyAuthID, codebuddyAuthIDEnv), nil
+}
 
 // ListModels 实现 ModelLister。
 func (e *CodeBuddyEngine) ListModels(ctx context.Context) ([]string, error) {
@@ -571,17 +608,18 @@ func (e *CodeBuddyEngine) buildArgs(req Request) []string { return e.core().buil
 // buildArgsBase 构造参数（不含末尾的位置参数 prompt）。
 func (e *CodeBuddyEngine) buildArgsBase(req Request) []string { return e.core().buildArgsBase(req) }
 
-// ── codebuddy-ai：WorkBuddy AI.app 后端 ───────────────────────
+// ── codebuddy-ai：第二个账号 ─────────────────────────────────
 
 // DefaultCodeBuddyAIModel codebuddy-ai 引擎的默认模型。
 //
-// 故意留空：WorkBuddy AI（国际后端）的模型注册表与静态 --help 清单有漂移
-// （--help 里的 kimi-k3-1 / deepseek-v4-pro 实测被后端 400 拒绝），强制指定
-// hy3 有同款风险，故默认不传 --model、交 CLI 自身默认；-m 仍可显式指定。
+// 故意留空：国际站账号的模型注册表与静态 --help 清单有漂移（--help 里的
+// kimi-k3-1 / deepseek-v4-pro 实测被后端 400 拒绝），强制指定 hy3 有同款风险，
+// 故默认不传 --model、交 CLI 自身默认；-m 仍可显式指定。
 const DefaultCodeBuddyAIModel = ""
 
-// CodeBuddyAIEngine 通过 WorkBuddy AI.app 内置的 codebuddy CLI 实现 Engine。
-// 协议 / flag 面与 CodeBuddyEngine 完全一致，仅后端网关与 Bearer 令牌不同。
+// CodeBuddyAIEngine 与 CodeBuddyEngine 用**同一个**（独立安装的）CodeBuddy Code CLI，
+// 只是账号不同：account id "codebuddy-ai" → 票据 sharedDataPath/auth/codebuddy-ai.info。
+// 协议 / flag 面完全一致。
 type CodeBuddyAIEngine struct {
 	// BinPath 显式指定 CLI 路径（空 = 自动探测）。测试注入用。
 	BinPath string
@@ -601,6 +639,7 @@ func (e *CodeBuddyAIEngine) core() codebuddyCore {
 		extendedModelSources: true,
 		modelCacheDirs:       codebuddyAIModelCacheDirs(),
 		accConfigPath:        codebuddyAIAccConfigPath(),
+		configDir:            codebuddyAIDir(),
 	}
 }
 
@@ -703,14 +742,10 @@ func codebuddyModelCacheDirs() []string {
 
 // codebuddyAIDir codebuddy-ai 引擎的专用配置目录（~/.codebuddy-ai）。
 //
-// 为什么不共用 ~/.codebuddy（2026-09-21 实测根因）：两个桌面 App（WorkBuddy /
-// WorkBuddy AI）的 daemon 与两个 CLI 共享同一份凭据库，且各自会切换「活动账号」
-// —— 谁后写谁生效。CLI 登录写入的会话会被 WorkBuddy AI 桌面 daemon 顶掉
-// （实测顶成另一账号，其 refresh token 401），造成引擎间歇性 401 / 空输出。
-// 独立目录让 codebuddy-ai 的登录态只归本引擎，与桌面 App 彻底隔离。
-//
-// 后端网关不受影响：endpoint 定义在 CLI 安装目录的 product.json（随 App 分发），
-// 与配置目录无关（实测 product.json line 11）。
+// 注意：**账号**的隔离靠 authentication.id（见 codebuddyAuthID / codebuddyAIAuthID），
+// 与配置目录无关 —— 票据文件是共享的 sharedDataPath/auth/<id>.info。
+// 这里分目录是为了让两个引擎的 settings / keyblob / 会话 / 插件缓存各归各的，
+// 避免互相覆盖（历史上共享目录时出现过登录态被顶）。
 func codebuddyAIDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -719,13 +754,72 @@ func codebuddyAIDir() string {
 	return filepath.Join(home, ".codebuddy-ai")
 }
 
-// codebuddyAIExtraEnv 返回 codebuddy-ai 子进程的隔离环境变量。
-// 用户已显式设置 CODEBUDDY_CONFIG_DIR 时尊重之（不覆盖）。
-func codebuddyAIExtraEnv() []string {
-	if os.Getenv("CODEBUDDY_CONFIG_DIR") != "" {
-		return nil
+// ── 账号隔离：一个 CLI，两个账号 ─────────────────────────────
+//
+// CLI 的票据路径由 authentication.id 决定：
+//
+//	sharedDataPath/auth/<authentication.id>.info   （sharedDataPath 与配置目录无关）
+//
+// 而 authentication.id 的取值链是：
+//
+//	① 合并后的产品配置 → ② ACC_PRODUCT_CONFIG_PATH 指向的文件
+//	→ ③ ACC_PRODUCT_CONFIG_V3 / _V2（环境变量里的 JSON）→ ④ CLI 包内 product.json
+//
+// 实测（2026-09-28）：独立运行时 ①② 为空，③ 生效 —— 给两个子进程注入不同的 id，
+// CLI 就各读各的票据、各用各的账号，互不顶号（改 id 后立刻改读另一份 .info 并能正常出正文）。
+//
+// ⚠️ ACC_PRODUCT_CONFIG_PATH 必须**清空**：父会话（WorkBuddy App / 内嵌会话）会把它
+// 指到自己的 acc-product-config，而它优先级**高于** ③，会把账号选回 App 的默认账号。
+const (
+	// codebuddyAuthID codebuddy 引擎的账号标识（票据 auth/codebuddy.info）。
+	codebuddyAuthID = "codebuddy"
+	// codebuddyAIAuthID codebuddy-ai 引擎的账号标识（票据 auth/codebuddy-ai.info）。
+	codebuddyAIAuthID = "codebuddy-ai"
+
+	// codebuddyAuthIDEnv / codebuddyAIAuthIDEnv：各引擎自己的账号覆盖变量
+	//（临时切到别的账号用；不读通用的 ACC_PRODUCT_CONFIG_V3，理由见 codebuddyAccountEnv）。
+	codebuddyAuthIDEnv   = "MAGIC_AGENT_CODEBUDDY_AUTH_ID"
+	codebuddyAIAuthIDEnv = "MAGIC_AGENT_CODEBUDDY_AI_AUTH_ID"
+)
+
+// codebuddyAccountEnv 构造「选定账号」的子进程环境变量。
+//
+//   - ACC_PRODUCT_CONFIG_PATH 恒清空（见上）
+//   - ACC_PRODUCT_CONFIG_V3   只声明 authentication.id
+//   - CODEBUDDY_CONFIG_DIR    该引擎自己的配置目录（settings / keyblob / 会话）；
+//     用户已显式设置时尊重之
+//
+// 想临时换账号：设**各引擎自己的** authIDEnv（见 codebuddyAuthIDEnv /
+// codebuddyAIAuthIDEnv）。刻意**不**读通用的 ACC_PRODUCT_CONFIG_V3 当覆盖 ——
+// 那个变量一旦在全局会话里存在，两个引擎就会静默合并成同一个账号，
+// 「一个 CLI 挂两个账号」的设计当场作废。
+func codebuddyAccountEnv(configDir, authID, authIDEnv string) []string {
+	if v := strings.TrimSpace(os.Getenv(authIDEnv)); v != "" {
+		authID = v
 	}
-	return []string{"CODEBUDDY_CONFIG_DIR=" + codebuddyAIDir()}
+	env := []string{
+		"ACC_PRODUCT_CONFIG_PATH=",
+		`ACC_PRODUCT_CONFIG_V3={"authentication":{"id":"` + authID + `"}}`,
+	}
+	if os.Getenv("CODEBUDDY_CONFIG_DIR") == "" {
+		env = append(env, "CODEBUDDY_CONFIG_DIR="+configDir)
+	}
+	return env
+}
+
+// codebuddyDir codebuddy 引擎的配置目录（= CLI 默认目录 ~/.codebuddy）。
+func codebuddyDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".codebuddy")
+}
+
+// codebuddyAIExtraEnv 返回 codebuddy-ai 子进程的账号环境变量。
+// 与 codebuddy 的差异只在账号标识与配置目录，二进制是同一个。
+func codebuddyAIExtraEnv() []string {
+	return codebuddyAccountEnv(codebuddyAIDir(), codebuddyAIAuthID, codebuddyAIAuthIDEnv)
 }
 
 // bin 探测 codebuddy-ai CLI 路径。
@@ -733,6 +827,16 @@ func (e *CodeBuddyAIEngine) bin() string { return e.core().bin() }
 
 // Detect 实现 Engine。
 func (e *CodeBuddyAIEngine) Detect() (bool, string) { return e.core().detect() }
+
+// LoginCommand 实现 LoginRunner：拉起交互式会话（进去执行 /login）。
+// 与 CodeBuddyEngine 用同一个二进制，账号环境不同（票据 auth/codebuddy-ai.info）。
+func (e *CodeBuddyAIEngine) LoginCommand() (string, []string, []string, error) {
+	bin := e.bin()
+	if bin == "" {
+		return "", nil, nil, fmt.Errorf("%s CLI not found; set %s", e.Name(), codebuddyAIBase.envVar)
+	}
+	return bin, nil, codebuddyAIExtraEnv(), nil
+}
 
 // ListModels 实现 ModelLister。
 func (e *CodeBuddyAIEngine) ListModels(ctx context.Context) ([]string, error) {

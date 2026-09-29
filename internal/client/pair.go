@@ -30,25 +30,64 @@ import (
  * 而那条链接正是我打印给用户点的。**守卫拦住的必须是攻击者，不能是正确用法**。
  */
 
-// pairURL 拼出配对地址：用请求里的 host（含端口），带上令牌。
+// pairURL 拼出配对地址：**外部入口**优先，退回请求自身的 host（含端口），带上令牌。
+//
+// ⚠️ 为什么要认 X-Forwarded-*：隧道 / nginx 这类入口要在这里终止 TLS，源侧收到的是明文
+// HTTP —— 请求本身看不出「外面其实是 https」。第一版写死 `http://` + `r.Host`，隧道下
+// 生成的二维码就编成了 `http://<公网域名>/?token=…`：手机扫出来的一瞬间，令牌跟着一条
+// 明文请求先发到边缘节点。能不能靠 301 跳回 https 是另一回事，**不该拿跳转当密钥的兜底**。
+// （这条是隧道实测暴露的，不是推演出来的。）
+//
+// 信任边界：这两个头能被本机进程伪造。但 /pair* 本来就走令牌鉴权，能伪造的人已经持有令牌，
+// 它能改变的只是「二维码写给谁看」；真正要挡的没令牌的人连这个页面都拿不到。
 func (s *Service) pairURL(r *http.Request) string {
-	host := r.Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	u := "http://" + host + "/"
+	scheme, host := pairTarget(r)
+	u := scheme + "://" + host + "/"
 	if s.opts.Token != "" {
 		u += "?token=" + s.opts.Token
 	}
 	return u
 }
 
+// pairTarget 求出「手机该连哪儿」：外部入口给的 scheme+host，没有就退回请求自身的。
+//
+// 单独抽出来是因为 /desk/pair 也要报同一个 host —— 两处各拼一次就会漂移，
+// 而这类漂移的表现是「壳里显示的地址是对的、二维码扫出来是错的」，最难查。
+func pairTarget(r *http.Request) (scheme, host string) {
+	scheme = "http"
+	if p := firstForwarded(r.Header.Get("X-Forwarded-Proto")); p != "" {
+		scheme = p
+	}
+	host = firstForwarded(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return scheme, host
+}
+
+// firstForwarded 取逗号分隔转发头的第一段（`a, b` → `a`）并去掉空白：
+// 代理链会把多跳叠成一串，最左边那个才代表最初的客户端。
+func firstForwarded(v string) string {
+	if i := strings.Index(v, ","); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
+}
+
 // handlePairInfo 机器读：给壳 / 自动化用。
+//
+// host 给的是**外部**主机（与 url / 二维码一致）；requestHost 另给一份原始值做排障 ——
+// 隧道下这两个不一样（原始值是 127.0.0.1:端口），而壳真正要用的是前者。
 func (s *Service) handlePairInfo(w http.ResponseWriter, r *http.Request) {
+	_, host := pairTarget(r)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url":  s.pairURL(r),
-		"host": r.Host,
-		"hint": "手机端扫 /pair 页面上的二维码；地址与令牌都在这个 url 里。",
+		"url":         s.pairURL(r),
+		"host":        host,
+		"requestHost": r.Host,
+		"hint":        "手机端扫 /pair 页面上的二维码；地址与令牌都在这个 url 里。",
 	})
 }
 

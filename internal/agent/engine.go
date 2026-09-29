@@ -11,7 +11,7 @@
 //	engine_base.go — 公共基座：统一探测链（cliBase）+ 统一参数矩阵
 //	prompt.go      — 多轮消息扁平化为单条 prompt 的公共逻辑
 //	claude.go      — Claude Code CLI 引擎（--print --output-format json）
-//	codebuddy.go   — CodeBuddy（WorkBuddy）CLI 引擎
+//	codebuddy.go   — CodeBuddy Code CLI 引擎（一个独立 CLI、两个账号）
 //	trae.go        — Trae CLI 引擎（-p，无 --model flag，-c model.name= 覆盖）
 //	llmengine.go   — simonw/LLM CLI 引擎（-m / -s / -o 透传）
 //	codex.go       — Codex CLI 引擎（exec / exec resume + --output-schema）
@@ -188,6 +188,17 @@ type Request struct {
 	// 默认值是否开启按引擎区分，见 AppendDefaultOn（dsh 默认关）。
 	Append <-chan string
 
+	// OnSessionID 引擎发现 session_id 时回调（用于「看历史」持久化）。
+	//
+	// 谁需要它：CLI 在 runStreamAsk 里包一个 sessionWriter，每条事件落盘到
+	// `<dir>/<session_id>.jsonl`。但 session_id 出现得早（claude 的 init 行就有），
+	// 而引擎先发完初始帧 → 调用方再开文件 → 早期帧全丢；这个回调让 writer
+	// **在收到第一条 init 行时就开好文件**，避免丢前几条事件。
+	//
+	// 调用方保证：id 非空时回调；多次回调以最后一次为准；与 onEvent 并发调用，
+	// 调用方需要同步。引擎实现里一般一行 `req.OnSessionID(extract(line))` 即可。
+	OnSessionID func(id string)
+
 	// Timeout 单次尝试的超时（含引擎 CLI 自身执行时间）。
 	// 0 = 引擎默认。
 	Timeout time.Duration
@@ -347,7 +358,8 @@ func Lookup(name string) Engine {
 func initEngines() {
 	Register(&ClaudeEngine{})
 	Register(&CodeBuddyEngine{})
-	// codebuddy-ai 与 codebuddy 同族 CLI、不同后端（WorkBuddy AI / 国际站），
+	// codebuddy-ai 与 codebuddy 用**同一个**独立 CLI，只是账号不同
+	//（ACC_PRODUCT_CONFIG_V3 切 authentication.id，见 codebuddy.go）。
 	// 必须注册在 codebuddy 之后 —— Lookup 取第一个同名匹配，两者名字不同不冲突。
 	Register(&CodeBuddyAIEngine{})
 	// codebuddy-gateway = CodeBuddy 的**第三种接入方式**：不起本机 CLI，而是把 prompt

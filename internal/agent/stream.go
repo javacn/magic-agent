@@ -494,7 +494,14 @@ type streamAccumulator struct {
 	// 送回同一个会话（`--append <session_id>`），而 json 模式下 stderr 保持干净、
 	// 拿不到启动提示里的 run_id。init 行在流的最开头就给了 session_id，
 	// 所以提问出现时这里一定已经有值（与 KindTurnEnd 带 SessionID 同一取舍）。
+	//
+	// 顺带也用它给 `OnSessionID` 兜底（见 stream.go handleNDJSONLine 里 OnSessionID 回调）——
+	// 在 handleNDJSONLine 收到第一条含 session_id 的 NDJSON 行时就触发，开文件早于第一条事件。
 	SessionID string
+
+	// OnSessionID 见 Request.OnSessionID：可选回调，nil 跳过。
+	// CLI 在 runStreamAsk 里 wire 到 sessionWriter 的开文件动作上。
+	OnSessionID func(id string)
 
 	// askSeen 已发过 KindAsk 的请求 key（tool_use_id / request_id / 工具名+入参），用于去重。
 	//
@@ -614,6 +621,12 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 	// 直接把答案追加回同一会话，见 streamAccumulator.SessionID 的说明。
 	if probe.SessionID != "" {
 		a.SessionID = probe.SessionID
+		/* 通知 CLI 「会话 id 已出现」：让 sessionWriter 在写第一条事件之前就能
+		   开好文件，避免「打开文件前的那条 init 行（带 thinking 起点）全丢」。
+		   OnSessionID 是可选字段（nil 跳过），老调用方无需改。 */
+		if a.OnSessionID != nil {
+			a.OnSessionID(probe.SessionID)
+		}
 	}
 
 	switch probe.Type {

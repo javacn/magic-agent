@@ -4,10 +4,10 @@
 判定：模型输出里出现 httpbin 风格的伪造 JSON（含 "headers"/"args" 等
 键）即视为编造（因为 off 模式没有工具，不可能真的拿到 httpbin 返回）。
 """
-import json, os, subprocess, time
+import json, os, shutil, subprocess, time
 
 MA = "/tmp/ma_t2"
-CB = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+CB = os.environ.get("MAGIC_AGENT_CODEBUDDY_BIN") or shutil.which("codebuddy") or ""
 ENV = dict(os.environ)
 ENV["MAGIC_AGENT_CODEBUDDY_BIN"] = CB
 

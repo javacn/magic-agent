@@ -1,6 +1,7 @@
 # 各引擎细节
 
-arkclaw / codebuddy-gateway / llm / dsh / codex 五个引擎的配置、协议与行为细节。
+codebuddy / codebuddy-ai / arkclaw / codebuddy-gateway / llm / dsh / codex
+各引擎的配置、协议与行为细节。
 
 ## arkclaw 引擎（A2A JSON-RPC 网关）
 
@@ -92,6 +93,111 @@ magic-agent -e arkclaw --json-schema '{"type":"object",...}' "输出 JSON"   # �
 | 默认超时 | **10 分钟**（2026-09-24 由 3 分钟上调）：短问答 8~23s，但**带工具循环的长任务要 5 分钟** —— 实测「生成周报」在网关侧 304s 才回；3 分钟会把正文全砍掉 |
 | `-t, --timeout` | **流式与非流式都生效**（2026-09-24 修）：以前流式路径从不设 `req.Timeout`，引擎回落到自己的默认值 → `-t 600s` 被静默忽略，桌面壳上表现为「什么都没显示 · 调用失败 context deadline exceeded」 |
 | 取文 | `result.status.message.parts[].text` → 兜底 `result.artifacts[].parts[].text` |
+
+## codebuddy / codebuddy-ai 引擎（同一个独立 CLI、两个账号）
+
+`-e codebuddy` 与 `-e codebuddy-ai` 跑的是**同一个** CodeBuddy Code CLI ——
+即 `npm i -g @tencent-ai/codebuddy-code` 装出来的那份，**不是**桌面 App 内置的。
+
+| | codebuddy | codebuddy-ai |
+|---|---|---|
+| 二进制 | 同一个（env `MAGIC_AGENT_CODEBUDDY_BIN`） | 同一个（env `MAGIC_AGENT_CODEBUDDY_AI_BIN`） |
+| 账号 id | `codebuddy` | `codebuddy-ai` |
+| 票据文件 | `…/CodeBuddyExtension/Data/Public/auth/codebuddy.info` | 同目录 `codebuddy-ai.info` |
+| 配置目录 | `~/.codebuddy` | `~/.codebuddy-ai` |
+| 默认模型 | `hy3` | 不传（交 CLI 自选） |
+
+**为什么换掉 App 内置 CLI（2026-09-28 实测）**：桌面 App 的凭据由 App 通过 sidecar
+通道用**受管密钥**静态加密（`CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET`），
+密钥只发给 App 自己的子进程 —— 独立起的 CLI 解不开，at-rest 登记表里
+`auth/<id>.info` 的 read/write 全是 `missing-key`，引擎每次只拿到
+「Authentication required」的空输出。独立安装的 CLI 自带可读写的凭据库，
+而且带完整 TUI（能 `/login`）。
+
+**一个 CLI 怎么挂两个账号**：票据路径是 `sharedDataPath/auth/<authentication.id>.info`，
+而 `authentication.id` 的取值链里**环境变量 `ACC_PRODUCT_CONFIG_V3` 优先于 CLI 包内的
+`product.json`**。给两个子进程注入不同的 id，就等于各用各的账号、互不顶号。
+实现见 `internal/agent/codebuddy.go` 的 `codebuddyAccountEnv`。
+
+⚠️ 同时必须**清空** `ACC_PRODUCT_CONFIG_PATH`：父会话（WorkBuddy App / 内嵌会话）
+会把它指到自己的 acc-product-config，那份里的 `authentication.id` 优先级高于 V3，
+会把账号选回 App 的默认账号（实测踩过）。
+
+### 登录
+
+```bash
+magic-agent --login codebuddy        # 拉起交互式会话，在里面执行 /login
+magic-agent --login codebuddy-ai     # 另一个账号，各登各的
+```
+
+`--login` 由 CLI 层 exec 引擎自己给出的命令（`agent.LoginRunner`：bin + 账号环境），
+**账号环境与普通调用同源**，所以不会把两个账号登到同一份票据上。
+
+临时换账号：`MAGIC_AGENT_CODEBUDDY_AUTH_ID` / `MAGIC_AGENT_CODEBUDDY_AI_AUTH_ID`。
+
+### 检测与安装
+
+- 探测链：`MAGIC_AGENT_CODEBUDDY_BIN`（/ `_AI_BIN`）→ PATH 上的 `codebuddy`
+  → npm 全局 bin 目录；**不再探测 App 包内路径**（那是导致 missing-key 的那一份）。
+- `--engines` 的 `install` 字段：`npm install -g @tencent-ai/codebuddy-code`
+  （同一条命令对已装好的引擎重跑 = 升级）。
+
+### 自定义模型端点（`models.json` 自动同步）
+
+桌面 App 里配好的自定义模型（`custom-local:*`）在独立 CLI 下会失败：
+
+```
+Custom model <id> has no endpoint url configured.
+Set the "url" field for this model in your model settings (models.json) and try again.
+```
+
+原因：CLI 的自定义模型端点**只从 `<配置目录>/models.json` 读**，而桌面 App 是在启动 CLI 时
+把端点（`url` / `apiKey`）注入子进程的 —— 独立进程没有这份注入。
+
+引擎在**探测模型时顺带同步**（`listModels` → `syncCustomModelEndpoints`）：
+
+| 引擎 | 端点来源（只读） | 落点 |
+|---|---|---|
+| `codebuddy` | `~/.workbuddy/cache/acc-product-config-v*.json` | `~/.codebuddy/models.json` |
+| `codebuddy-ai` | `~/.workbuddy-ai/cache/acc-product-config-v*.json` | `~/.codebuddy-ai/models.json` |
+
+清单与端点**同源**（都是该引擎的 acc 缓存），所以不会出现「列得出来、选不了」。
+调用侧还有一道兜底：`-m custom-local:*` 时再补一次（用户可能刚在 App 里配好就直接调用）。
+
+约束（见 `internal/agent/custom_models.go`）：只**新增**缺失的 id，不删不改既有条目、
+不动未识别字段（`models.json` 归 CLI 所有）；跳过 `disabled` 条目；无新增不落盘；
+App 缓存只读；文件权限 `0600`（含第三方 `apiKey`）。用户显式设了
+`CODEBUDDY_CONFIG_DIR` 时，落点跟着走。
+
+### 提问（AskUserQuestion）：不支持
+
+`--engines` 里 codebuddy / codebuddy-ai 的 `ask` 字段是 **`"none"`** —— 这两个引擎**产生不了决策卡**。
+
+官方文档把 `AskUserQuestion` 列为内置工具（Requires Permission: Yes），但**可用性有宿主门槛**：
+CLI 只把它交给第一方宿主（官方 App / IDE），第三方宿主驱动的通道下**模型根本看不到它**。
+2026-09-28 实测七种配置，全部拿不到 —— 模型一律 `ToolSearch` 搜不到、自述"注册表里没有"，
+最后退化成**文字提问**（这正是「正文说'有两个决定要你拍'、UI 却没有卡片」的原因）：
+
+| 配置 | 结果 |
+|---|---|
+| `-p` 文本 / `--print --output-format json` | ❌ |
+| `--tools default` / 显式白名单 / `--allowedTools AskUserQuestion` | ❌ |
+| `-y`(bypassPermissions) / `auto` / `default` | ❌ |
+| SDK initialize 声明 `capabilities.elicitation.form` | ❌ |
+| `CODEBUDDY_HOST_CAPABILITIES=elicitation.form` | ❌ |
+| `--acp`（initialize + session/new + session/prompt） | ❌ |
+| `--acp` + `clientCapabilities.elicitation.form=true` | ❌ |
+
+佐证：该工具**只在 CLI init 行的 75 个工具注册表里出现**，不进模型的可用工具列表，`ToolSearch`
+也索引不到；而 `elicitation.form` 解锁的是 `AskUserForStructuredInput`（文档明说"否则不暴露给模型"），
+不是 `AskUserQuestion`。CLI dist 里提问走的是「工具审批/中断」通道（ACP 的
+`handleToolApproval → requestPermission`、SDK 的 `perm_`/`elic_` 前缀），属第一方宿主面。
+
+**所以能力表如实报 `none`**：此前按"claude/codebuddy 同族协议"推断成支持，会让上层 UI
+承诺一张永远不会出现的决策卡——比"不支持"更糟。**需要决策卡请用 `claude` 引擎。**
+
+（`EncodeAskAnswer` 对 codebuddy 族的**答案编码形状**仍然保留，见 `ask.go` 的
+`askAnswerShapeKnown`：形状官方文档写了，将来该通道打开即可直接复用。）
 
 ## codebuddy-gateway 引擎（webhook + SSE）
 

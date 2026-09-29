@@ -34,7 +34,8 @@ go build -o bin/magic-agent ./cmd/magic-agent   # 从源码构建（Go 1.26+）
 | 引擎 | CLI | 探测路径 / 环境变量 |
 |------|-----|---------------------|
 | claude | Claude Code | `MAGIC_AGENT_CLAUDE_BIN` → `/opt/homebrew/bin/claude` → PATH |
-| codebuddy | WorkBuddy 内置 CLI | `MAGIC_AGENT_CODEBUDDY_BIN` → `WorkBuddy.app/.../cli/bin/codebuddy` → PATH |
+| codebuddy | CodeBuddy Code CLI（`npm i -g @tencent-ai/codebuddy-code`） | `MAGIC_AGENT_CODEBUDDY_BIN` → PATH → npm 全局前缀 |
+| codebuddy-ai | 同上（**同一个 CLI 的第二个账号**） | `MAGIC_AGENT_CODEBUDDY_AI_BIN` → PATH → npm 全局前缀 |
 | trae | trae-cli | `MAGIC_AGENT_TRAE_BIN` → `~/.local/bin/trae-cli` → PATH |
 | llm | [simonw/LLM](https://github.com/simonw/LLM) | `MAGIC_AGENT_LLM_BIN` → `~/.llm-venv/bin/llm` → `/opt/homebrew/bin/llm` → PATH |
 | codex | `@openai/codex` | `MAGIC_AGENT_CODEX_BIN` → `/opt/homebrew/bin/codex` → PATH |
@@ -44,6 +45,18 @@ go build -o bin/magic-agent ./cmd/magic-agent   # 从源码构建（Go 1.26+）
 | codebuddy-gateway | 无（已在跑的 CodeBuddy Code HTTP 网关） | 配置文件的 `codebuddyGateway` 节，或 `MAGIC_AGENT_CBGW_URL` / `_PASSWORD` |
 
 探测链最后一跳是 **npm 全局前缀** `<NPM_CONFIG_PREFIX>/bin`，专治「CLI 装好了、探测却说 not found」（容器常把 `npm i -g` 的落点设成不在 PATH 里的私有前缀）。优先级不变：显式参数 > 环境变量 > 候选路径 > PATH > npm 前缀。
+
+`codebuddy` 与 `codebuddy-ai` 是**一个 CLI、两个账号**：跑同一个二进制，靠
+`authentication.id` 分开票据（`sharedDataPath/auth/<id>.info`），互不顶号。
+各自登录一次即可，登录态落进自己的票据：
+
+```bash
+magic-agent --login codebuddy        # 拉起交互式会话，在里面执行 /login
+magic-agent --login codebuddy-ai     # 同上；两个账号各自独立
+```
+
+> 不再使用 WorkBuddy / WorkBuddy AI 桌面 App 内置的那份 CLI —— 那份的凭据由 App
+> 用受管密钥静态加密，独立进程解不开（`missing-key`），只会拿到空输出。
 
 ## 引擎与模型清单（`--engines`）
 
@@ -164,6 +177,8 @@ magic-agent --stream --no-thinking -e claude "问题"
 
 # 会话
 magic-agent --sessions              # 会话登记表
+magic-agent --session-log <id>      # 读这段会话的事件历史（{session, events}）
+magic-agent --session-log <id> --after 20   # 增量续读：只回 seq > 20 的部分
 magic-agent --stop <session_id>     # 停掉这条会话的引擎进程组
 magic-agent --append <run_id> -p "追加：顺便把 lint 也跑了"
 ```
@@ -190,6 +205,8 @@ magic-agent --append <run_id> -p "追加：顺便把 lint 也跑了"
 | `--json` | 关 | 兼容保留（行为同 `--engines` 的默认 JSON 输出） |
 | `--stop` | 空 | 停止指定会话 / 运行（传 `session_id` 或 `run_id`） |
 | `--sessions` | 关 | 列出会话登记表 |
+| `--session-log` | 空 | 读一段会话的事件历史（传 `session_id` 或 `run_id`）；输出 `{session, events}` |
+| `--after` | `0` | 配合 `--session-log` 增量续读：只回 `seq > N` 的事件（另附 `count/after/lastSeq/snapshotRequired`） |
 | `--keep-alive` | **开** | 常驻会话（仅 `claude`/`codebuddy` 的 `--stream` 调用生效） |
 | `--append` | 空 | 向常驻会话追加一条消息（传 `session_id` 或 `run_id`） |
 | `--idle` | `5m` | 常驻会话空闲收工时长（`0` = 本轮结束就收工） |
@@ -267,12 +284,14 @@ magic-agent -p "对比这两张图的差异" -a a.png -a b.png      # 可重复�
 
 ## 需要用户选择（`AskUserQuestion`）
 
-模型发起 `AskUserQuestion`（或工具调用待授权）时，claude / codebuddy 在 wire 上是两种完全不同的形状。magic-agent 把它们归一化成一份统一格式，`--stream` 输出里多一类 `ask` 事件（消息里带 `questions` / `options`），上层 UI 拿到后渲染给用户，再用 `--append` 把选择传回去。
+模型发起 `AskUserQuestion`（或工具调用待授权）时，claude 是普通 `tool_use` 块、codebuddy 族是 `control_request`——wire 上两种完全不同的形状。magic-agent 把它们归一化成一份统一格式，`--stream` 输出里多一类 `ask` 事件（消息里带 `questions` / `options`），上层 UI 拿到后渲染给用户，再用 `--append` 把选择传回去。
 
 ```bash
 magic-agent --engines --no-models | jq -r '.[] | "\(.engine)\t\(.ask)"'
-# claude / codebuddy → "tool:AskUserQuestion"；其余 → "none"
+# claude → "tool:AskUserQuestion"；其余（含 codebuddy 族）→ "none"
 ```
+
+> ⚠️ **codebuddy / codebuddy-ai 报 `none` 是实测结论（2026-09-28）**：官方文档把 `AskUserQuestion` 列为内置工具，但 CLI 只把它交给第一方宿主（官方 App / IDE）——第三方宿主驱动的通道下模型**根本看不到该工具**。七种配置实测全部拿不到（`-p` / `--tools default` / 白名单 / `--allowedTools` / `-y` / `auto` / SDK 声明 `capabilities.elicitation.form` / `CODEBUDDY_HOST_CAPABILITIES` / `--acp` ± `elicitation.form`），模型一律搜索不到、退化成文字提问。此前按"同族协议"推断成支持，会让上层 UI 承诺永远不出现的决策卡。**需要决策卡请用 `claude` 引擎。** 详见 [docs/engines.md](docs/engines.md)。
 
 wire 形状、三条通道与接住回答的写法见 [docs/notes.md](docs/notes.md)。
 

@@ -50,10 +50,15 @@ func (u *unavailableEngine) Complete(context.Context, agent.Request) (agent.Resp
 }
 
 func TestEnginesInstallCommandByAvailability(t *testing.T) {
-	// 三个假引擎：不可用但有一键安装命令（openclaw）、不可用且没有（codebuddy-ai 是 GUI 应用）、
-	// 可用且有一键安装命令（llm，用来钉「可用时也给 = 当升级用」）。
+	// 四个假引擎：
+	//   不可用 + 有一键安装命令（openclaw）
+	//   不可用 + 也有（codebuddy-ai：2026-09-28 起是**独立安装**的 CodeBuddy Code CLI，
+	//     不再是桌面 GUI 应用）
+	//   不可用 + 没有（codebuddy-gateway：它要的是「把网关跑起来」而不是安装）
+	//   可用 + 有一键安装命令（llm，用来钉「可用时也给 = 当升级用」）
 	registerFake(&unavailableEngine{name: "openclaw"})
 	registerFake(&unavailableEngine{name: "codebuddy-ai"})
+	registerFake(&unavailableEngine{name: "codebuddy-gateway"})
 	registerFake(&stringEngine{name: "llm", text: "x"})
 
 	stdout, _, err := runAskCmd(t, "", "--engines", "--no-models")
@@ -93,20 +98,36 @@ func TestEnginesInstallCommandByAvailability(t *testing.T) {
 	}
 
 	// 2) 不可用但没有可执行安装命令：install 必须为空（原因在 note）。
+	foundGateway := false
+	for _, r := range rows {
+		if r.Engine != "codebuddy-gateway" {
+			continue
+		}
+		if r.OK {
+			t.Fatal("codebuddy-gateway 假引擎应报 ok:false")
+		}
+		foundGateway = true
+		if r.Install != "" {
+			t.Errorf("codebuddy-gateway（要的是「把网关跑起来」，不是安装）不该给 install，got %q", r.Install)
+		}
+		if r.Note == "" {
+			t.Error("codebuddy-gateway 不可用却没给 note（怎么才能用要靠它说明）")
+		}
+	}
+	if !foundGateway {
+		t.Fatal("--engines 缺 codebuddy-gateway 行")
+	}
+
+	// 2b) codebuddy-ai 改成独立安装的 CLI 之后，要给一键安装命令
+	//     （2026-09-28：不再走桌面 App 内置 CLI，见 engine_base.go 的 codebuddyBase 注释）。
 	foundAI := false
 	for _, r := range rows {
 		if r.Engine != "codebuddy-ai" {
 			continue
 		}
-		if r.OK {
-			t.Fatal("codebuddy-ai 假引擎应报 ok:false")
-		}
 		foundAI = true
-		if r.Install != "" {
-			t.Errorf("codebuddy-ai（GUI 应用）不该给 install，got %q", r.Install)
-		}
-		if r.Note == "" {
-			t.Error("codebuddy-ai 不可用却没给 note（怎么才能用要靠它说明）")
+		if want := agent.InstallCommandOf("codebuddy-ai"); r.Install != want {
+			t.Errorf("codebuddy-ai 的 install = %q want %q", r.Install, want)
 		}
 	}
 	if !foundAI {

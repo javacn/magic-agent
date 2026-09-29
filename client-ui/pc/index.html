@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>magic-agent · 对话</title>
+<!--
+  PC 端基础 UI —— **从 magic-test 现成的对话框复制而来**，不是重画一份。
+
+  ── 为什么反过来抄 magic-test ──
+    那份对话框是长期打磨出来的：气泡 / 工具卡 / 思考块 / markdown / 文件变更 / diff
+    这些渲染细节都带着真实报障的修法（见各文件的头注释）。重新按别的设计画一遍，
+    等于把这些经验丢掉再踩一遍。所以这里先**原样搬过来**，再在此基础上找增强点。
+
+  ── 目录 ──
+    app.css            整份从 magic-test/app.css 复制（5110 行，逐字未改）
+    vendor/            第三方库：marked（markdown）/ purify（消毒）/ highlight（代码高亮，按需加载）
+                       从 magic-test/vendor 复制。floating-ui 未用（弹出层定位是本仓库自写的简化版）
+    assets/            icon.png（bot 头像）+ damiao-mascot.png（输入框角落吉祥物）
+    js/00-base.js      $ / $$ / escHtml / toast / htmlWrite / qaImeComposing —— 也从上游搬来
+    js/04-task-list.js  任务状态 + 引擎 / 模型 / 权限档位 + 能力探测（整份逐字复制，424 行）
+    js/91-workbench-stubs.js 工作台侧符号：纯函数原样搬，缺失能力一律如实说（增强点清单）
+    js/10-markdown.js  markdown 渲染
+    js/03-chat-message.js      消息渲染（气泡 / 工具卡 / 思考块 …）
+    js/29-msg-variants.js      消息变体（气泡/标记/工具卡/代码面板/文件变更/Diff）
+    js/08-ask-event-map.js     引擎事件 → 归一化形态
+    js/09-stream-apply.js  事件→画面 的映射管线（从 09-ask-event.js 取 1–365 行）
+    js/07-chat-stream-render.js 流式渲染与事件委托（含 qaSend / qaStopActive）
+    js/06-ask-answer.js 提问卡作答与待发队列
+    js/05-task-list-render.js 会话登记与快照
+    js/19-attachments.js 附件 + ＋菜单 + askBoxMountAll（输入框的挂载入口）
+    js/18-askbox.js    融合输入框（含 ＋ / 引擎 / 模型 / 权限 四只菜单的标记）
+    js/92-composer.js  撰写区交互层：四只菜单的开关与点选 + 发送主链 + 事件→画面订阅
+    js/90-glue.js      只在这一层做适配：transport、desk 桥、挂载
+
+  ── 与上游的差别（只有这一处）──
+    上游这些文件直接调 `window.desk.*`（Electron IPC）。magic-agent 是 CLI，没有 IPC，
+    所以 90-glue.js 提供一层同名的适配，把 desk 的四个通道映射到 transport 上：
+      desk.ask / desk.askStop / desk.askAppend  → transport.ask / control
+      desk.onAskEvent                            → transport.ask 的 onEvent 回调
+    其余片段一个字都没动 —— 这是这次移植的纪律：先搬，再改。
+-->
+<link rel="stylesheet" href="app.css">
+<style>
+/* 宿主自身的最小排布：把对话区铺满窗口。
+   上游这些尺寸由工作台布局给（左栏 + 主区），这里没有工作台，所以补上外层。 */
+html, body { height: 100%; margin: 0; }
+body { overflow: hidden; background: var(--bg-page); }
+#app { height: 100vh; height: 100dvh; display: flex; }
+#view-chat { flex: 1; min-width: 0; display: flex; }
+
+/* ── 左侧会话栏（93-rail.js）─────────────────────────────────────────
+   列表 / 搜索 / 分组那几块**复用 app.css 里现成的 .tk-* 类**（与旧工作台同一套观感）；
+   这里只补它没覆盖的：栏宽、栏头、状态点、行尾菜单。 */
+.pc-rail{
+  width: 248px; flex: none; display: flex; flex-direction: column; gap: 2px;
+  padding: 12px 10px 8px; border-right: 1px solid var(--line);
+  background: var(--bg-page); overflow: hidden;
+}
+.rail-hd{ display: flex; align-items: center; gap: 6px; padding: 0 2px 2px; }
+.rail-title{ flex: 1; min-width: 0; font-family: var(--serif); font-size: 12px; letter-spacing: .08em;
+  color: var(--paper-mute); }
+.rail-acts{ display: flex; align-items: center; gap: 2px; }
+.rail-ic{ width: 22px; height: 22px; display: grid; place-items: center; padding: 0; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px; background: transparent;
+  color: var(--paper-mute); font-size: 13px; line-height: 1; }
+.rail-ic:hover{ color: var(--paper); background: rgba(28,25,23,.06); }
+.rail-dot{ display: block; width: 7px; height: 7px; border-radius: 999px; background: var(--paper-mute); }
+.rail-dot.live{ background: #2E9E6B; box-shadow: 0 0 0 3px rgba(46,158,107,.16); }
+.rail-dot.done{ background: #C9C1B6; }
+.rail-dot.failed{ background: #C4553C; }
+/* 「无历史」标记：这条会话有会话 id（能续接），但引擎当时非流式跑、没留下事件日志。
+   在行上先标出来，免得点开才发现只有一句说明（`93-rail.js` 的 noLog）。 */
+.rail-nolog{
+  flex: none; margin-left: 5px; padding: 0 4px; border-radius: 5px;
+  font-size: 10px; line-height: 15px; color: var(--paper-mute);
+  background: rgba(28,25,23,.05); border: 1px solid rgba(28,25,23,.07);
+}
+#rail-list{ flex: 1; min-height: 0; overflow-y: auto; }
+.rail-menu{
+  position: fixed; z-index: 60; min-width: 168px; padding: 4px;
+  background: #FFFDFB; border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(40,30,20,.14);
+}
+.rail-menu button{
+  display: block; width: 100%; text-align: left; padding: 7px 10px; cursor: pointer;
+  border: none; border-radius: 7px; background: transparent; color: var(--paper);
+  font: 12px/1.5 -apple-system, "PingFang SC", system-ui, sans-serif;
+}
+.rail-menu button:hover{ background: rgba(28,25,23,.06); }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <!-- 左栏：会话清单（数据来自 magic-agent 的 --sessions / --session-log，见 93-rail.js） -->
+  <aside class="pc-rail" id="pc-rail" aria-label="会话列表">
+    <div class="rail-hd">
+      <span class="rail-title">会话</span>
+      <span class="rail-acts">
+        <button class="rail-ic" id="rail-new" type="button" title="新建对话" data-testid="rail-new">＋</button>
+        <button class="rail-ic" id="rail-refresh" type="button" title="刷新列表" data-testid="rail-refresh">↻</button>
+      </span>
+    </div>
+    <div class="tk-search" id="rail-search">
+      <svg class="si" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l4.5 4.5"/></svg>
+      <input id="rail-search-input" type="search" placeholder="搜索会话" autocomplete="off" spellcheck="false" aria-label="搜索会话" data-testid="rail-search" />
+      <button class="sx" id="rail-search-clear" type="button" hidden aria-label="清空搜索" title="清空搜索">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="tk-tabs" id="rail-tabs"></div>
+    <div class="nav-tasks" id="rail-list"></div>
+    <div class="tk-note" id="rail-note"></div>
+  </aside>
+  <section class="view" id="view-chat" data-title="任务对话">
+    <div class="chat-wrap rv rv-1" data-testid="chat-entry">
+      <div class="chat-empty" id="chat-empty">
+        <div class="ce-bubble"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="M6.5 9.5l2.5 2.5-2.5 2.5M11.5 15h6"/></svg></div>
+        <div class="ce-title">描述你要做的事</div>
+        <div class="ce-sub">回答会流式生成，并留存在这个任务里</div>
+      </div>
+      <div class="qa-scroll" id="qa-scroll">
+        <div class="qa-stream" id="qa-stream" hidden></div>
+      </div>
+      <!-- 输入框 = 基础组件 askBox，标记由 askBoxMountAll 注入 -->
+      <div class="home-entry" id="ask-home"></div>
+    </div>
+  </section>
+</div>
+
+<div id="toast" role="status"><span id="toast-msg"></span></div>
+
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="js/00-base.js"></script>
+<script src="js/04-task-list.js"></script>
+<script src="js/91-workbench-stubs.js"></script>
+<script src="js/10-markdown.js"></script>
+<script src="js/03-chat-message.js"></script>
+<script src="js/29-msg-variants.js"></script>
+<script src="js/08-ask-event-map.js"></script>
+<script src="js/09-stream-apply.js"></script>
+<script src="js/07-chat-stream-render.js"></script>
+<script src="js/06-ask-answer.js"></script>
+<script src="js/05-task-list-render.js"></script>
+<script src="js/19-attachments.js"></script>
+<script src="js/18-askbox.js"></script>
+<script src="../shared/transport-http.js"></script>
+<script src="js/92-composer.js"></script>
+<script src="js/93-rail.js"></script>
+<script src="js/90-glue.js"></script>
+</body>
+</html>

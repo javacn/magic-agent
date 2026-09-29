@@ -277,7 +277,7 @@ func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(Strea
 	args := e.buildArgs(req, prompt)
 	args = append(args, "--output-format", "stream-json", "--include-partial-messages")
 
-	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
+	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent, OnSessionID: req.OnSessionID}
 	var fin struct {
 		Type      string `json:"type"`
 		Subtype   string `json:"subtype"`

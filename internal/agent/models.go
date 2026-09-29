@@ -6,7 +6,8 @@ package agent
 // 现取现算，CLI 升级 / 用户注册新模型后 --engines 自动跟随：
 //
 //	引擎      动态来源
-//	claude    ~/.claude/settings.json（顶层 model + env 里 ANTHROPIC_*_MODEL[*_NAME]）①
+//	claude    ~/.claude/settings.json（顶层 model + env 里 ANTHROPIC_*MODEL /
+//	          CLAUDE_CODE_*MODEL 这些 **id 格**）①
 //	codebuddy 扩展来源链（两端同链 ③）：客户端合并配置缓存 acc-product-config
 //	          → 远程配置缓存 ∪ App 包 product.json → `codebuddy --help` 的
 //	          "Currently supported: (...)" 清单（末级兜底）
@@ -20,9 +21,12 @@ package agent
 //
 // ① claude 没有 models 子命令（--help 只有 agents/auth/doctor/mcp/plugin/
 //    project/... ），可用的模型标识只能从用户配置里读：settings.json 的
-//    env 键是 claude 自己的契约（ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL
-//    与 *_MODEL_NAME 指向代理真实模型）。这里按「前缀 ANTHROPIC_ + 后缀
-//    MODEL / MODEL_NAME」过滤键名，不写死具体模型名。
+//    env 键是 claude 自己的契约 —— 每个档位一组四个变量
+//    （ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU,FABLE...}_MODEL = 模型 id，
+//    _MODEL_NAME = 显示名，另有 _MODEL_DESCRIPTION / _MODEL_SUPPORTED_CAPABILITIES），
+//    同形态还有 ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL /
+//    CLAUDE_CODE_SUBAGENT_MODEL。这里按「命名空间 ANTHROPIC_ / CLAUDE_CODE_ +
+//    后缀 MODEL」过滤键名（**只取 id 格**，显示名不算），不写死具体模型名。
 // ② 探测失败/无来源都不算致命：CLI 层把原因写进 models_note，models 字段
 //    留空（见 cli/root.go runEngines）。
 // ③ codebuddy 两端的清单链（2026-09-21 定稿，2026-09-28 两端对齐）：客户端合并
@@ -611,9 +615,34 @@ func parseLLMModelsText(stdout string) []string {
 	return dedupeModels(out)
 }
 
-// claudeModelsFromSettings 从 Claude Code 的 settings.json 抽模型标识：
-// 顶层 model + env 里所有「ANTHROPIC_ 开头、MODEL / MODEL_NAME 结尾」的字符串值
-// （env 里混有非字符串值，如 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1，须跳过）。
+// claudeModelEnvPrefixes Claude Code 里「模型 id」变量所在的命名空间（两个）：
+//
+//	ANTHROPIC_    ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL /
+//	              ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL …
+//	CLAUDE_CODE_  CLAUDE_CODE_SUBAGENT_MODEL（子代理用的模型 id）
+//
+// 为什么不写死具体变量名：档位是可扩展的（本机就出现了 ANTHROPIC_DEFAULT_FABLE_MODEL，
+// 二进制里只有 HAIKU/SONNET/OPUS），按「命名空间 + MODEL 结尾」过滤更耐用。
+// ⚠️ 同一组的 `*_MODEL_NAME` / `*_MODEL_DESCRIPTION` / `*_MODEL_SUPPORTED_CAPABILITIES`
+// 是**显示名/描述/能力位**，不是 id，被「MODEL 结尾」这条挡掉（见下）。
+var claudeModelEnvPrefixes = []string{"ANTHROPIC_", "CLAUDE_CODE_"}
+
+// claudeModelsFromSettings 从 Claude Code 的 settings.json 抽**模型标识**（-m 可取值）：
+// 顶层 model + env 里「ANTHROPIC_ / CLAUDE_CODE_ 开头、且以 MODEL 结尾」的字符串值。
+//
+// 为什么只认 **MODEL 结尾**（2026-09-28 更正）：Claude Code 的 model 类 env 是
+// **一组四个**变量（键名取自 CLI 二进制内的字符串）：
+//
+//	ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL                       ← 模型 id
+//	ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_NAME                  ← 显示名（界面标签）
+//	ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_DESCRIPTION           ← 描述
+//	ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL_SUPPORTED_CAPABILITIES ← 能力位
+//
+// 只有 id 那一格算「模型」；`*_MODEL_NAME` 是给人看的标签
+// （本机那份里是 GLM-5.2 / kimi-k2.6 / deepseek-v4-pro —— 实测「能跑通」不等于
+// 「是模型 id」，路由可能只是回落到默认模型，所以只按命名契约取 id 格）。
+//
+// env 里混有非字符串值（如 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1），须跳过。
 func claudeModelsFromSettings(data []byte) ([]string, error) {
 	var s struct {
 		Model string         `json:"model"`
@@ -632,10 +661,11 @@ func claudeModelsFromSettings(data []byte) ([]string, error) {
 	}
 	sort.Strings(keys) // 固定顺序，便于 diff / 测试
 	for _, k := range keys {
-		if !strings.HasPrefix(k, "ANTHROPIC_") {
+		if !hasAnyPrefix(k, claudeModelEnvPrefixes) {
 			continue
 		}
-		if !strings.HasSuffix(k, "MODEL") && !strings.HasSuffix(k, "MODEL_NAME") {
+		// 只取 id 格：MODEL 结尾。`*_MODEL_NAME` 是显示名，不是可取值。
+		if !strings.HasSuffix(k, "MODEL") {
 			continue
 		}
 		if v, ok := s.Env[k].(string); ok && strings.TrimSpace(v) != "" {
@@ -643,4 +673,14 @@ func claudeModelsFromSettings(data []byte) ([]string, error) {
 		}
 	}
 	return dedupeModels(out), nil
+}
+
+// hasAnyPrefix 判断 s 是否以 prefixes 中任一项开头。
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }

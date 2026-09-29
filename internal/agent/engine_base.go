@@ -127,27 +127,34 @@ var (
 		},
 		notFound: "claude CLI not found (install Claude Code or set MAGIC_AGENT_CLAUDE_BIN)",
 	}
+	// codebuddyBase / codebuddyAIBase 都指向**独立安装**的 CodeBuddy Code CLI
+	// （`npm i -g @tencent-ai/codebuddy-code`），不再用桌面 App 内置的那一份。
+	//
+	// 为什么换掉 App 内置 CLI（2026-09-28 实测根因）：
+	//   桌面 App（WorkBuddy / WorkBuddy AI）的凭据由 App 通过 sidecar 通道用
+	//   **受管密钥**做静态加密（CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET），
+	//   密钥只发给 App 自己的子进程；独立起的 CLI 解不开，
+	//   at-rest 登记表里 `auth/<id>.info` 的 read/write 全是 `missing-key`
+	//   → 引擎每次调用只拿到 "Authentication required" 的空输出。
+	//   而独立安装的 CLI 自带 TUI（可 `/login`）、自带可读写的凭据库，
+	//   并且能用 ACC_PRODUCT_CONFIG_V3 切 authentication.id —— 一个 CLI 并存多个账号。
+	//
+	// 探测链（见 cliBase.resolve）：MAGIC_AGENT_CODEBUDDY_BIN →
+	// PATH 上的 `codebuddy` → npm 全局 bin 目录。candidates 留空 =
+	// 不再探测 App 包内路径（那是导致 missing-key 的那一份）。
 	codebuddyBase = cliBase{
-		binName: "codebuddy",
-		envVar:  "MAGIC_AGENT_CODEBUDDY_BIN",
-		candidates: []string{
-			"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-			"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/cbc",
-		},
-		notFound: "codebuddy CLI not found (install WorkBuddy.app or set MAGIC_AGENT_CODEBUDDY_BIN)",
+		binName:  "codebuddy",
+		envVar:   "MAGIC_AGENT_CODEBUDDY_BIN",
+		notFound: "codebuddy CLI not found (npm install -g @tencent-ai/codebuddy-code, or set MAGIC_AGENT_CODEBUDDY_BIN)",
 	}
-	// codebuddyAIBase 与 codebuddyBase 同族 CLI（CodeBuddy Code 同版本），仅托管方不同：
-	// WorkBuddy → copilot.tencent.com；WorkBuddy AI → www.workbuddy.ai（国际站），
-	// 两者的 Bearer 令牌各自独立（2026-09-21 真机验证）。模型注册表也存在漂移，
-	// 见 codebuddy.go 的 DefaultCodeBuddyAIModel 注释。
+	// codebuddyAIBase 与 codebuddyBase 用**同一个二进制**，差异只在账号：
+	// 两个引擎各自注入不同的 ACC_PRODUCT_CONFIG_V3（authentication.id），
+	// CLI 据此读不同的票据文件 sharedDataPath/auth/<id>.info
+	//（2026-09-28 实测验证）。账号标识见 codebuddy.go 的 codebuddyAuthID / codebuddyAIAuthID。
 	codebuddyAIBase = cliBase{
-		binName: "codebuddy",
-		envVar:  "MAGIC_AGENT_CODEBUDDY_AI_BIN",
-		candidates: []string{
-			"/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-			"/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/cbc",
-		},
-		notFound: "codebuddy-ai CLI not found (install WorkBuddy AI.app or set MAGIC_AGENT_CODEBUDDY_AI_BIN)",
+		binName:  "codebuddy",
+		envVar:   "MAGIC_AGENT_CODEBUDDY_AI_BIN",
+		notFound: "codebuddy CLI not found for codebuddy-ai (npm install -g @tencent-ai/codebuddy-code, or set MAGIC_AGENT_CODEBUDDY_AI_BIN)",
 	}
 	traeBase = cliBase{
 		binName: "trae-cli",
@@ -241,26 +248,36 @@ func (b cliBase) resolve(binPath string) string {
 
 // npmGlobalBinDirs 返回 npm 全局 bin 目录，用于发现 `npm i -g` 装出来的 CLI。
 //
-// 依据：npm 把可执行文件放在 `<prefix>/bin`，而 prefix 由 `NPM_CONFIG_PREFIX`
-// （或小写 `npm_config_prefix`）覆盖 —— 本机实测沙箱就把它指向一个**不在 PATH 里**
-// 的私有前缀，导致 `npm i -g @deepseek-ai/dsh` 明明成功、探测却报 not found。
+// 两段，按优先级：
+//
+//  1. 环境变量 `NPM_CONFIG_PREFIX`（或小写 `npm_config_prefix`）给出的前缀
+//     —— 依据：npm 把可执行文件放在 `<prefix>/bin`。本机实测沙箱就把它指向一个
+//     **不在 PATH 里**的私有前缀，导致 `npm i -g @deepseek-ai/dsh` 明明成功、探测却报 not found。
+//  2. 标准全局前缀兜底 `/opt/homebrew/bin`、`/usr/local/bin`。
+//     为什么需要兜底（2026-09-28）：GUI 启动的进程（magic-test 等）PATH 往往很窄，
+//     既没有 `npm i -g` 的落点、也可能没有 Homebrew 的 bin；而 codebuddy 系现在
+//     依赖**独立安装**的 CodeBuddy Code CLI（`npm i -g @tencent-ai/codebuddy-code`
+//     → 默认落在 `/opt/homebrew/bin`），探测不能把这件事寄托在调用方的 PATH 上。
+//
 // 只读环境变量、不起子进程：探测链会被 `--engines` 对每个引擎调用一次，跑 `npm prefix -g`
 // 会让列表慢上秒级；而「npm 在 PATH 上」的场景本来就能被 LookPath 命中，无需兜底。
 func npmGlobalBinDirs() []string {
 	var dirs []string
 	seen := map[string]bool{}
-	for _, k := range []string{"NPM_CONFIG_PREFIX", "npm_config_prefix"} {
-		p := strings.TrimSpace(os.Getenv(k))
-		if p == "" {
-			continue
-		}
-		d := filepath.Join(p, "bin")
-		if seen[d] {
-			continue
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
 		}
 		seen[d] = true
 		dirs = append(dirs, d)
 	}
+	for _, k := range []string{"NPM_CONFIG_PREFIX", "npm_config_prefix"} {
+		if p := strings.TrimSpace(os.Getenv(k)); p != "" {
+			add(filepath.Join(p, "bin"))
+		}
+	}
+	add("/opt/homebrew/bin") // Apple Silicon Homebrew
+	add("/usr/local/bin")    // Intel Homebrew / Node 官方安装包
 	return dirs
 }
 
@@ -328,6 +345,12 @@ func WorkspaceSupportOf(engine string) string {
 //
 //	claude    npm install -g @anthropic-ai/claude-code
 //	          （官方另有 curl -fsSL https://claude.ai/install.sh | bash、brew install --cask claude-code）
+//	codebuddy npm install -g @tencent-ai/codebuddy-code
+//	codebuddy-ai  同上 —— 两个引擎跑的是**同一个独立 CLI**，只是账号不同
+//	          （靠 ACC_PRODUCT_CONFIG_V3 切 authentication.id，见 codebuddy.go）。
+//	          2026-09-28 起不再使用桌面 App（WorkBuddy.app / WorkBuddy AI.app）内置的那份：
+//	          那份的凭据由 App 用受管密钥静态加密，独立进程解不开（missing-key），
+//	          只会拿到空输出 —— 见 codebuddyBase 注释。
 //	codex     npm install -g @openai/codex
 //	openclaw  npm install -g openclaw@latest（官方文档；装完通常还要 openclaw onboard --install-daemon）
 //	dsh       npm i -g @deepseek-ai/dsh
@@ -339,7 +362,6 @@ func WorkspaceSupportOf(engine string) string {
 //
 // 返回空串 = **没有可执行的一键安装命令**（而不是「不知道」）：
 //
-//	codebuddy / codebuddy-ai  桌面端 GUI 应用（WorkBuddy.app / WorkBuddy AI.app），没有安装命令
 //	arkclaw                   没有二进制也没有 CLI —— 凭据与端点在配置文件里
 //	codebuddy-gateway         同上：它要的不是安装，而是**把网关跑起来**
 //	                          （`codebuddy --serve` 或交互会话里的 `/gateway`），
@@ -353,6 +375,8 @@ func InstallCommandOf(engine string) string {
 	switch engine {
 	case "claude":
 		return "npm install -g @anthropic-ai/claude-code"
+	case "codebuddy", "codebuddy-ai":
+		return "npm install -g @tencent-ai/codebuddy-code"
 	case "codex":
 		return "npm install -g @openai/codex"
 	case "openclaw":

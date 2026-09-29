@@ -96,8 +96,9 @@ func claudeSettingsPath() string {
 //
 // claude 没有 models 子命令（--help 只有 agents/auth/doctor/mcp/plugin/...），
 // 所以清单取自用户配置 ~/.claude/settings.json：顶层 model + env 里
-// ANTHROPIC_*MODEL[*_NAME] 的值 —— 这正是 -m 能收的标识（别名由 CLI 解析，
-// 代理侧不硬编码任何模型名）。
+// ANTHROPIC_*MODEL / CLAUDE_CODE_*MODEL（**id 那一格**）的值 —— 这正是 -m 能收的标识
+// （别名由 CLI 解析，代理侧不硬编码任何模型名）。同组的 `*_MODEL_NAME` 是显示名，不算
+// （见 models.go 的 claudeModelsFromSettings）。
 func (e *ClaudeEngine) ListModels(_ context.Context) ([]string, error) {
 	path := claudeSettingsPath()
 	if path == "" {
@@ -197,7 +198,7 @@ func (e *ClaudeEngine) completeWithAttachments(ctx context.Context, req Request,
 	if err != nil {
 		return Response{}, err
 	}
-	acc := &streamAccumulator{Engine: e.Name()}
+	acc := &streamAccumulator{Engine: e.Name(), OnSessionID: req.OnSessionID}
 	var fin streamJSONResult
 	seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, strings.NewReader(stdin), acc, &fin)
 	if err != nil {
@@ -306,7 +307,7 @@ func (e *ClaudeEngine) Stream(ctx context.Context, req Request, onEvent func(Str
 			stdin = strings.NewReader(line)
 		}
 		args = streamJSONArgs(e.buildArgsBase(req), prompt, true)
-		acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
+		acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent, OnSessionID: req.OnSessionID}
 		var fin streamJSONResult
 		seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, stdin, acc, &fin)
 		if err != nil {

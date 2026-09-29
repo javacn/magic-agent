@@ -107,9 +107,17 @@ func TestCapabilitiesDocumentedEngines(t *testing.T) {
 		}
 	}
 
-	// codebuddy 是桌面端 GUI 应用：没有可执行安装路径，因此没有 engine.install
-	if cb := capabilitiesOfEngine(&CodeBuddyEngine{}); hasCap(cb, CapEngineInstall) {
-		t.Errorf("codebuddy 不应有能力 %s（无安装命令），实际 %v", CapEngineInstall, cb)
+	// codebuddy 系 2026-09-28 起改成**独立安装**的 CodeBuddy Code CLI
+	//（不再是桌面 GUI 应用）→ 有可执行安装路径，因此有 engine.install。
+	for _, e := range []Engine{&CodeBuddyEngine{}, &CodeBuddyAIEngine{}} {
+		if cb := capabilitiesOfEngine(e); !hasCap(cb, CapEngineInstall) {
+			t.Errorf("%s 应有能力 %s（npm 一键安装命令），实际 %v", e.Name(), CapEngineInstall, cb)
+		}
+	}
+	// 反例：没有可执行安装路径的引擎不给 engine.install
+	//（codebuddy-gateway 要的不是安装，而是「把网关跑起来」）。
+	if gw := capabilitiesOfEngine(&CodeBuddyGatewayEngine{}); hasCap(gw, CapEngineInstall) {
+		t.Errorf("codebuddy-gateway 不应有能力 %s（无安装命令），实际 %v", CapEngineInstall, gw)
 	}
 
 	// 走路径降级的引擎：给 attachment.prompt 而不是 attachment.native

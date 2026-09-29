@@ -329,6 +329,46 @@ func TestAskPassesSession(t *testing.T) {
 	}
 }
 
+// TestAskPassesPermission 授权档位要透传给 core 的 --permission。
+// 反面同样重要：**没选档位时不能替 core 补一个默认值** —— core 只在显式传过
+// --permission 时才校验引擎支不支持（internal/cli/ask.go::resolvePermissionTier），
+// 我们替它补默认值会把「显式指定」与「沿用默认」混成一种，让不支持的引擎凭空报错。
+func TestAskPassesPermission(t *testing.T) {
+	svc := newTestService(t, fakeCore(t, goodContract))
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+
+	cases := []struct {
+		name string
+		req  askRequest
+		want string
+	}{
+		{"显式选档", askRequest{Engine: "claude", Prompt: "改代码", Permission: "manual"}, "--permission manual"},
+		{"accept-edits", askRequest{Engine: "claude", Prompt: "改代码", Permission: "accept-edits"}, "--permission accept-edits"},
+		{"full 危险档", askRequest{Engine: "codebuddy", Prompt: "跑起来", Permission: "full"}, "--permission full"},
+		{"未选档位就不传", askRequest{Engine: "claude", Prompt: "只读"}, ""},
+		{"空白按未选处理", askRequest{Engine: "claude", Prompt: "只读", Permission: "   "}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sse := openSSE(t, srv.URL, "tok", c.req)
+			defer sse.close()
+			_ = sse.next(t) // open
+
+			raw, _ := sse.next(t)["raw"].(string)
+			if c.want == "" {
+				if strings.Contains(raw, "--permission") {
+					t.Errorf("未选档位时不该传 --permission，实际 %q", raw)
+				}
+				return
+			}
+			if !strings.Contains(raw, c.want) {
+				t.Errorf("core 收到的参数里应有 %q，实际 %q", c.want, raw)
+			}
+		})
+	}
+}
+
 // TestProjectAPINotConfigured 没配项目后端时 `/api/*` 回 501 并**点名 profile 字段**，
 // 不静默 404（静默 404 会让人以为是模块前端写错了）。
 func TestProjectAPINotConfigured(t *testing.T) {

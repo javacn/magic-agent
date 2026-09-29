@@ -59,23 +59,32 @@ type askOptions struct {
 	engines      bool
 	contract     bool // 输出带版本的契约 envelope（--contract；客户端启动校验用）
 	noModels     bool
-	events       bool // --stream 的事件流带契约版本与行号（--events；客户端消费用）
-	control      bool // 从 stdin 读 NDJSON 控制命令（--control；打断 / 收工 / 回审批）
+	login        string // 拉起某引擎自己的交互式登录会话（--login <engine>）
+	events       bool   // --stream 的事件流带契约版本与行号（--events；客户端消费用）
+	control      bool   // 从 stdin 读 NDJSON 控制命令（--control；打断 / 收工 / 回审批）
 	jsonOut      bool
 	stream       bool
 	noThinking   bool
 	maxTokens    int
 	temperature  float64
 	tempSet      bool
-	jsonSchema   string        // 内联 JSON Schema（仅 llm 引擎走 --schema）
-	session      string        // 会话续接 id（空 = 新会话，默认）
-	continueF    bool          // 续接最近一次会话（-c/--continue；不需要 id）
-	workspace    string        // 工作目录（-w/--workspace；空 = 用调用方 cwd）
-	stop         string        // 停止指定会话/运行（--stop <session_id|run_id>）
-	listSessions bool          // 列出会话登记表（--sessions）
-	keepAlive    bool          // 常驻会话：首轮结束后不退出，等 --append 追加（需配合 --stream）
-	appendTo     string        // 向常驻会话追加消息（--append <session_id|run_id>）
-	idle         time.Duration // 常驻会话空闲收工时长（--idle，仅 --keep-alive 有效）
+	jsonSchema   string // 内联 JSON Schema（仅 llm 引擎走 --schema）
+	session      string // 会话续接 id（空 = 新会话，默认）
+	continueF    bool   // 续接最近一次会话（-c/--continue；不需要 id）
+	workspace    string // 工作目录（-w/--workspace；空 = 用调用方 cwd）
+	stop         string // 停止指定会话/运行（--stop <session_id|run_id>）
+	listSessions bool   // 列出会话登记表（--sessions）
+	// sessionLog 读一段会话的**事件历史**（--session-log <session_id|run_id>）。
+	// 为什么要有它：会话的「查询」能力原先只在 HTTP 插件里（/desk/session/{id}/messages），
+	// 而 magic-agent 自己不跑服务、由调用方（如掌天瓶）直接 exec CLI —— 所以读历史
+	// 必须也是一条 CLI 命令，否则调用方拿不到历史，只能自己解析磁盘格式。
+	sessionLog string
+	// logAfter 增量续读游标（--after <seq>，仅配合 --session-log）：
+	// 调用方报「我已看到 seq=N」，只回 seq > N 的部分。断线重连时不必重传整段历史。
+	logAfter  uint64
+	keepAlive bool          // 常驻会话：首轮结束后不退出，等 --append 追加（需配合 --stream）
+	appendTo  string        // 向常驻会话追加消息（--append <session_id|run_id>）
+	idle      time.Duration // 常驻会话空闲收工时长（--idle，仅 --keep-alive 有效）
 
 	// 四档权限模型（见 internal/agent/permission.go）。仅 claude / codebuddy 接线。
 	permission     string   // 档位：manual | accept-edits | auto | full
@@ -117,6 +126,10 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.BoolVarP(&opts.continueF, "continue", "c", false, "续接当前目录最近一次会话（不需要 session id；与 --session 同时给时 --session 优先）")
 	f.StringVar(&opts.stop, "stop", "", "停止指定会话/运行：传 session_id 或 run_id（--sessions 可见），杀掉它的引擎进程组")
 	f.BoolVar(&opts.listSessions, "sessions", false, "列出会话登记表（JSON 数组：run_id / session_id / pid / engine / state / 起止时间）")
+	/* 会话历史的**读取**命令。与 --sessions（列表）、--stop、--append 同一族：
+	   调用方（掌天瓶等）exec CLI 就能拿到会话数据，不需要 magic-agent 跑任何服务。 */
+	f.StringVar(&opts.sessionLog, "session-log", "", "读一段会话的事件历史（JSON：{session,events}）。传 session_id 或 run_id（--sessions 可见）")
+	f.Uint64Var(&opts.logAfter, "after", 0, "配合 --session-log：增量续读，只回 seq > N 的事件（另附 count/after/lastSeq/snapshotRequired）")
 	f.BoolVar(&opts.keepAlive, "keep-alive", true, "常驻会话：首轮结束后不退出、等 --append 追加（需 --stream）。claude/codebuddy 默认开；dsh 默认关（显式传 --keep-alive 开启）；其余引擎不支持")
 	f.StringVar(&opts.appendTo, "append", "", "向常驻会话追加一条消息：传 session_id 或 run_id，内容用 -p/位置参数给")
 	f.DurationVar(&opts.idle, "idle", 5*time.Minute, "常驻会话空闲收工时长（默认 5m；0 = 本轮结束就收工，追加窗口只在任务运行期间）")
@@ -131,6 +144,7 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.BoolVar(&opts.engines, "engines", false, "列出支持的引擎、本机 CLI 可用性与各引擎当前支持的模型（JSON 数组；每行含 capabilities / models / workspace / streaming 能力字段；不可用的引擎带 install 一键安装命令）")
 	f.BoolVar(&opts.contract, "contract", false, "输出桌面/移动客户端契约：{\"contractVersion\":N,\"engines\":[...]}（engines 与 --engines 同构，另含 capabilities 静态能力字段）。默认不探测模型（快）；要模型写 --no-models=false")
 	f.BoolVar(&opts.noModels, "no-models", false, "配合 --engines / --contract：跳过各引擎的模型探测（只列引擎与可用性，不启动 CLI）")
+	f.StringVar(&opts.login, "login", "", "拉起指定引擎自己的交互式登录会话（如 codebuddy / codebuddy-ai）：自动带上该引擎的账号环境，进去执行 /login 即可；登录态落在该引擎自己的票据上，两个账号互不顶号")
 	f.BoolVar(&opts.jsonOut, "json", false, "兼容保留：--engines 已默认 JSON，本 flag 不再需要")
 	f.BoolVar(&opts.stream, "stream", false, "流式输出：正文/思考增量实时打到 stdout（text 模式思考走 stderr）")
 	f.BoolVar(&opts.events, "events", false, "配合 --stream：事件流带契约版本与行号（每行加 v / seq，并先发一行 ready），供客户端消费；老消费者不要开（形状与 --stream 不同）")
@@ -516,7 +530,61 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	sink := newEventSink(stdout, engine.Name(), opts.events)
+
+	// 「看历史」持久化：每条事件落盘到 <dir>/<session_id>.jsonl，
+	// 移动端进入会话详情时先读这个文件渲染历史，再开 SSE 接续。
+	// 不写盘也不会让流失败；所有写盘错误都进 stderr 警告、流继续（写盘是个独立 goroutine）。
+	sessionLog, err := newSessionWriterAuto(sessionLogDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "magic-agent: 准备会话持久化目录失败：%v（流继续）\n", err)
+		sessionLog = nil
+	} else {
+		defer func() { sessionLog.close() }()
+	}
+	// 把 session_id 推到 writer：CLI 这边的 OnSessionID 回调（引擎流里见到 init 行就调）
+	// 写新 id，writer 自己的写盘 goroutine 读出来开文件。
+	req.OnSessionID = func(id string) {
+		if sessionLog != nil {
+			sessionLog.setSessionID(id)
+		}
+	}
+
+	/* 用户自己的提问也落盘（2026-09-28）。
+	   在此之前落盘的**只有引擎事件** —— 于是从列表点进会话，历史里只有 agent 的回复，
+	   没有「你问的那句话」（实时发消息时气泡正常，因为那条是客户端自己本地渲染的，
+	   不依赖落盘）。移动端渲染器早就预留了 `kind:"user"` 分支，这里一补历史就完整。
+	   ⚠️ 位置很关键：放在 OnSessionID **之后**、流开始**之前**。此刻还不知道 session_id，
+	      writer 会把它收进 pending；等 id 出现时 pending 会**先于**当前事件被写出 ——
+	     所以顺序天然正确，不必在这里自己等 id（等就是把流路径堵住，违反「绝不断流」）。
+	   ⚠️ 只落 `user` 角色：system prompt 是调用参数、不是会话内容，落了会让历史里出现
+	     用户从没说过的话；assistant 正文已由引擎的 text / turn_end 事件覆盖。
+	   ⚠️ 一条 user 消息一条事件：UI 侧一个气泡对应一条，合并成一坨就没法分开渲染。 */
+	if sessionLog != nil {
+		for _, m := range req.Messages {
+			if m.Role != "user" || strings.TrimSpace(m.Content) == "" {
+				continue
+			}
+			sessionLog.push(sessionEvent{Kind: "user", Text: m.Content})
+		}
+	}
+
 	var onEvent func(agent.StreamEvent)
+	wireLogger := func(ev agent.StreamEvent) {
+		if sessionLog == nil {
+			return
+		}
+		// 全部 StreamEventKind 都该落盘：thinking / text / tool_use / tool_result /
+		// ask / turn_end。turn_end 是「这一轮到底了」的最重要标记（flush 到 UI 的
+		// 「一轮结束」线）；历史视图上少一条 turn_end 就看不出「这轮已完」。
+		// ⚠️ 这里只走**引擎事件**。用户提问（kind:"user"）与失败（kind:"error"）
+		//    不由流事件触发，见上面 runStreamAsk 里的 push 与下面的 error 分支。
+		/* ToolKind 与 SSE 流同源（同一个 toolKindOfEvent）：历史回放与实时渲染
+		   因此画出同一种卡，而不是各按工具名猜一套（见 agent/toolkind.go）。 */
+		sessionLog.push(sessionEvent{
+			Kind: string(ev.Kind), Text: ev.Text, Name: ev.Name, ID: ev.ID,
+			ToolKind: toolKindOfEvent(ev), Ask: ev.Ask,
+		})
+	}
 	if format == agent.FormatJSON {
 		onEvent = func(ev agent.StreamEvent) {
 			// --no-thinking 只压制思考过程；工具事件保持透传。
@@ -524,6 +592,7 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 				return
 			}
 			_ = sink.stream(ev)
+			wireLogger(ev)
 		}
 	} else {
 		onEvent = func(ev agent.StreamEvent) {
@@ -550,6 +619,7 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 				// 要真正作答得把答案作为后续 user 消息补进去（agent.EncodeAskFollowUp）。
 				fmt.Fprint(stderr, "❓ "+ev.Text+"\n")
 			}
+			wireLogger(ev)
 		}
 	}
 
@@ -609,14 +679,40 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 	// ready 握手（仅 --events）：客户端据此确认「谁在跑、契约版本是多少」。
 	_ = sink.ready(req.Model)
 
+	/* ── 会话状态的中途写入（2026-09-29，对齐 anywhere 的 TimelineStatus）──
+	   引擎**停下来等用户**（提问 / 工具待授权）时，这条会话仍然活着，但没在跑 ——
+	   界面上该显示「等审批」而不是「生成中」。用户作答、或这一轮的任何后续事件到达时
+	   回到 running。落点选在这里，是因为它同时罩住两条 onEvent（--stream 与 --events），
+	   不必在两个分支里各写一遍（漏一个就会有一条通道的状态是假的）。
+	   写入很快（状态没变时 Mark 直接返回，一轮最多两次落盘），见 session.Handle.Mark。 */
+	if h != nil {
+		inner := onEvent
+		onEvent = func(ev agent.StreamEvent) {
+			if ev.Kind == agent.KindAsk {
+				h.Mark(session.StateWaitingApproval)
+			} else {
+				h.Mark(session.StateRunning)
+			}
+			inner(ev)
+		}
+	}
+
 	res, err := streamer.Stream(ctx, req, onEvent)
-	if ctl != nil && ctl.WasInterrupted() {
+	interrupted := ctl != nil && ctl.WasInterrupted()
+	if interrupted {
 		/* 打断的应答放在这里、而不是命令到达的那一刻：interrupt 的真实含义是
 		   「这一轮真的结束了」。失败链本身就是 context canceled，不必再包一层。 */
 		_ = sink.notice("interrupted", map[string]any{"reason": "control"})
 	}
 	if err != nil {
-		finishSession(h, "", session.StateFailed)
+		/* 被打断 ≠ 失败（2026-09-29）：这里的 err 就是 context canceled，但「用户喊停」
+		   与「引擎报错」是两件事 —— 混成 failed 之后左栏只能显示「失败」，
+		   用户会以为是自己哪里没接好。 */
+		if interrupted {
+			finishSession(h, "", session.StateInterrupted)
+		} else {
+			finishSession(h, "", session.StateFailed)
+		}
 		/* ⚠️ 失败必须留下**调用方读得到**的说明（2026-09-22 修）。
 		   以前这里 json 模式一个字都不写：stdout 空、stderr 只剩前面那些提示行
 		   （如 openclaw 的「指定了模型，本轮改走非流式」）—— 调用方（桌面壳）看到的就是
@@ -629,7 +725,14 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		       老调用方（只读 stderr / 只读 envelope）照旧能拿到原因。
 		   ⚠️ 别把这条只写进 stderr：桌面壳的**换模型重试**判据吃的是事件流与 stderr 两处，
 		     但只认事件的消费方（第三方 jq 管道）会因此永远看不到失败。 */
-		if format == agent.FormatJSON {
+		if interrupted {
+			/* 打断这一支**不发 error 事件**（2026-09-29）：事件流上已经发过 `interrupted`，
+			   再叠一条 error 会让界面把「用户喊停」画成「运行失败」（消费方的 onError 分支），
+			   词表就白分了。stderr 仍留一份 WriteError，排障时看清是哪一个 signal 结束的。
+			   ⚠️ 退出码不动（这里照旧返回 reportedError）—— 改退出码是另一件事，
+			      会连带所有调用方的判错逻辑，不夹带在这次改动里。 */
+			_ = agent.WriteError(stderr, format, engine.Name(), 1, err)
+		} else if format == agent.FormatJSON {
 			_ = sink.event(streamErrorPayload(engine.Name(), err))
 			_ = agent.WriteError(stderr, format, engine.Name(), 1, err)
 		} else {

@@ -17,9 +17,12 @@ package agent
 //	     "content":"Answer questions?","is_error":true,"tool_use_id":"call_01a0…"}]},
 //	   "tool_use_result":"Error: Answer questions?"}
 //
-//	codebuddy（本机构建）连 AskUserQuestion 都不在工具表里（工具表走 ToolSearch /
-//	DeferExecuteTool 的延迟工具集），所以当前不会出现该形态；官方 SDK 文档则与 claude
-//	同构地定义了该工具，故两家共用同一套答案格式。
+//	codebuddy（独立 CLI v2.159.0）**模型根本看不到 AskUserQuestion**：官方文档把它列为
+//	内置工具，但可用性有宿主门槛（只给第一方宿主）。2026-09-28 用七种配置实测全部拿不到
+//	（-p / --tools default / 白名单 / --allowedTools / -y / auto / SDK 声明 elicitation.form /
+//	CODEBUDDY_HOST_CAPABILITIES / --acp ± elicitation.form），模型一律 ToolSearch 搜不到、
+//	退化成文字提问 —— 详见 AskSupportOf 的注释。故能力表如实报 "none"；
+//	下面的答案编码格式仍保留（官方 SDK 文档与 claude 同构，将来若通道打开可直接复用）。
 //
 // 于是「需要用户选择」在 wire 上只有两种形状，本文件把它们归一化成一份统一格式：
 //
@@ -42,9 +45,10 @@ package agent
 //	3. allow 时 updatedInput **必填**，且必须原样回传 questions 数组 —— EncodeAskAnswer
 //	   用「原始 input + answers」的方式保证这一点（不做字段级重建，免得漏字段）。
 //
-// 其余引擎（trae / llm / codex / openclaw / dsh / arkclaw）实测均无 AskUserQuestion 与
-// can_use_tool 协议，能力表 AskSupportOf 返回 "none"（ACP 系的 session/request_permission
-// 是另一族协议，本项目尚未接入，不在本文件冒充支持）。
+// 其余引擎（codebuddy / codebuddy-ai / trae / llm / codex / openclaw / dsh / arkclaw）实测均无
+// AskUserQuestion 可用（codebuddy 族是"工具存在但模型看不到"，见上），能力表 AskSupportOf
+// 返回 "none"（ACP 系的 session/request_permission 是另一族协议，本项目尚未接入，
+// 不在本文件冒充支持）。
 
 import (
 	"encoding/json"
@@ -344,12 +348,16 @@ func isAskUserQuestion(name string) bool {
 //
 // 适用场景：宿主自己实现了 canUseTool 回调（即这次请求来自 control_request）。
 // 若这次请求是 tool_use 形态（CLI 已自行拒绝），请改用 EncodeAskFollowUp。
+//
+// 门槛用的是 askAnswerShapeKnown（"答案该长什么样"）而不是 AskSupportOf（"能不能收到提问"）：
+// 两者在 codebuddy 上分道 —— 它收不到提问，但答案形状官方文档写了，编码保持可用，
+// 将来它的提问通道打开（第一方宿主 / 官方补齐）时直接复用。见 AskSupportOf 的 ⚠️ 段。
 func EncodeAskAnswer(engine string, req *AskRequest, ans AskAnswer) ([]byte, error) {
 	if req == nil {
 		return nil, fmt.Errorf("ask: nil request")
 	}
-	if !AskSupportsEngine(engine) {
-		return nil, fmt.Errorf("ask: engine %q does not expose AskUserQuestion (see AskSupportOf)", engine)
+	if !askAnswerShapeKnown(engine) {
+		return nil, fmt.Errorf("ask: engine %q has no known ask-answer protocol shape", engine)
 	}
 
 	if ans.Denied {
@@ -477,18 +485,37 @@ func EncodeAskFollowUp(req *AskRequest, ans AskAnswer) string {
 
 // AskSupportOf 返回某引擎「需要用户选择」的落地方式（机器可读）：
 //
-//	"tool:AskUserQuestion"  有该工具 + can_use_tool 协议（claude / codebuddy 族）
-//	"none"                  无该能力（其余引擎实测均无 AskUserQuestion，也无 canUseTool）
+//	"tool:AskUserQuestion"  有该工具 + can_use_tool 协议（**仅 claude**）
+//	"none"                  无该能力（其余引擎均无 —— 含 codebuddy 族，见下）
 //
 // 与 WorkspaceSupportOf / AttachmentSupportOf 同一约定：能力值同时可进 `--engines` 输出，
 // 供调用方决定要不要走 Ask 流程。
+//
+// ⚠️ codebuddy / codebuddy-ai 为什么是 "none"（2026-09-28 实测更正）：
+// 官方文档把 AskUserQuestion 列为内置工具（Requires Permission: Yes），但**它的可用性有宿主门槛** ——
+// CLI 只把该工具交给第一方宿主（官方 App / IDE），第三方宿主驱动的通道下模型根本看不到它。
+// 实测七种配置，全部拿不到（模型一律 ToolSearch 搜不到 → 自述"注册表里没有" → 退化成文字提问）：
+//
+//	-p 文本 / --print json                     ❌
+//	--tools default / 白名单 / --allowedTools  ❌
+//	-y(bypassPermissions) / auto / default     ❌
+//	SDK initialize 声明 capabilities.elicitation.form  ❌
+//	CODEBUDDY_HOST_CAPABILITIES=elicitation.form       ❌
+//	--acp（initialize+session/new+session/prompt）     ❌
+//	--acp + clientCapabilities.elicitation.form=true   ❌
+//
+// 佐证：该工具只在 CLI init 行的 75 个工具**注册表**里出现，不进模型的可用工具列表，
+// ToolSearch 也索引不到；而 elicitation.form 解锁的是 AskUserForStructuredInput（文档明说
+// "否则该工具不暴露给模型"），不是 AskUserQuestion。
+// 故此前那句 "tool:AskUserQuestion" 是**按 claude/codebuddy 同族协议推断**的失实声明：
+// 上层 UI 会因此承诺决策卡，而它永远不会出现 —— 比"不支持"更糟。
 //
 // 注：trae / cursor / iflow / qwen 等走的是 ACP 的 session/request_permission（另一族
 // 协议：选项带 optionId + kind=allow_once/reject_once…），本项目尚未接入，因此如实报 none。
 func AskSupportOf(engine string) string {
 	// 具名 agent（如 MagicAI）先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
 	engine = CapabilityFamilyOf(engine)
-	if equalFold(engine, "claude") || equalFold(engine, "codebuddy") || equalFold(engine, "codebuddy-ai") {
+	if equalFold(engine, "claude") {
 		return "tool:AskUserQuestion"
 	}
 	return "none"
@@ -497,10 +524,26 @@ func AskSupportOf(engine string) string {
 // AskSupportsEngine 引擎是否支持 AskUserQuestion 族协议。
 func AskSupportsEngine(engine string) bool { return AskSupportOf(engine) != "none" }
 
+// askAnswerShapeKnown 该引擎是否有**已知的答案编码形状**（EncodeAskAnswer 的门槛）。
+//
+// 与 AskSupportOf 是两件事，别合并：AskSupportOf 回答"这台机器上能不能**收到**提问"
+// （面向调用方/UI，codebuddy 族为 none），这里回答"若拿到提问，**答案**该渲染成什么形状"。
+// codebuddy 族的形状官方 SDK 文档写了（含 interrupt），故保留编码能力 ——
+// 沿用同一套问答格式的将来（第一方宿主 / 官方补齐第三方通道）不必再改编码层。
+func askAnswerShapeKnown(engine string) bool {
+	// 具名 agent 先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
+	engine = CapabilityFamilyOf(engine)
+	return equalFold(engine, "claude") || equalFold(engine, "codebuddy") || equalFold(engine, "codebuddy-ai")
+}
+
 // AskInterruptSupportOf 拒绝时是否支持 interrupt（拒绝并中断整个会话）。
 //
 // 只有 codebuddy 的官方文档写了该字段；claude 的 SDK 文档只给 behavior/message，
 // 故对 claude 不渲染（见 EncodeAskAnswer）。codebuddy-ai 与 codebuddy 同族同协议，同样支持。
+//
+// ⚠️ 现实注脚（2026-09-28）：codebuddy 族**产生不了提问**（见 AskSupportOf），所以这个分支
+// 在当前真机上走不到 —— 保留的是**协议形状**：将来若 codebuddy 的提问通道打开（第一方宿主
+// 或官方补齐第三方通道），编码答案时该字段仍然正确。
 func AskInterruptSupportOf(engine string) bool {
 	// 具名 agent 先归到它协议的家族名，再查表 —— 见 CapabilityFamilyOf。
 	engine = CapabilityFamilyOf(engine)

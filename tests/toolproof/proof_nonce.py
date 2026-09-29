@@ -5,9 +5,9 @@
 nonce。随机 nonce 模型不可能预先知道 —— 若返回内容含该 nonce，则证明
 发生了真实网络请求，且不是模型编造。
 """
-import json, os, subprocess, secrets, time
+import json, os, shutil, subprocess, secrets, time
 
-CB = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+CB = os.environ.get("MAGIC_AGENT_CODEBUDDY_BIN") or shutil.which("codebuddy") or ""
 ENV = {k: v for k, v in os.environ.items() if not k.startswith("SERVER__")}
 ENV["PATH"] = "/opt/homebrew/bin:" + ENV.get("PATH", "/usr/bin:/bin")
 

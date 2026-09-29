@@ -89,14 +89,16 @@ func NewRootCommand() *cobra.Command {
 		Version: Version,
 		Long: `magic-agent - agent CLI 代理工具
 
-把 claude / codebuddy（WorkBuddy）/ trae 等 CLI 与 openclaw / dsh / arkclaw
+把 claude / codebuddy / trae 等 CLI 与 openclaw / dsh / arkclaw
 等 agent 后端的非交互调用统一成一条命令：支持切换引擎与模型、超时与
 重试、固定 text/json 输出格式、稳定退出码。适合脚本化编排与上层工具集成。
 
 引擎：
   claude     Claude Code CLI（-p --output-format json）
-  codebuddy  CodeBuddy / WorkBuddy 内置 CLI（默认 hy3，可切 glm-5.3 等）
-  codebuddy-ai CodeBuddy / WorkBuddy AI 内置 CLI（国际站后端、独立登录；默认不传 --model 交给 CLI 自选）
+  codebuddy  CodeBuddy Code CLI（**独立安装**：npm i -g @tencent-ai/codebuddy-code；默认 hy3，可切 glm-5.3 等）
+  codebuddy-ai 同一个 CodeBuddy Code CLI 的**第二个账号**（默认不传 --model，交给 CLI 自选）
+             两个引擎跑同一个二进制，靠 authentication.id 分开账号，互不顶号；
+             登录：magic-agent --login codebuddy / --login codebuddy-ai
   trae       Trae CLI（使用 trae 自身配置的默认模型）
   llm        simonw/LLM CLI（模型与密钥由 llm models / llm keys 自管）
   codex      Codex CLI（使用 codex 自身配置的模型与凭据）
@@ -394,8 +396,19 @@ codebuddy-gateway 引擎（CodeBuddy Code HTTP 网关，走 webhook + SSE；凭�
 				return &usageError{fmt.Errorf("--control 与「从 stdin 读提示词（-f -）」冲突：stdin 已被控制通道占用")}
 			}
 			switch {
+			case flagChanged(cmd, "login"):
+				// 用「传过没有」而不是「值非空」判断：`--login ""` 也要走参数校验（提示要引擎名）
+				return runLogin(cmd, opts)
 			case opts.listSessions:
 				return runSessions(cmd, opts)
+			case flagChanged(cmd, "session-log"):
+				// 与 --stop 同理：用「传过没有」判断，`--session-log ""` 要走参数校验（报要 id），
+				// 而不是掉进下面的「提问」分支报 empty prompt。
+				return runSessionLog(cmd, opts)
+			case flagChanged(cmd, "after"):
+				// --after 只在 --session-log 下成立：给了却没给 --session-log 就**明说**，
+				// 不静默忽略（静默忽略是本项目反复踩的坑）。
+				return &usageError{fmt.Errorf("--after 只在 --session-log 下成立：请配合 --session-log <id> 使用")}
 			case flagChanged(cmd, "stop"):
 				// 用「传过没有」而不是「值非空」判断：`--stop ""` 也要走参数校验
 				//（exit 2 提示要 id），而不是掉进「提问」分支报 empty prompt。

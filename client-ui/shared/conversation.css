@@ -1,0 +1,256 @@
+/* 对话 UI 组件的公共样式（PC 与移动端共用这一份，不各写一遍）。
+ *
+ *  ── 分工 ──
+ *    本文件：**对话区**的全部结构样式（气泡 / markdown / 思考块 / 工具卡 / 审批卡 /
+ *            输入框 / 三项选择器）。尺寸取自 agents-anywhere 安卓端的 Compose 规格
+ *            （每处都标了原始常量），那是这套对话视觉最严格的一份基准。
+ *    宿主：只负责 ① 提供下面那组颜色变量的值 ② 给一个容器 ③ 调 MagicConversation.create()。
+ *
+ *  ── 颜色契约（宿主必须定义，本文件只用不定义）──
+ *    基础：--canvas --ink --ink-soft --muted --faint --border --subtle --raised
+ *          --primary-action --on-primary-action --app-shadow
+ *    对话：--bubble --bubble-text --code --status-neutral --status-neutral-text --activity
+ *    markdown：--md-body --md-muted --md-border --md-code-bg --link --prompt --shimmer
+ *          --panel --panel-border
+ *    语义：--accent --warning --success --error-surface --error-border --error-text --error-icon
+ *          --running --transitioning --active
+ *    几何：--r-card --r --r-full --font --mono
+ *  桌面（oklch）与移动（十六进制）两套值都能满足这个契约 —— 所以样式能共用，
+ *  而两端各自的调性不会被对方的色板拽走。
+ */
+
+/* ── 对话滚动区 ──
+   MessageList LazyColumn：padding horizontal 20dp · spacedBy 16dp。
+   宽屏时用左右对称的 padding 把内容收在 860px 内 —— 刻意不加内层 wrapper：
+   组件里那个 thread 元素同时是**滚动容器**和**条目容器**，多套一层会让
+   scrollTop 与 appendChild 落到两个不同元素上（历史与实时共用一条渲染路径，
+   这类错会表现成「滚动不跟随 / 事件画不出来」）。 */
+.conv{display:flex;flex-direction:column;min-height:0;flex:1}
+.conv__thread{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;display:flex;flex-direction:column;gap:16px;
+  padding:20px max(12px, calc((100% - 860px) / 2)) 28px}
+/* 单个 timeline item 内：spacedBy(7.dp)，且不参与收缩 */
+.tgroup{display:flex;flex-direction:column;gap:7px;flex:0 0 auto}
+
+/* ── 用户气泡 UserBubble ──
+   SessionMessages.kt:1341 RoundedCornerShape(22.dp) · sessionMessageBubble
+   :1343 padding(17,13) · :1349 16.5sp/24sp · :1296 maxBubbleWidth = 78% · :1352 maxLines 8 */
+.urow{display:flex;justify-content:flex-end;align-items:flex-end;gap:6px;max-width:100%}
+.urow__col{display:flex;flex-direction:column;align-items:flex-end;gap:7px;min-width:0;max-width:78%}
+.ubub{position:relative;max-width:100%;border-radius:22px;background:var(--bubble);
+  padding:13px 17px;display:flex;flex-direction:column;gap:7px}
+.ubub__t{color:var(--bubble-text);font-size:16.5px;line-height:24px;white-space:pre-wrap;
+  word-break:break-word;overflow:hidden}
+.ubub:not(.is-open) .ubub__t{display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:8;overflow:hidden}
+.ubub__more{align-self:flex-start;color:var(--warning);font-size:12px;font-weight:700;line-height:1.2}
+.ubub__meta{align-self:flex-end;font-size:11px;font-weight:600;color:var(--error-icon)}
+/* MessageCopyButton：30dp 圆 · muted */
+.copybtn{width:30px;height:30px;border-radius:var(--r-full);display:flex;align-items:center;
+  justify-content:center;color:var(--muted);flex:0 0 auto}
+.copybtn:hover,.copybtn:active{background:var(--activity)}
+.copybtn--sm{width:23px;height:23px}
+
+/* ── Agent 文本 AgentMarkdownText ──
+   AgentMarkdownText.kt:139-143 padding horizontal 4dp · spacedBy 8dp */
+.md{padding:0 4px;display:flex;flex-direction:column;gap:8px;color:var(--md-body);
+  font-size:16px;line-height:26px;word-break:break-word}
+.md>*{margin:0}
+.md h1{font-size:22px;line-height:30px;font-weight:700}
+.md h2{font-size:20px;line-height:28px;font-weight:700}
+.md h3,.md h4,.md h5,.md h6{font-size:18px;line-height:26px;font-weight:700}
+.md strong{font-weight:700}
+.md em{font-style:italic}
+.md del{text-decoration:line-through}
+.md a{color:var(--link);text-decoration:underline;word-break:break-all}
+.md hr{border:0;height:1px;background:var(--md-border)}
+/* MarkdownList(:219-250) */
+.md ul,.md ol{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:6px}
+.md li{display:flex;gap:8px}
+.md li>.mk{flex:0 0 auto;color:var(--md-muted);font-size:15px;line-height:24px}
+.md li>.mk--mono{font-family:var(--mono);font-size:13px;line-height:24px}
+.md li>.li-b{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
+/* MarkdownQuote(:254-278) 2dp 竖线 */
+.md blockquote{display:flex;gap:10px;align-items:stretch}
+.md blockquote>.bar{flex:0 0 auto;width:2px;background:var(--md-border);border-radius:1px}
+.md blockquote>.q-b{flex:1;min-width:0;color:var(--md-muted)}
+/* MarkdownTable(:281-320) 8dp 圆角 · 1dp 描边 */
+.md-table-wrap{align-self:flex-start;max-width:100%;overflow-x:auto;
+  border:1px solid var(--md-border);border-radius:8px}
+.md table{border-collapse:collapse;font-size:14px;line-height:22px}
+.md th,.md td{min-width:100px;max-width:240px;padding:8px 10px;
+  border:.5px solid var(--md-border);text-align:left;vertical-align:top}
+.md th{background:var(--md-code-bg);font-weight:700}
+/* 行内码 codeInlineContent(:445-480) 5dp 圆角 · 14sp mono */
+.md code{font-family:var(--mono);font-size:13.5px;line-height:20px;background:var(--md-code-bg);
+  border:1px solid var(--md-border);border-radius:5px;padding:1px 6px;word-break:break-all}
+.md .md-code--file{color:var(--link);text-decoration:underline}
+.md .md-code--wrap{display:inline-block;padding:3px 7px}
+
+/* ── 代码面板 MarkdownCodePanel(:602-670) 20dp 圆角 · padding(18,17,18,12) ── */
+.codepanel{background:var(--panel);border:1px solid var(--panel-border);border-radius:20px;
+  box-shadow:0 12px 28px -8px var(--app-shadow);padding:17px 18px 12px;display:flex;flex-direction:column}
+.codepanel__head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.codepanel__label{color:var(--ink);font-size:14px;line-height:18px;font-weight:700}
+.codepanel__code{margin-top:14px;overflow-x:auto}
+.codepanel__pre{margin:0;font:15px/22px var(--mono);color:var(--ink);white-space:pre;letter-spacing:0}
+/* BashCommandLine(:739-770) 首个 token 用 prompt 色 */
+.cmdline{display:flex;gap:7px;align-items:baseline;font:500 15px/22px var(--mono);white-space:nowrap}
+.cmdline+.cmdline{margin-top:4px}
+.cmdline__p{color:var(--prompt)}
+.cmdline__r{color:var(--ink)}
+
+/* ── 命令行 CommandLineBar(:970-2019) 14dp 圆角 ── */
+.cmdbar{display:flex;flex-direction:column;gap:6px}
+.cmdbar__head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cmdbar__label{color:var(--muted);font-size:11px;font-weight:700}
+.cmdbar__body{display:flex;gap:8px;align-items:flex-start;border-radius:14px;background:var(--code);
+  border:1px solid var(--border);padding:9px 10px}
+.cmdbar__p{flex:0 0 auto;color:var(--muted);font:800 13px/18px var(--mono)}
+.cmdbar__t{flex:1;min-width:0;color:var(--ink-soft);font:600 13px/18px var(--mono);
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;word-break:break-all}
+
+/* ── 段落预览 CommandPreviewSection(:2021-2052) 12dp 圆角 ── */
+.sect{display:flex;flex-direction:column;gap:6px}
+.sect__head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sect__label{color:var(--muted);font-size:11px;font-weight:700}
+.sect__code{border-radius:12px;border:1px solid var(--md-border);background:var(--code);
+  padding:10px 12px;overflow:auto;max-height:360px}
+.sect__pre{margin:0;font:13px/18px var(--mono);color:var(--md-body);white-space:pre-wrap;word-break:break-word}
+.sect__pre--err{color:var(--error-text)}
+
+/* ── 思考块 ReasoningSection(:1530-1608) 行 min 34dp · 展开体缩进 30dp ── */
+.rsn{display:flex;flex-direction:column;gap:8px;padding:0 4px}
+.rsn__head{display:flex;align-items:center;gap:8px;min-height:34px;padding:6px;border-radius:8px;width:100%;text-align:left}
+.rsn__title{flex:1;min-width:0;color:var(--ink);font:400 13px/1.3 var(--mono);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rsn__body{padding:0 6px 0 30px}
+.rsn__body .md{font-size:14px;line-height:21px;font-weight:300;gap:6px}
+.rsn__body .md h1{font-size:17px;line-height:24px;font-weight:600}
+.rsn__body .md h2{font-size:16px;line-height:23px;font-weight:600}
+.rsn__body .md h3,.rsn__body .md h4,.rsn__body .md h5,.rsn__body .md h6{font-size:15px;line-height:22px;font-weight:600}
+.rsn__body .md table{font-size:13px;line-height:19px}
+
+/* ── 工具卡 ToolActivityCard(:1625-1748) 折叠行 min 34dp · 8dp 圆角 ── */
+.tool{display:flex;flex-direction:column;gap:8px;padding:0 4px}
+.tool__head{display:flex;align-items:center;gap:8px;min-height:34px;padding:6px;border-radius:8px;
+  background:var(--activity);text-align:left;width:100%}
+.tool__ico{flex:0 0 auto;color:var(--muted);display:flex}
+.tool--err .tool__ico{color:var(--error-icon)}
+.tool__t{flex:1;min-width:0;color:var(--ink);font:400 13px/1.3 var(--mono);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tool__cv{flex:0 0 auto;color:var(--faint);transition:transform .18s}
+.tool[aria-expanded="false"] .tool__cv{transform:rotate(-90deg)}
+.tool__body{border-radius:14px;background:var(--subtle);border:1px solid var(--border);
+  padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+/* 扫光：ToolActivityCard 折叠行在“正在跑”时的 shimmer 动画 */
+@keyframes tool-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.tool--run .tool__head{background-image:linear-gradient(100deg,
+  color-mix(in oklab,var(--activity) 80%,transparent) 20%,
+  color-mix(in oklab,var(--ink) 10%,var(--activity)) 40%,
+  color-mix(in oklab,var(--activity) 80%,transparent) 60%);
+  background-size:200% 100%;animation:tool-shimmer 1.4s ease-in-out infinite}
+
+/* ── 状态胶囊 CompactStatusPill / 工具占位 ToolPlaceholder ── */
+.pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:var(--r-full);
+  background:var(--status-neutral);color:var(--status-neutral-text);font-size:12px;font-weight:600;flex:0 0 auto}
+.pill--err{background:var(--error-surface);color:var(--error-text);border:1px solid var(--error-border)}
+.ph{display:flex;align-items:center;gap:10px;padding:6px 4px;color:var(--muted);font-size:14px}
+.ph--err{color:var(--error-text)}
+/* WorkingIndicator：16dp conic 环 */
+.work{display:flex;align-items:center;gap:10px;padding:6px 4px;color:var(--muted);font-size:14px}
+.work__ring{width:16px;height:16px;border-radius:var(--r-full);flex:0 0 auto;
+  background:conic-gradient(from 0deg,transparent 0% 25%,var(--accent) 75% 100%);
+  animation:work-spin .9s linear infinite}
+@keyframes work-spin{to{transform:rotate(360deg)}}
+/* 时间线分隔条 */
+.sep{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;
+  font-variant-numeric:tabular-nums;padding:2px 4px}
+.sep::after{content:"";flex:1;height:1px;background:var(--border)}
+
+/* ── 错误/提示卡 AuthErrorNotice(Components.kt:88-117) 14dp 圆角 ── */
+.notice{display:flex;align-items:center;gap:10px;border-radius:14px;background:var(--error-surface);
+  border:1.2px solid var(--error-border);padding:14px}
+.notice__ico{flex:0 0 auto;color:var(--error-icon);display:flex}
+.notice__t{flex:1;min-width:0;color:var(--error-text);font-size:13.5px;line-height:17px;font-weight:500}
+
+/* ── 审批 / 提问卡 ──
+   ask 是 headless 下**唯一**能喂答案的通道（core 的 --control answer），
+   所以它必须能作答，不能只显示一行提示。 */
+.askcard{background:var(--bubble);border-radius:var(--r-card);padding:14px 15px;
+  border-left:3px solid var(--active);display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+.askcard__head{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--ink)}
+.askcard__dot{width:8px;height:8px;border-radius:var(--r-full);background:var(--active);flex:0 0 auto}
+.askcard__dot--ok{background:var(--accent)}
+.askcard__q{margin:0;font-size:14.5px;line-height:1.55;color:var(--bubble-text)}
+.askcard__opts{display:flex;flex-wrap:wrap;gap:7px}
+.askcard__btn{height:34px;padding:0 14px;border-radius:var(--r-full);border:1px solid var(--border);
+  background:var(--raised);color:var(--ink);font-size:13.5px}
+.askcard__btn--primary{background:var(--primary-action);color:var(--on-primary-action);
+  border-color:var(--primary-action);font-weight:600}
+.askcard__opt{display:flex;flex-direction:column;gap:2px;padding:9px 13px;border-radius:var(--r);
+  border:1px solid var(--border);background:var(--raised);text-align:left;max-width:100%}
+.askcard__opt b{font-size:13.5px;color:var(--ink)}
+.askcard__opt span{font-size:12px;color:var(--muted);line-height:1.45}
+
+/* ── 输入区 Composer ── */
+.composer{flex:0 0 auto;padding:0 clamp(12px,4vw,20px) 16px}
+.composer__box{max-width:860px;margin:0 auto;border:1px solid var(--border);border-radius:var(--r-card);
+  background:var(--raised);display:flex;flex-direction:column;gap:2px;padding:10px 12px 8px}
+.composer__box:focus-within{border-color:var(--accent)}
+.composer textarea{display:block;width:100%;border:0;outline:0;resize:none;background:none;
+  color:var(--ink);font:16px/24px var(--font);min-height:24px;max-height:200px;padding:2px}
+.composer__row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.composer__left{display:flex;align-items:center;gap:9px;min-width:0;flex:1}
+
+/* 授权档位胶囊：四档一眼分清；full 是危险档（等同 --dangerously-skip-permissions），
+   必须看起来“危险”，否则它会变成最容易顺手选中的那一档。 */
+.permchip{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;
+  border-radius:var(--r-full);border:1px solid var(--border);background:var(--subtle);
+  color:var(--ink-soft);font-size:12.5px;max-width:190px;white-space:nowrap;overflow:hidden}
+.permchip:disabled{opacity:.45}
+.permchip[data-tier="full"]{background:var(--error-surface);border-color:var(--error-border);
+  color:var(--error-text);font-weight:600}
+
+/* 引擎 · 模型：一级选引擎、hover/点开二级出该引擎的模型（级联） */
+.casc{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;
+  border-radius:var(--r-full);border:1px solid var(--border);background:var(--subtle);
+  font-size:12.5px;max-width:280px}
+.casc__p,.casc__s{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.casc__sep{color:var(--muted)}
+.casc__cv{color:var(--faint);flex:0 0 auto}
+
+.btn{height:32px;padding:0 13px;border-radius:var(--r-full);border:1px solid var(--border);
+  background:var(--raised);color:var(--ink);font-size:13px;display:inline-flex;align-items:center;gap:6px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.sendbtn{width:36px;height:36px;border-radius:var(--r-full);background:var(--primary-action);
+  color:var(--on-primary-action);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.sendbtn:active{transform:scale(.94)}
+.sendbtn--stop{background:var(--error-surface);color:var(--error-text);
+  border:1px solid var(--error-border)}
+
+/* ── 选择器浮层（引擎/模型/授权共用）──
+   fixed + 挂 body：定位用视口坐标，不受任何祖先的 overflow/transform 影响。
+   这一条踩过坑：菜单 append 进 flex 行里做 absolute 时宽高会塌成 0×0。 */
+.pick{position:fixed;z-index:300;min-width:220px;max-height:min(60vh,420px);overflow-y:auto;
+  padding:6px;border:1px solid var(--border);border-radius:var(--r-card);
+  background:var(--raised);box-shadow:0 14px 40px -12px var(--app-shadow);display:none}
+.pick--on{display:block}
+.pick__cap{padding:6px 9px 4px;font-size:11px;font-weight:700;color:var(--muted)}
+.pick__row{width:100%;display:flex;align-items:center;gap:9px;padding:8px 9px;
+  border-radius:var(--r);text-align:left;font-size:13.5px;color:var(--ink)}
+.pick__row:hover{background:var(--subtle)}
+.pick__row[aria-selected="true"]{font-weight:600}
+.pick__row:disabled{opacity:.5;cursor:not-allowed}
+.pick__ck{width:14px;flex:0 0 auto;color:var(--accent)}
+.pick__l{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pick__d{font-size:11.5px;color:var(--muted);line-height:1.4}
+.pick__danger{color:var(--error-text)}
+.pick__danger:hover{background:var(--error-surface)}
+
+/* ── 空态 ── */
+.conv__empty{margin:auto;padding:28px 20px;text-align:center;color:var(--muted);font-size:14px;line-height:1.7}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}

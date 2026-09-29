@@ -65,6 +65,20 @@ func environ() []string {
 	return out
 }
 
+// ChildEnvWith 返回「子进程应继承的环境（environ()，已剔除父进程专属项）」
+// 追加 extraEnv 后的结果。
+//
+// exec 对重复 key 取**后出现**的那份，所以 extraEnv 可以覆盖继承来的同名变量
+// —— 这正是账号隔离需要的语义（见 codebuddy.go 的 codebuddyAccountEnv）。
+// 交互式登录入口（--login）也用它构造环境，保证与普通调用同源。
+func ChildEnvWith(extraEnv []string) []string {
+	if len(extraEnv) == 0 {
+		return environ()
+	}
+	out := environ()
+	return append(out, extraEnv...)
+}
+
 // envDenied 判断某环境变量是否不允许传给子 CLI。
 func envDenied(name string) bool {
 	if strings.HasPrefix(name, serverEnvPrefix) {

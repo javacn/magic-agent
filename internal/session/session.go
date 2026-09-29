@@ -44,13 +44,45 @@ const EnvDir = "MAGIC_AGENT_SESSIONS"
 const Retention = 24 * time.Hour
 
 // 记录状态。
+//
+// ⚠️ 词表对齐 agents-anywhere 的 `TimelineStatus`（2026-09-29）：同一个意思在两个
+// 界面上说同一个词，才谈得上「统一」。**只统一会话侧**（这个包的记录回答的是
+// 「一条会话活得怎么样」）；需求看板那套（待验证 / 已完成…）是另一个轴，不动。
+//
+// 三处细分与 anywhere 对齐（此前都挤在 stopped / failed 里）：
+//
+//	· cancelled   被 `--stop` 停掉 —— 调用方**主动取消**这条会话
+//	· interrupted 用户**中途打断当前轮**（`--control interrupt`），会话本身仍可继续
+//	· waiting_approval 引擎停下来等用户（提问 / 工具待授权）—— 会话还活着，但没在跑，
+//	  界面上该显示「等审批」而不是「生成中」
 const (
-	StateRunning = "running" // 正在跑
-	StateDone    = "done"    // 正常结束
-	StateFailed  = "failed"  // 报错结束
-	StateStopped = "stopped" // 被 --stop 停掉
-	StateGone    = "gone"    // 记录里是 running，但进程已不在（自然退出/被别处杀掉）
+	StateRunning         = "running"          // 正在跑
+	StateWaitingApproval = "waiting_approval" // 卡在等授权 / 等用户回答
+	StateDone            = "done"             // 正常结束
+	StateFailed          = "failed"           // 报错结束
+	StateCancelled       = "cancelled"        // 被 --stop 取消
+	StateInterrupted     = "interrupted"      // 当前轮被打断（会话仍可继续）
+	StateGone            = "gone"             // 记录里是 running，但进程已不在（自然退出/被别处杀掉）
 )
+
+// normalizeState 把磁盘上的**旧状态值**归一成当前词表。
+//
+// 为什么必须有：`stopped` 在 2026-09-29 之前由 `--stop` 写入，一次性全部改写磁盘上的
+// 记录既没必要也不安全（还有别的版本在读同一份目录）。所以在**读**的时候翻。
+// 认不出来的值原样返回 —— 宁可显示一个陌生词，也不要把它悄悄改成别的意思。
+func normalizeState(s string) string {
+	if s == "stopped" {
+		return StateCancelled
+	}
+	return s
+}
+
+// isTerminalOverride 这个已落盘的状态是否**优先于**收尾时的 failed。
+// 它记的是「谁、以什么方式结束了它」，比一句 failed 信息量更大。
+// （readRecord 已把老值 stopped 归一成 cancelled，这里不必再认 stopped。）
+func isTerminalOverride(s string) bool {
+	return s == StateCancelled || s == StateInterrupted
+}
 
 // Record 一条会话记录（也是磁盘上的 JSON 形状）。
 type Record struct {
@@ -125,17 +157,49 @@ func (h *Handle) SetSessionID(id string) {
 	h.write()
 }
 
-// Finish 收尾：写最终状态（done / failed / stopped）+ 回填会话 id。
+// Mark 就地改状态（只在 running 与 waiting_approval 之间来回时生效）。
 //
-// 一个刻意的小保护：被别人 `--stop` 停掉时，磁盘上已经是 stopped；本进程随后
-// 因被杀而以 failed 收尾 —— 不能把 stopped 覆盖成 failed，否则「是谁停的」就丢了。
+// 为什么需要一个**中途**写状态的入口：引擎会停下来等用户（提问 / 工具待授权），此时这条
+// 会话还活着，但**没在跑** —— 界面上该显示「等审批」而不是「生成中」。这是 2026-09-29
+// 统一会话状态词表时新增的写入点（值取自 anywhere 的 waiting_approval）。
+//
+// ⚠️ 只允许在这两个值之间切：一旦写进终态（done / failed / cancelled / interrupted），
+//
+//	这里不许改回去。终态是「这条会话结束了」的结论，让一个迟到的流事件把它翻回
+//	running，等于让历史撒谎。
+func (h *Handle) Mark(state string) {
+	if h == nil || state == "" {
+		return
+	}
+	cur := normalizeState(h.rec.State)
+	if cur != StateRunning && cur != StateWaitingApproval {
+		return
+	}
+	if state != StateRunning && state != StateWaitingApproval {
+		return
+	}
+	if cur == state {
+		return
+	}
+	h.rec.State = state
+	h.write()
+}
+
+// Finish 收尾：写最终状态（done / failed / cancelled / interrupted）+ 回填会话 id。
+//
+// 一个刻意的小保护：被别人 `--stop` 停掉、或用户中途打断时，磁盘上已经是
+// cancelled / interrupted；本进程随后因被杀而以 failed 收尾 —— 不能把它覆盖成
+// failed，否则「是谁、以什么方式结束的」就丢了。
+// ⚠️ 2026-09-29 起保护名单扩到两个值（此前只有 stopped）：对齐 anywhere 的
+//
+//	TimelineStatus 时把「取消」与「打断」分了开，保护漏一个就等于白分。
 func (h *Handle) Finish(sessionID, state string) {
 	if h == nil {
 		return
 	}
 	if state == StateFailed {
-		if cur, err := readRecord(h.path); err == nil && cur.State == StateStopped {
-			state = StateStopped
+		if cur, err := readRecord(h.path); err == nil && isTerminalOverride(cur.State) {
+			state = cur.State
 		}
 	}
 	if s := strings.TrimSpace(sessionID); s != "" {
@@ -310,7 +374,11 @@ func Stop(id string) (StopResult, error) {
 				fmt.Errorf("session %q (pid %d) 未能终止", id, rec.PID)
 		}
 	}
-	rec.State = StateStopped
+	/* `--stop` = 调用方**主动取消** → cancelled（2026-09-29 对齐 anywhere 的 TimelineStatus；
+	   老值 `stopped` 在读入时归一，见 normalizeState）。
+	   ⚠️ StopResult.Stopped 那个布尔**不改名**：它回答的是「这次停成功了吗」，
+	   与状态词表无关，改了会连带 CLI 的 `-o json` 契约一起动。 */
+	rec.State = StateCancelled
 	rec.UpdatedAt = time.Now()
 	writeRecord(rec)
 	return StopResult{Record: rec, Stopped: true}, nil
@@ -340,6 +408,9 @@ func readRecord(path string) (Record, error) {
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return Record{}, err
 	}
+	/* 旧记录里的 `stopped` 在这里翻成 `cancelled`（见 normalizeState）——
+	   读的时候归一，就不必去批量改写磁盘上已有的记录。 */
+	rec.State = normalizeState(rec.State)
 	return rec, nil
 }
 

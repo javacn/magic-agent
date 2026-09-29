@@ -66,33 +66,55 @@ gpt-4o
 }
 
 func TestClaudeModelsFromSettings(t *testing.T) {
-	// env 里混有非字符串值（真实 settings.json 就有 1 这种整型），必须跳过而不是解析失败。
+	// 真实 settings.json 的形态：每个档位一组**四个**变量，其中只有 `*_MODEL`（id 格）
+	// 是模型；`*_MODEL_NAME` 是显示名。id 格分布在两个命名空间：
+	// ANTHROPIC_DEFAULT_*_MODEL / ANTHROPIC_MODEL 与 CLAUDE_CODE_SUBAGENT_MODEL。
+	// 回归保护（2026-09-28 用户报「claude 返回的模型列表不对」→「setting 中不是 5 个模型吗」）：
+	//   ① 显示名（本机那份是 GLM-5.2 / kimi-k2.6 / deepseek-v4-pro）**不得**进清单；
+	//   ② CLAUDE_CODE_SUBAGENT_MODEL 这个 id 格**不能漏**。
+	// env 里还混有非字符串值（真实文件就有 1 这种整型），必须跳过而不是解析失败。
 	data := []byte(`{
 	  "model": "claude-sonnet-4-6",
 	  "env": {
 	    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5[1M]",
-	    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "MiniMax-M3",
+	    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "kimi-k2.6",
+	    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION": "Kimi K2.6",
+	    "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES": "1m,vision",
 	    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5[1M]",
-	    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "MiniMax-M2.7-highspeed",
+	    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "GLM-5.2",
+	    "ANTHROPIC_MODEL": "claude-fable-5[1M]",
+	    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
 	    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
 	    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
 	  }
 	}`)
-	want := []string{"claude-sonnet-4-6", "MiniMax-M3", "MiniMax-M2.7-highspeed"}
+	// 顶层 model 先，其后 env 键按字母序 —— 共 5 个 id 格。
+	want := []string{
+		"claude-sonnet-4-6",
+		"claude-opus-5[1M]",
+		"claude-sonnet-5[1M]",
+		"claude-fable-5[1M]",
+		"deepseek-v4-flash",
+	}
 
-	// 顺序 = 键名排序（顶层 model 先），断言集合足够：ANTHROPIC_* 键按字母序
-	// 取到的值与 -m 能收的标识一一对应。
 	got, err := claudeModelsFromSettings(data)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	for _, m := range append(want, "claude-sonnet-5[1M]", "claude-opus-5[1M]") {
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v（集合应完全一致）", got, want)
+	}
+	for _, m := range want {
 		if !containsStr(got, m) {
 			t.Errorf("missing %q in %v", m, got)
 		}
 	}
-	if containsStr(got, "http://127.0.0.1:15721") || containsStr(got, "1") {
-		t.Errorf("non-model env leaked into list: %v", got)
+
+	// 显示名 / 描述 / 能力位 / 非模型 env 一律不得混入
+	for _, bad := range []string{"kimi-k2.6", "GLM-5.2", "Kimi K2.6", "1m,vision", "http://127.0.0.1:15721", "1"} {
+		if containsStr(got, bad) {
+			t.Errorf("非模型 id 的值 %q 混进了清单: %v", bad, got)
+		}
 	}
 
 	// 语法错 → 报错（不是静默空清单）。
@@ -300,8 +322,9 @@ func TestParseProductJSONModels(t *testing.T) {
 func TestProductJSONPath(t *testing.T) {
 	cases := []struct{ bin, want string }{
 		{
-			bin:  "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-			want: "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/product.json",
+			// 独立安装（npm）布局：product.json 在包根（bin/ 的上一级）
+			bin:  "/opt/npm-global/lib/node_modules/@tencent-ai/codebuddy-code/bin/codebuddy",
+			want: "/opt/npm-global/lib/node_modules/@tencent-ai/codebuddy-code/product.json",
 		},
 		{bin: "/usr/local/bin/codebuddy", want: "/usr/local/product.json"},
 		{bin: "", want: ""},
