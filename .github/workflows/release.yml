@@ -116,6 +116,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          # ⚠️ 必须声明 registry-url：setup-node 才会写出含
+          #    //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN} 的 .npmrc。
+          #    只给 npm publish 传 NODE_AUTH_TOKEN 环境变量是无效的 —— 那会 ENEEDAUTH。
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify npm auth (fail fast)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN secret 未配置或为空"
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org
 
       - name: Resolve target version
         id: version
