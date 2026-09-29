@@ -144,21 +144,28 @@ jobs:
       - name: Download all 5 platform artifacts
         uses: actions/download-artifact@v4
         with:
+          # ⚠️ 不能开 merge-multiple：那会把 5 份 artifact 摊平到一个目录里，
+          #    下面按 artifacts/magic-agent-<label>/ 定位的暂存步骤就找不到目录了。
+          #    保持各自成目录，目录名 = artifact 名。
           path: artifacts/
-          merge-multiple: true
 
       - name: Stage prebuilt binaries into npm/dist/
         run: |
+          echo "=== downloaded artifact layout ==="
+          ls -la artifacts/
+          for d in artifacts/*/; do echo "--- $d"; ls -la "$d"; done
           mkdir -p npm/dist
-          declare -A MAP=(
-            [darwin-arm64]=magic-agent-darwin-arm64
-            [darwin-x64]=magic-agent-darwin-x64
-            [linux-x64]=magic-agent-linux-x64
-            [linux-arm64]=magic-agent-linux-arm64
-            [win32-x64]=magic-agent-win32-x64
-          )
-          for plat in "${!MAP[@]}"; do
-            src="artifacts/${MAP[$plat]}"
+          # 用 plat=artifact 键值对逐条走，不用 declare -A：
+          # 关联数组要 bash 4+，本机 macOS 自带 bash 3.2 跑不了这段，写成可移植的更省事。
+          for entry in \
+            darwin-arm64=magic-agent-darwin-arm64 \
+            darwin-x64=magic-agent-darwin-x64 \
+            linux-x64=magic-agent-linux-x64 \
+            linux-arm64=magic-agent-linux-arm64 \
+            win32-x64=magic-agent-win32-x64
+          do
+            plat="${entry%%=*}"
+            src="artifacts/${entry#*=}"
             if [ ! -d "$src" ]; then
               echo "::error::Missing artifact for $plat ($src)"
               exit 1
