@@ -1,6 +1,6 @@
 {
   "name": "magic-agent",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "专业的 agent CLI 代理工具 - 统一 claude / codebuddy / trae / llm / codex / openclaw 引擎",
   "license": "MIT",
   "bin": {
