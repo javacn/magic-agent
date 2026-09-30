@@ -72,11 +72,18 @@ func stopActiveSession() {
 // 为什么必须做：引擎 CLI 在**独立进程组**里（Setpgid），调用方对 magic-agent
 // 发 SIGTERM / kill(-magic-agent-pid) 时，引擎子进程不在那一组里 → 会变成孤儿继续跑
 // （观物台「停止」按钮踩的就是这个）。这里在退出前补一刀。
+//
+// 覆盖三处孤儿来源：
+//   - 当前活动会话（stopActiveSession）；
+//   - 交互式登录子进程（stopLoginChild）—— 它必须待在前台组里读 tty，因而
+//     比普通引擎更「自己管不了」，只能在这里记一笔带走（见 login.go）；
+//   - 关终端（SIGHUP）：与 SIGTERM 同路。
 func installSignalStop() {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-ch
+		stopLoginChild()
 		stopActiveSession()
 		os.Exit(exitInterrupted)
 	}()

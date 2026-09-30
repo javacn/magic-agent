@@ -44,24 +44,27 @@ import (
 
 // askOptions 根命令的全部参数。
 type askOptions struct {
-	engine       string
-	model        string
-	system       string
-	prompt       string
-	file         string
-	attach       []string // 附件（截图/图片）路径；与提示词一起发给引擎
-	tools        string
-	timeout      time.Duration
-	retries      int
-	backoff      time.Duration
-	output       string
-	verbose      bool
-	engines      bool
-	contract     bool // 输出带版本的契约 envelope（--contract；客户端启动校验用）
-	noModels     bool
-	login        string // 拉起某引擎自己的交互式登录会话（--login <engine>）
-	events       bool   // --stream 的事件流带契约版本与行号（--events；客户端消费用）
-	control      bool   // 从 stdin 读 NDJSON 控制命令（--control；打断 / 收工 / 回审批）
+	engine   string
+	model    string
+	system   string
+	prompt   string
+	file     string
+	attach   []string // 附件（截图/图片）路径；与提示词一起发给引擎
+	tools    string
+	timeout  time.Duration
+	retries  int
+	backoff  time.Duration
+	output   string
+	verbose  bool
+	engines  bool
+	contract bool // 输出带版本的契约 envelope（--contract；客户端启动校验用）
+	noModels bool
+	login    string // 拉起某引擎自己的交互式登录会话（--login <engine>）
+	// repairModels 还原被反向同步写坏的桌面端 models.json（--repair-models <engine>）：
+	// 2026-09-30 Windows 事故的收尾手段，见 internal/agent/custom_models.go 的事故还原一节。
+	repairModels string
+	events       bool // --stream 的事件流带契约版本与行号（--events；客户端消费用）
+	control      bool // 从 stdin 读 NDJSON 控制命令（--control；打断 / 收工 / 回审批）
 	jsonOut      bool
 	stream       bool
 	noThinking   bool
@@ -145,6 +148,7 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.BoolVar(&opts.contract, "contract", false, "输出桌面/移动客户端契约：{\"contractVersion\":N,\"engines\":[...]}（engines 与 --engines 同构，另含 capabilities 静态能力字段）。默认不探测模型（快）；要模型写 --no-models=false")
 	f.BoolVar(&opts.noModels, "no-models", false, "配合 --engines / --contract：跳过各引擎的模型探测（只列引擎与可用性，不启动 CLI）")
 	f.StringVar(&opts.login, "login", "", "拉起指定引擎自己的交互式登录会话（如 codebuddy / codebuddy-ai）：自动带上该引擎的账号环境，进去执行 /login 即可；登录态落在该引擎自己的票据上，两个账号互不顶号")
+	f.StringVar(&opts.repairModels, "repair-models", "", "还原被覆盖写坏的桌面端 models.json（如 codebuddy / codebuddy-ai）：把对象格式改回桌面端的数组格式，官方模型清单不动；只在形状确实是坏的时候才改，且先留 .broken.bak 备份")
 	f.BoolVar(&opts.jsonOut, "json", false, "兼容保留：--engines 已默认 JSON，本 flag 不再需要")
 	f.BoolVar(&opts.stream, "stream", false, "流式输出：正文/思考增量实时打到 stdout（text 模式思考走 stderr）")
 	f.BoolVar(&opts.events, "events", false, "配合 --stream：事件流带契约版本与行号（每行加 v / seq，并先发一行 ready），供客户端消费；老消费者不要开（形状与 --stream 不同）")

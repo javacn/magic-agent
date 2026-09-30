@@ -129,6 +129,7 @@ func NewRootCommand() *cobra.Command {
   magic-agent --engines                           # 列出引擎、可用性与各引擎支持的模型（JSON 数组）
   magic-agent --engines --no-models               # 只列引擎与可用性（跳过模型探测，不启动 CLI）
   magic-agent --engines --json                    # 等价（--json 为兼容保留）
+  magic-agent --repair-models codebuddy           # 还原被覆盖写坏的桌面端 models.json（事故收尾，先留 .broken.bak）
 
 四档权限模型（--permission，仅 claude / codebuddy / codebuddy-ai 生效）：
   把「哪些动作自动放行 + 放行不了时由谁裁决」收敛成四档，映射到 Claude Code 的参数：
@@ -399,6 +400,9 @@ codebuddy-gateway 引擎（CodeBuddy Code HTTP 网关，走 webhook + SSE；凭�
 			case flagChanged(cmd, "login"):
 				// 用「传过没有」而不是「值非空」判断：`--login ""` 也要走参数校验（提示要引擎名）
 				return runLogin(cmd, opts)
+			case flagChanged(cmd, "repair-models"):
+				// 同上：`--repair-models ""` 要走参数校验，而不是掉进「提问」分支报 empty prompt。
+				return runRepairModels(cmd, opts)
 			case opts.listSessions:
 				return runSessions(cmd, opts)
 			case flagChanged(cmd, "session-log"):
@@ -426,6 +430,23 @@ codebuddy-gateway 引擎（CodeBuddy Code HTTP 网关，走 webhook + SSE；凭�
 		},
 	}
 	bindAskFlags(root, opts)
+	/* `--login` / `--repair-models` 忘带引擎名时，cobra 在解析阶段就报错，**走不到**
+	   runLogin / runRepairModels 的校验分支，默认文案是英文的
+	   "flag needs an argument: ..."（且退出码 1）。这里翻成与传空串一致的中文
+	   usage（exit 2），免得用户只看到一句看不懂的报错。 */
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		if err == nil || !strings.Contains(err.Error(), "flag needs an argument") {
+			return err
+		}
+		switch {
+		case strings.Contains(err.Error(), "login"):
+			return &usageError{fmt.Errorf("--login 需要引擎名：magic-agent --login <engine>（可用：%s）", loginCapableEngines())}
+		case strings.Contains(err.Error(), "repair-models"):
+			return &usageError{fmt.Errorf("--repair-models 需要引擎名：magic-agent --repair-models <engine>（可用：%s）",
+				strings.Join(agent.DesktopEngines(), " / "))}
+		}
+		return err
+	})
 	// 无子命令设计：禁用 cobra 自动注入的 completion 命令，
 	// 保证 "magic-agent completion" 也只是被当作 prompt 而非隐藏子命令。
 	root.CompletionOptions.DisableDefaultCmd = true
