@@ -1,4 +1,8 @@
-bin/
+# 只忽略仓库根的 bin/（本地构建产物目录）。
+# ⚠️ 不能写成不带前导斜杠的 bin/：那会连 npm/bin/ 一起忽略，
+#    导致 npm 包的 bin 入口 npm/bin/magic-agent.js 从未被提交，
+#    发布出去的包一运行就找不到入口（v1.0.0 的教训）。
+/bin/
 npm/dist/
 *.tgz
 *.test
