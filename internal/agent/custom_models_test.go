@@ -9,8 +9,11 @@ package agent
 //  2. 幂等：无新增时**不落盘**（内容逐字节不变）
 //  3. 只增不改：既有条目与未识别字段原样保留；availableModels 追加不丢
 //  4. 安全兜底：App 缓存缺失 / 条目 disabled → 不建文件、不报错
+//  5. 陌生文件一律不碰：顶层不是 JSON 对象（桌面端是数组）/ 坏 JSON → 逐字节保持原样，
+//     且覆盖写之前一定留 .magic-agent.bak（见 2026-09-30 Windows 事故用例）
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -182,11 +185,112 @@ func TestSyncCustomModelsFromApp_IdempotentAndMergeOnly(t *testing.T) {
 	}
 }
 
+// 目标文件顶层不是 JSON 对象（桌面端 WorkBuddy 的 models.json 就是**数组**）时，
+// 必须**一个字都不动**、也不留备份（因为压根没写）。
+//
+// 为什么是关键回归：以前把"解析不进 map"当空文件继续写回 {models, availableModels}，
+// 等于把对方的模型清单整体替换成只剩 custom-local 几条 —— 官方模型全丢且不可回滚。
+func TestSyncCustomModelsFromApp_RefusesNonObjectFile(t *testing.T) {
+	// 桌面端 models.json 的真实形状：顶层数组，条目是 LanguageModel。
+	desktop := []byte(`[
+  {
+    "id": "MiniMax-M3",
+    "name": "MiniMax-M3",
+    "vendor": "MiniMax",
+    "url": "https://api.minimaxi.com/v1/chat/completions",
+    "apiKey": "sk-user-own"
+  },
+  {
+    "id": "glm-5.3",
+    "name": "glm-5.3",
+    "url": "https://open.bigmodel.cn/api/paas/v4",
+    "apiKey": "sk-user-own-2"
+  }
+]`)
+
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"顶层是数组（桌面端格式）", desktop},
+		{"坏 JSON", []byte("{oops")},
+		{"顶层是字符串", []byte(`"just a string"`)},
+		{"顶层是数字", []byte(`42`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			acc := filepath.Join(dir, "acc.json")
+			writeJSON(t, acc, appCacheFixture())
+			cfg := filepath.Join(dir, "config")
+			if err := os.MkdirAll(cfg, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(cfg, customModelsFileName)
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			added, err := syncCustomModelsFromApp(acc, cfg)
+			if err != nil {
+				t.Errorf("应静默跳过，不该报错: %v", err)
+			}
+			if added != 0 {
+				t.Errorf("added = %d, want 0", added)
+			}
+
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("原文件必须还在: %v", err)
+			}
+			if !bytes.Equal(after, tc.content) {
+				t.Errorf("原文件被改写了！\nbefore=%s\nafter =%s", tc.content, after)
+			}
+			if _, err := os.Stat(path + customModelsBackupSuffix); !os.IsNotExist(err) {
+				t.Errorf("没写就不该留备份")
+			}
+		})
+	}
+}
+
+// 真的要覆盖写时，必须先把原文留成 <models.json>.magic-agent.bak（可回滚）。
+func TestSyncCustomModelsFromApp_BacksUpBeforeOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	acc := filepath.Join(dir, "acc.json")
+	writeJSON(t, acc, appCacheFixture())
+	cfg := filepath.Join(dir, "config")
+	if err := os.MkdirAll(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg, customModelsFileName)
+
+	before := []byte("{\n  \"models\": [],\n  \"availableModels\": [\"hy3\"]\n}\n")
+	if err := os.WriteFile(path, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	added, err := syncCustomModelsFromApp(acc, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added == 0 {
+		t.Fatal("本次应有新增（触发落盘）")
+	}
+
+	bak, err := os.ReadFile(path + customModelsBackupSuffix)
+	if err != nil {
+		t.Fatalf("覆盖写之前应留备份: %v", err)
+	}
+	if !bytes.Equal(bak, before) {
+		t.Errorf("备份内容应为改动前的原文\nwant=%s\ngot =%s", before, bak)
+	}
+}
+
 func TestSyncCustomModelsFromApp_NoSourceNoFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config")
 	path := filepath.Join(cfg, customModelsFileName)
-
 	cases := []struct{ name, acc string }{
 		{"acc 路径为空", ""},
 		{"acc 文件不存在", filepath.Join(dir, "nope.json")},
@@ -221,7 +325,17 @@ func TestSyncCustomModelsFromApp_NoSourceNoFile(t *testing.T) {
 	}
 }
 
-func TestSyncCustomModelsFromApp_CorruptExistingFileRebuilt(t *testing.T) {
+/* 既有 models.json 无法确认为「CLI 自己的格式」时，一律**不碰**，而不是重建。
+ *
+ * 这条契约是 2026-09-30 改的（Windows 事故）。原行为是「解析失败当空文件，重建」，
+ * 理由看起来无害（CLI 自己也这么兜底）。实际后果是把**别人的**文件整体替换掉：
+ * 桌面端 WorkBuddy 的 models.json 顶层是数组，数组解析不进 map[string]any，
+ * 于是被当成「坏文件」重建 → 里面 61 条官方模型全没了，只剩 8 条 custom-local，
+ * 而且没有备份，不可回滚。
+ *
+ * 宁可少同步一次端点（CLI 会自己报 "has no endpoint url configured"），
+ * 也不要毁掉一份不是我们管的配置。 */
+func TestSyncCustomModelsFromApp_CorruptExistingFileLeftUntouched(t *testing.T) {
 	dir := t.TempDir()
 	acc := filepath.Join(dir, "acc.json")
 	writeJSON(t, acc, appCacheFixture())
@@ -229,16 +343,25 @@ func TestSyncCustomModelsFromApp_CorruptExistingFileRebuilt(t *testing.T) {
 	if err := os.MkdirAll(cfg, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// 既有 models.json 坏了：应重建（CLI 自己也这么兜：读失败当空），且不崩
-	if err := os.WriteFile(filepath.Join(cfg, customModelsFileName), []byte("{oops"), 0o600); err != nil {
+	path := filepath.Join(cfg, customModelsFileName)
+	broken := []byte("{oops")
+	if err := os.WriteFile(path, broken, 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	added, err := syncCustomModelsFromApp(acc, cfg)
 	if err != nil {
-		t.Fatalf("坏文件应可恢复: %v", err)
+		t.Fatalf("不认识的文件应静默跳过，不该报错: %v", err)
 	}
-	if added != 2 {
-		t.Errorf("added = %d, want 2", added)
+	if added != 0 {
+		t.Errorf("added = %d, want 0（不碰未知格式）", added)
+	}
+	after, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("原文件必须还在: %v", rerr)
+	}
+	if !bytes.Equal(after, broken) {
+		t.Errorf("原文件被改写了：%s", after)
 	}
 }
 
