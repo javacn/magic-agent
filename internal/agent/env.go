@@ -80,9 +80,17 @@ func ChildEnvWith(extraEnv []string) []string {
 }
 
 // envDenied 判断某环境变量是否不允许传给子 CLI。
+//
+// ⚠️ 大小写不敏感（2026-09-30 修，Windows 事故）：环境变量名在 **Windows 上本身
+// 不区分大小写**，父会话用 `server__port` / `Server__Port` 这类大小写写出来时，
+// 原来的逐字符比较会**漏剔除** —— 子 CLI 于是仍读到父进程的监听端口，再起一个服务
+// 撞上 EADDRINUSE，表现为「一进登录界面就卡死 / 嵌套调用永远没结果」。
+// Unix 上变量名区分大小写，折叠大小写只会**更保守**（多剔除几个父会话风格的名字），
+// 不会少剔除，故这里两个平台统一按大写比较。
 func envDenied(name string) bool {
-	if strings.HasPrefix(name, serverEnvPrefix) {
+	upper := strings.ToUpper(name)
+	if strings.HasPrefix(upper, serverEnvPrefix) {
 		return true
 	}
-	return envDenylist[name]
+	return envDenylist[upper]
 }

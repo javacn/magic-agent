@@ -86,6 +86,43 @@ func TestEnvironStripsPythonVars(t *testing.T) {
 	}
 }
 
+// Windows 的变量名不区分大小写：父会话若写成混合大小写，也必须被剔除。
+// 2026-09-30 事故：漏剔除 → 子 CLI 仍读到父进程端口 → EADDRINUSE 永久挂起，
+// 表现就是「一进登录界面就上不去」。
+func TestEnvDeniedCaseInsensitive(t *testing.T) {
+	cases := map[string]bool{
+		"server__port":         true,
+		"Server__Port":         true,
+		"server__host":         true,
+		"codebuddy_session_id": true,
+		"Codebuddy_Session_Id": true,
+		"pythonhome":           true,
+		"PATH":                 false,
+		"HOME":                 false,
+		// 仍必须放行：引擎靠它选配置目录（见 codebuddyAccountEnv）
+		"codebuddy_config_dir": false,
+	}
+	for name, want := range cases {
+		if got := envDenied(name); got != want {
+			t.Errorf("envDenied(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// 混合大小写的父会话变量在 environ() 里也必须不见。
+func TestEnvironStripsMixedCaseServerPrefix(t *testing.T) {
+	t.Setenv("server__port", "58311")
+	t.Setenv("Server__Host", "127.0.0.1")
+	t.Setenv("codebuddy_session_id", "should-be-stripped")
+
+	for _, kv := range environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if envDenied(name) {
+			t.Errorf("被拒绝的变量仍出现在子 CLI 环境里: %s", kv)
+		}
+	}
+}
+
 func TestEnvDenied(t *testing.T) {
 	cases := map[string]bool{
 		"SERVER__PORT":                true,
