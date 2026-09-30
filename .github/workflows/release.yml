@@ -208,11 +208,18 @@ jobs:
       - name: Verify npm version (正式发布后)
         if: github.event_name == 'push'
         run: |
-          sleep 5
-          VERSION=$(npm view magic-agent version 2>&1 || echo "FETCH_FAILED")
-          echo "npm view magic-agent version → ${VERSION}"
-          if [ "${VERSION}" != "${{ steps.version.outputs.version }}" ]; then
-            echo "::error::npm 上版本 ${VERSION} 与发布的 ${{ steps.version.outputs.version }} 不一致"
-            exit 1
-          fi
-          echo "✓ npmjs.org 上 magic-agent@${VERSION} 已就位"
+          # npm publish 受理后 CDN 元数据传播要几分钟（registry 自己都提示
+          # "may take a few minutes"），单次校验必然读到旧版本误报红 —— 改成轮询：
+          # 每 15s 查一次，最多等 6 分钟，看到目标版本即过。
+          WANT="${{ steps.version.outputs.version }}"
+          for i in $(seq 1 24); do
+            VERSION=$(npm view magic-agent version 2>/dev/null || echo "FETCH_FAILED")
+            echo "[${i}/24] npm view magic-agent version → ${VERSION}"
+            if [ "${VERSION}" = "${WANT}" ]; then
+              echo "✓ npmjs.org 上 magic-agent@${VERSION} 已就位"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::等了 6 分钟，npm 上仍是 ${VERSION}，与发布的 ${WANT} 不一致"
+          exit 1
