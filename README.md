@@ -376,6 +376,41 @@ EOF
 | Linux x64 / arm64 | `npm/dist/linux-x64` / `linux-arm64` |
 | Windows x64 | `npm/dist/win32-x64` |
 
+## 集成 H5 对话组件（其他工程）
+
+npm 包自带可复用的前端组件，`npm install magic-agent` 后在 `node_modules/magic-agent/` 下：
+
+| 路径 | 内容 |
+|------|------|
+| `client-ui-mobile/index.html` | 移动端 H5 宿主页（顶栏 + AA 安卓端配色，含暗/亮双主题） |
+| `client-ui/index.html` | PC 宿主页（oklch 配色）；`client-ui/pc/` 是带工作台的完整版 |
+| `client-ui/shared/` | 公共对话组件：`MagicConversation.create()` + HTTP 传输参考件 |
+| `CLIENT-CONTRACT.md` | 契约说明（`/desk/*` 接口、事件流、控制命令、模块机制） |
+
+核心设计：**组件不连后端**，宿主注入 `transport`；现成的 `transport-http.js` 打
+magic-client 的 `/desk/*` 接口。三种集成姿势：
+
+**① 直接当静态页托管**（最快）：先把包里的两块拼成一个可服务目录（`index.html`
+按**同级** `shared/` 相对路径引用，这个关系不能拆散）——
+
+```bash
+cp -r node_modules/magic-agent/client-ui-mobile magic-h5
+cp -r node_modules/magic-agent/client-ui/shared magic-h5/shared
+magic-client serve --ui-dir magic-h5
+```
+
+手机访问启动时打印的 `http://<局域网IP>/?token=...`。嵌进自己的服务同理：按上面的
+布局静态托管，令牌走 `?token=`。
+
+**② 拷进自己的构建**（App/工程内嵌）：把 `client-ui-mobile/` 内容与 `client-ui/shared/`
+复制进 `www/`（Vite/Capacitor 同理，`require.resolve('magic-agent/client-ui-mobile/index.html')`
+定位源路径），再注入 `window.MAGIC_BASE` / `window.MAGIC_TOKEN` 指向 magic-client 地址。
+
+**③ 自定义 transport**（不走 magic-client）：实现四个方法即可挂组件——
+`listEngines()` / `ask(payload, {onEvent, onEnd})` / `control(payload)` / `readSession(sid, opts)`，
+数据从 IPC→CLI 或自有后端来都行（参考 `client-ui/shared/transport-http.js` 与
+`CLIENT-CONTRACT.md` 的事件流形状）。
+
 ## 更多文档
 
 | 文档 | 内容 |
