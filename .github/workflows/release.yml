@@ -197,23 +197,31 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # ⚠️ 显式指定官方源：国内开发者常把 ~/.npmrc 的 registry 设成
+          #    npmmirror 之类的只读镜像，而本 job 会 checkout 后 publish。
+          #    runner 上没有用户级 .npmrc，但显式写死能挡住「哪天有人
+          #    在 workflow 里手滑 npm config set」的回归。
+          #    npmmirror 只做同步，写入会直接 403。
+          REG=https://registry.npmjs.org
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "▶ Dry-run 模式（workflow_dispatch）：npm publish --dry-run，不会真发"
-            npm publish --access public --ignore-scripts --dry-run
+            npm publish --access public --ignore-scripts --registry=$REG --dry-run
           else
             echo "▶ 正式发布 v${{ steps.version.outputs.version }} 到 npmjs.org"
-            npm publish --access public --ignore-scripts
+            npm publish --access public --ignore-scripts --registry=$REG
           fi
 
       - name: Verify npm version (正式发布后)
         if: github.event_name == 'push'
         run: |
-          # npm publish 受理后 CDN 元数据传播要几分钟（registry 自己都提示
-          # "may take a few minutes"），单次校验必然读到旧版本误报红 —— 改成轮询：
+          # 双重保险：① 显式指定官方源（镜像同步有延迟，打到 npmmirror
+          # 会读到旧版本误判失败）；② 轮询等待 CDN 元数据传播 —— registry
+          # 自己都提示 "may take a few minutes"，单次校验必然误报红。
           # 每 15s 查一次，最多等 6 分钟，看到目标版本即过。
+          REG=https://registry.npmjs.org
           WANT="${{ steps.version.outputs.version }}"
           for i in $(seq 1 24); do
-            VERSION=$(npm view magic-agent version 2>/dev/null || echo "FETCH_FAILED")
+            VERSION=$(npm view magic-agent version --registry=$REG 2>/dev/null || echo "FETCH_FAILED")
             echo "[${i}/24] npm view magic-agent version → ${VERSION}"
             if [ "${VERSION}" = "${WANT}" ]; then
               echo "✓ npmjs.org 上 magic-agent@${VERSION} 已就位"
