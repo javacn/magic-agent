@@ -169,7 +169,13 @@ var (
 		binName: "llm",
 		envVar:  "MAGIC_AGENT_LLM_BIN",
 		candidates: []string{
-			// venv 优先：绕开 Homebrew Python 3.14 的 pip truststore 兼容问题
+			// venv 优先：绕开 Homebrew Python 3.14 的 pip truststore 兼容问题。
+			// ⚠️ **两个平台的 venv 布局不同，两条都要列**（2026-10-01 实测踩过）：
+			// Windows 的 venv 可执行文件在 `Scripts\`，Unix 在 `bin/`。只列 Unix 那条时，
+			// `npm i -g magic-agent` 的 postinstall 明明把 llm 装好了（install.js 自己
+			// 按 win32 选了 Scripts），`--engines` 却仍报 "llm CLI not found" ——
+			// 安装器与探测器对「llm 装在哪」各说各话，且两边都不报错，很难查。
+			"~/.llm-venv/Scripts/llm.exe",
 			"~/.llm-venv/bin/llm",
 			"/opt/homebrew/bin/llm",
 			"/usr/local/bin/llm",

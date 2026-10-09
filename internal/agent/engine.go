@@ -40,9 +40,12 @@ type Message struct {
 
 // ToolsMode 工具开关模式。
 //
-//	ToolsOff      禁用全部工具（默认）：纯 chat 一次成型，输出可解析。
+//	ToolsOff      禁用全部工具：纯 chat 一次成型，输出可解析。
 //	ToolsOn       引擎默认工具集 + 权限旁路：真 agent 模式，模型可执行
 //	              工具调用（读文件、跑命令等），代价是输出可能是工具痕迹。
+//	              ⚠️ 2026-10-01：默认档从 Off 改成 On —— 用户报障「claude 只会
+//	                闲聊、不读文件、不能用工具」就是因为这个默认。magic-agent
+//	                装在本机就是要当 agent 跑，不是 chat 套壳。
 //	ToolsAllowlist 白名单：仅允许列出的工具 + 权限旁路。
 //
 // 判定方法一律导出：Engine 实现与本包外的调用方（如 CLI 层测试）
@@ -93,7 +96,7 @@ type Request struct {
 	//（claude/codebuddy用 --append-system-prompt，trae 拼进 prompt 头）。
 	SystemPrompt string
 
-	// Tools 工具开关模式（默认 ToolsOff）。
+	// Tools 工具开关模式（默认 ToolsOn —— 2026-10-01 实测用户期望）。
 	Tools ToolsMode
 
 	// Permission 四档权限档位（默认 DefaultPermissionTier = full，保持既有行为）。
@@ -426,18 +429,25 @@ func agentEnginesFrom(agents []config.AgentConfig, existing []Engine) []Engine {
 	return out
 }
 
-// toolsOrDefault nil ToolsMode 视为 ToolsOff。
+// toolsOrDefault nil ToolsMode 视为 ToolsOn。
+//
+// ⚠️ 2026-10-01 反转：用户报障「claude 只聊天、不读文件、不能用工具」，
+//
+//	根因就是这里把 nil 兜底成 Off。magic-agent 的定位是本机 agent，不是 chat
+//	套壳，nil（=调用方不显式声明工具）按"未指定 = 想要工具"处理才符合直觉。
+//	想禁用工具的调用方传 `agent.ToolsOff` 即可（API 与 CLI 都已暴露）。
+//
 // 返回接口（而非具体实现）：判定一律走 ToolsMode 的导出方法。
 func toolsOrDefault(t ToolsMode) ToolsMode {
 	if t == nil {
-		return ToolsOff
+		return ToolsOn
 	}
 	return t
 }
 
-// toolsIsOff 是否「禁用工具」模式（nil 视为 off）。
+// toolsIsOff 是否「禁用工具」模式（nil 视为 on，详见 toolsOrDefault 注释）。
 // 各引擎用它决定是否注入 noToolSuffix —— 该后缀明文禁止工具调用，
-// 只能在 off 模式出现，否则会和 on / 白名单模式互相打架。
+// 只能在显式 off 模式出现，否则会和 on / 白名单模式互相打架。
 func toolsIsOff(req Request) bool {
 	return toolsOrDefault(req.Tools).IsOff()
 }

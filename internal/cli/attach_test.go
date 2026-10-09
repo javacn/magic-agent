@@ -169,29 +169,35 @@ func TestAttachmentPromptFallbackWarnUnit(t *testing.T) {
 	}
 }
 
-// 端到端：trae（无原生通道）带附件 + 默认 --tools off → stderr 出现降级提示。
+// 端到端：trae（无原生通道）带附件 → stderr 出现降级提示，但不再提 --tools off
+// （2026-10-01 默认从 off 反转为 on —— trae 默认工具已开，附件还是降级，但**不要**
+// 再提示「请改用 --tools on」，因为已经是 on 了；提示要瘦身、避免噪音）。
 func TestAttachFlagWarnsOnPromptFallbackEngine(t *testing.T) {
 	registerFake(&stringEngine{name: "trae", text: "ok"})
 	img := writeAttachFile(t, "shot.png", "\x89PNG\r\n\x1a\n")
 
+	// 默认 --tools on：仍提示降级（trae 自身问题，与工具开关无关），但**不**提 --tools off
 	_, stderr, err := runAskCmd(t, "", "-e", "trae", "-p", "看图", "-a", img)
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	if !strings.Contains(stderr, "没有附件输入通道") || !strings.Contains(stderr, "--tools off") {
-		t.Errorf("stderr 应给出降级提示, got %q", stderr)
+	if !strings.Contains(stderr, "没有附件输入通道") {
+		t.Errorf("默认状态仍应提示降级, got %q", stderr)
+	}
+	if strings.Contains(stderr, "--tools off") {
+		t.Errorf("默认 --tools on，不该再提 --tools off: %q", stderr)
 	}
 
-	// --tools on → 只提示降级，不再提读不到
-	_, stderrOn, err := runAskCmd(t, "", "-e", "trae", "-p", "看图", "--tools", "on", "-a", img)
+	// --tools off → 必须点明读不到（反向场景仍然要明确警告）
+	_, stderrOff, err := runAskCmd(t, "", "-e", "trae", "-p", "看图", "--tools", "off", "-a", img)
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	if !strings.Contains(stderrOn, "没有附件输入通道") {
-		t.Errorf("仍应提示降级, got %q", stderrOn)
+	if !strings.Contains(stderrOff, "没有附件输入通道") {
+		t.Errorf("仍应提示降级, got %q", stderrOff)
 	}
-	if strings.Contains(stderrOn, "--tools off") {
-		t.Errorf("工具已开，不该再提 --tools off: %q", stderrOn)
+	if !strings.Contains(stderrOff, "--tools off") || !strings.Contains(stderrOff, "--tools on") {
+		t.Errorf("显式 --tools off 时必须点明读不到 + 指引 --tools on: %q", stderrOff)
 	}
 }
 

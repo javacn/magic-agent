@@ -106,15 +106,25 @@ type keepAlive struct {
 	closed    bool          // 收工后为 true：Push 据此拒收（与 close(in) 同锁，避免向已关闭通道发送）
 }
 
-// kaEnabled 常驻会话是否生效：只在「流式 + 引擎支持追加」时才有意义 —— 不满足就静默
-// 不启用（不影响原有调用形态）。显式传 `--keep-alive` 却不满足条件的报错在 prepareAsk
-// 里（那里能拿到 cmd 与引擎）。
+// kaEnabled 常驻会话是否生效：只在「流式 + 引擎支持追加 + 本平台有追加入口」时才有意义
+// —— 不满足就静默不启用（不影响原有调用形态）。显式传 `--keep-alive` 却不满足条件的
+// 报错在 prepareAsk 里（那里能拿到 cmd 与引擎）。
 //
 // 默认值语义**按引擎区分**（agent.AppendDefaultOn）：claude/codebuddy 默认常驻
 // （用户 2026-09-18 的要求）；dsh 默认关、要显式 `--keep-alive` —— 它的 SDK 通道本来
 // 就是一次一轮的形态，默认挂 5 分钟空闲窗口会让既有调用方以为命令卡住了。
+//
+// ⚠️ 平台维度（2026-10-01）：Windows 没有 unix domain socket，追加入口开不出来。
+//
+//	若仍按引擎默认值返回 true，用户**没要求**常驻却会撞上
+//	「--keep-alive: 只支持 macOS/Linux」的报错 —— 默认值不该制造错误。
+//	故这里按传输能力收敛：Windows 上默认值一律视为关；
+//	**显式** --keep-alive=true 仍由 prepareAsk 报错（用户明确要了，要说清为什么不行）。
 func kaEnabled(cmd *cobra.Command, opts *askOptions, engine string) bool {
 	if !opts.stream || !agent.AppendSupportOf(engine) {
+		return false
+	}
+	if !session.AppendTransportAvailable() {
 		return false
 	}
 	if flagChanged(cmd, "keep-alive") {

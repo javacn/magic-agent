@@ -44,14 +44,25 @@ function binaryPath(target) {
 
 /**
  * 定位可用的 go 可执行文件。
- * 顺序：MAGIC_AGENT_GO_BIN > PATH > homebrew > /usr/local/go > 常见版本目录。
+ * 顺序：MAGIC_AGENT_GO_BIN > PATH > 常见安装位置（homebrew / 官方安装包 / 版本目录）。
  */
 function findGo() {
   const fs = require("fs");
   const candidates = [];
   if (process.env.MAGIC_AGENT_GO_BIN) candidates.push(process.env.MAGIC_AGENT_GO_BIN);
   candidates.push("go");
-  candidates.push("/opt/homebrew/bin/go", "/usr/local/go/bin/go", "/usr/local/bin/go");
+  if (process.platform === "win32") {
+    const pf = process.env["ProgramFiles"] || "C:\\Program Files";
+    const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    candidates.push(
+      path.join(pf, "Go", "bin", "go.exe"),
+      path.join(pf86, "Go", "bin", "go.exe"),
+      "C:\\Go\\bin\\go.exe",
+      path.join(process.env.LOCALAPPDATA || "", "Programs", "Go", "bin", "go.exe")
+    );
+  } else {
+    candidates.push("/opt/homebrew/bin/go", "/usr/local/go/bin/go", "/usr/local/bin/go");
+  }
   for (const c of candidates) {
     try {
       if (c === "go") {
@@ -59,7 +70,7 @@ function findGo() {
         execFileSync("go", ["version"], { stdio: "ignore" });
         return "go";
       }
-      if (fs.existsSync(c)) return c;
+      if (c && fs.existsSync(c)) return c;
     } catch (_) {
       /* 继续找下一个 */
     }

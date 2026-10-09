@@ -73,7 +73,10 @@ func runCLIEnv(ctx context.Context, extra []string, bin string, args ...string) 
 
 // runCLIEnvIn = runCLIIn + runCLIEnv（工作目录 + 追加环境变量）。
 func runCLIEnvIn(ctx context.Context, dir string, extra []string, bin string, args ...string) (string, string, error) {
-	cmd := exec.Command(bin, args...)
+	// launchWrap 与流式路径同源：.cmd/.bat 在 Windows 上不能直接 exec，
+	// 参数会被 cmd.exe 拆坏（实测含换行的提示词整段丢失）。unix 上原样透传。
+	spec := launchWrap(bin, args)
+	cmd := exec.Command(spec.bin, spec.args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -147,7 +150,8 @@ func waitDrained(ch <-chan struct{}, n int, d time.Duration) {
 	}
 }
 
-// envWithDefaults 继承当前环境（CLI 依赖 HOME/PATH 等基础变量）。
+// envWithDefaults 继承当前环境（CLI 依赖 HOME/PATH 等基础变量），
+// 父-side 专属项已在 environ() 阶段过滤（参见 envDenylist）。
 func envWithDefaults() []string {
 	return environ()
 }
@@ -158,8 +162,14 @@ func newStreamCmd(bin string, args []string) *exec.Cmd {
 }
 
 // newStreamCmdIn 同 newStreamCmd，可指定工作目录（workspace，见 runCLIIn 注释）。
+//
+// ⚠️ 这里的 launchWrap 是 Windows 存活的关键（2026-10-01 实测）：
+// npm 装的 claude / codebuddy 是 .cmd 批处理，直接 exec 会让
+// 含换行 / 引号 / & | ^ % 的参数被 cmd.exe 拆坏 → 静默退 0、零输出。
+// unix 上它原样返回，行为不变。见 launch.go。
 func newStreamCmdIn(dir string, bin string, args []string) *exec.Cmd {
-	cmd := exec.Command(bin, args...)
+	spec := launchWrap(bin, args)
+	cmd := exec.Command(spec.bin, spec.args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}

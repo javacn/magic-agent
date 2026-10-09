@@ -76,6 +76,17 @@ type sessionEvent struct {
 	ToolKind  string            `json:"tool_kind,omitempty"`
 	SessionID string            `json:"session_id,omitempty"`
 	Ask       *agent.AskRequest `json:"ask,omitempty"`
+	/* 状态收敛四元组（2026-10-02）。落盘它们是为了让**历史回放与实时渲染
+	   画出同一种东西**：回放侧不必自己猜「这条消息到哪算完」，
+	   按 (item_id, item_revision) 覆盖即可。缺了它们，历史里每条 text
+	   都只是孤立的增量片段（与实时流同源但无法收敛）。 */
+	ItemID       string `json:"item_id,omitempty"`
+	ItemRevision uint64 `json:"item_revision,omitempty"`
+	Status       string `json:"status,omitempty"`
+	Snapshot     string `json:"snapshot,omitempty"`
+	// Error / Reason 异常收尾的原因（仅 turn_failed），与事件流同源。
+	Error  string `json:"error,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // sessionWriter 每条流式调用一个实例；开着就一直 append 到

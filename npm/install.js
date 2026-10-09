@@ -42,7 +42,8 @@ if (!fs.existsSync(out)) {
           env: { ...process.env, CGO_ENABLED: "0", GOOS: target.goos, GOARCH: target.goarch },
         }
       );
-      fs.chmodSync(out, 0o755);
+      // Windows 上没有 POSIX 权限位，chmodSync 会抛 EPERM/EINVAL，别碰。
+      if (target.goos !== "windows") fs.chmodSync(out, 0o755);
       console.log("ok");
     } catch (err) {
       console.log(`失败: ${err.message}`);
@@ -56,10 +57,25 @@ if (!fs.existsSync(out)) {
 
 // ── 2) llm CLI（simonw/LLM）────────────────────────────────────
 
+// venv 的可执行目录：POSIX 是 <venv>/bin，Windows 是 <venv>/Scripts。
+// （Windows 的 venv 从来就是 Scripts；bin 只出现在 Unix。）
+function venvDir(home) {
+  return path.join(home, ".llm-venv", process.platform === "win32" ? "Scripts" : "bin");
+}
+
+/** llm 在 venv 里的可能文件名（Windows 上是 llm.exe）。 */
+function venvExeCandidates(home) {
+  const dir = venvDir(home);
+  return process.platform === "win32"
+    ? [path.join(dir, "llm.exe"), path.join(dir, "llm")]
+    : [path.join(dir, "llm")];
+}
+
 function haveLlm() {
   if (process.env.MAGIC_AGENT_LLM_BIN) return process.env.MAGIC_AGENT_LLM_BIN;
-  const venv = path.join(os.homedir(), ".llm-venv", "bin", "llm");
-  if (fs.existsSync(venv)) return venv;
+  for (const c of venvExeCandidates(os.homedir())) {
+    if (fs.existsSync(c)) return c;
+  }
   try {
     return execFileSync("llm", ["--version"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim() && "llm";
   } catch (_) {
@@ -70,7 +86,6 @@ function haveLlm() {
 
 function installLlm() {
   const home = os.homedir();
-  const venvBin = path.join(home, ".llm-venv", "bin");
 
   // 找一个能用的 python3（python3 > python；都不行时放弃）。
   let py = null;
@@ -91,10 +106,11 @@ function installLlm() {
     // Homebrew Python pip 可能因 PIP_BREAK_SYSTEM_PACKAGES / truststore 报错，
     // venv 内不需要这些；静音升级提示。
     delete env.PIP_BREAK_SYSTEM_PACKAGES;
+    // Windows 的 venv 自带 pip 一般已装好，但 -m pip 走解释器更稳。
     execFileSync(py, ["-m", "venv", path.join(home, ".llm-venv")], { stdio: ["ignore", "ignore", "pipe"] });
     execFileSync(
-      path.join(venvBin, "pip"),
-      ["install", "--quiet", "--disable-pip-version-check", "llm"],
+      py,
+      ["-m", "pip", "install", "--quiet", "--disable-pip-version-check", "llm"],
       { stdio: ["ignore", "ignore", "pipe"], env }
     );
     console.log("ok");

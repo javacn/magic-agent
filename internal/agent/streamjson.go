@@ -141,7 +141,7 @@ func hasImageAttachment(atts []Attachment) bool {
 // setArgValue 把 args 里 <flag> 的下一个值改成 want（找不到就追加 <flag> want）。
 // claude/codebuddy 的 --output-format json → stream-json 就靠它。
 func setArgValue(args []string, flag, want string) []string {
-	for i := 0; i < len(args)-1; i++ {
+	for i := 0; len(args) > 0 && i < len(args)-1; i++ {
 		if args[i] == flag {
 			args[i+1] = want
 			return args

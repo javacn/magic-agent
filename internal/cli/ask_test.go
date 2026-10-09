@@ -260,6 +260,7 @@ func TestRootShorthandAsk(t *testing.T) {
 }
 
 // -p 与位置参数组合：-p 在前、args 在后；--tools 透传到 Request。
+// ⚠️ 2026-10-01 默认从 off 改成 on —— 此处断言随之反转。
 func TestPromptFlagCombinedWithArgs(t *testing.T) {
 	capEng := &capturingEngine{name: "fake-cap"}
 	registerFake(capEng)
@@ -272,9 +273,9 @@ func TestPromptFlagCombinedWithArgs(t *testing.T) {
 	if !strings.HasPrefix(got, "主问题") || !strings.Contains(got, "附加 上下文") {
 		t.Errorf("prompt = %q, want -p 在前 + args 在后", got)
 	}
-	// 默认 tools=off 透传
-	if !agent.ToolsIsOff(capEng.lastTools) {
-		t.Errorf("default tools should be off, got %#v", capEng.lastTools)
+	// 默认 tools=on 透传（2026-10-01 反转）
+	if !agent.ToolsIsOn(capEng.lastTools) {
+		t.Errorf("default tools should be on (2026-10-01), got %#v", capEng.lastTools)
 	}
 }
 

@@ -154,6 +154,13 @@ func dig(m map[string]any, path ...string) any {
 // 关键点：autoAllowBashIfSandboxed 是第 1/2 档与第 3 档的分水岭。
 // 该键在 claude 侧的默认值是 true，所以第 1/2 档必须显式写 false ——
 // 否则沙箱内的 Bash 会被自动放行，第 2 档就退化成了「编辑与命令都不问」。
+//
+// ⚠️ 2026-10-01 反转：第 4 档（PermissionFull / bypassPermissions）下，
+// sandboxSettings **返回 nil** 而不是 `{"enabled": false}`。原因是 claude CLI
+// 在 tools=default + bypassPermissions + `--settings {"sandbox":{"enabled":false}}`
+// 组合下报「Invalid JSON provided to --settings」、exit 0 零输出（实测）。
+// bypassPermissions 与 sandbox 互斥：开了也是空跑、显式写 enabled=false 反而触发 bug。
+// 让外层（agentSettingsPayload）整段不下发即可。
 func TestSandboxSettingsPerTier(t *testing.T) {
 	cases := []struct {
 		tier       PermissionTier
@@ -164,18 +171,15 @@ func TestSandboxSettingsPerTier(t *testing.T) {
 		{PermissionManual, true, false, true},
 		{PermissionAcceptEdits, true, false, true},
 		{PermissionAuto, true, true, true},
-		{PermissionFull, false, false, false},
 	}
 	for _, c := range cases {
 		sb := sandboxSettings(c.tier, PermissionOptions{}, "claude")
+		if sb == nil {
+			t.Errorf("%s: sandboxSettings 不应返回 nil", c.tier)
+			continue
+		}
 		if got := sb["enabled"]; got != c.enabled {
 			t.Errorf("%s: sandbox.enabled = %v, want %v", c.tier, got, c.enabled)
-		}
-		if c.tier == PermissionFull {
-			if _, has := sb["autoAllowBashIfSandboxed"]; has {
-				t.Errorf("full 档不该带 autoAllowBashIfSandboxed")
-			}
-			continue
 		}
 		if got := sb["autoAllowBashIfSandboxed"]; got != c.autoAllow {
 			t.Errorf("%s: sandbox.autoAllowBashIfSandboxed = %v, want %v（这是第1/2档与第3档的分水岭）",
@@ -199,6 +203,11 @@ func TestSandboxSettingsPerTier(t *testing.T) {
 	if got := sb["enabled"]; got != true {
 		t.Errorf("codebuddy auto 档 sandbox.enabled = %v, want true", got)
 	}
+
+	// 第 4 档：返回 nil，整段 sandbox 不下发。
+	if got := sandboxSettings(PermissionFull, PermissionOptions{}, "claude"); got != nil {
+		t.Errorf("full 档应返回 nil（实测 2026-10-01：写 enabled=false 触发 claude CLI bug）")
+	}
 }
 
 // TestSandboxSettingsOptions 可选项（排除命令 / 网络白名单 / 放宽逃逸舱口）。
@@ -221,9 +230,9 @@ func TestSandboxSettingsOptions(t *testing.T) {
 		t.Errorf("allowUnsandboxedCommands = %v, want true（显式放宽时）", got)
 	}
 
-	// 第 4 档无沙箱，可选项一律不生效。
-	if sbFull := sandboxSettings(PermissionFull, opts, "claude"); len(sbFull) != 1 {
-		t.Errorf("full 档 sandbox 应只有 enabled 一项，得到 %v", sbFull)
+	// 第 4 档：返回 nil，所有可选项一律不生效。
+	if sbFull := sandboxSettings(PermissionFull, opts, "claude"); sbFull != nil {
+		t.Errorf("full 档 sandbox 应返回 nil（整段不下发），得到 %v", sbFull)
 	}
 }
 
@@ -314,17 +323,17 @@ func TestAgentSettingsPayload(t *testing.T) {
 		t.Error("permissions.ask 丢失")
 	}
 
-	// ④ 第 4 档：显式关闭沙箱（覆盖用户 settings 里可能开着的 sandbox）。
+	// ④ 第 4 档：**不下发 sandbox 整段**（实测 2026-10-01：claude CLI 在
+	//   tools=default + bypassPermissions + `--settings {"sandbox":{"enabled":false}}`
+	//   组合下报「Invalid JSON provided to --settings」、exit 0 零输出）。
+	//   bypassPermissions 与 sandbox 互斥：开了也是空跑、显式写 enabled=false
+	//   反而触发那个 bug。让外层 sandboxSettings 返 nil、外层整段不下发即可。
 	payload, ok = agentSettingsPayload(Request{Tools: ToolsOn, Permission: PermissionFull}, "claude")
-	if !ok {
-		t.Fatal("full 档应注入 --settings（显式关闭沙箱）")
+	if ok {
+		t.Error("full 档应**不**注入 --settings（沙箱整段不下发）")
 	}
-	s = decodeSettings(t, payload)
-	if got := dig(s, "sandbox", "enabled"); got != false {
-		t.Errorf("full 档 sandbox.enabled = %v, want false", got)
-	}
-	if _, has := s["autoMode"]; has {
-		t.Error("full 档不该有 autoMode")
+	if payload != "" {
+		t.Errorf("full 档 payload 应为空，实际 %q", payload)
 	}
 }
 
@@ -374,7 +383,8 @@ func TestClaudeBuildArgsPermissionTiers(t *testing.T) {
 		{PermissionFull, "bypassPermissions"},
 	}
 	for _, c := range cases {
-		// --tools on
+		// --tools on：2026-10-01 必须显式 --tools default（不然 claude CLI 在
+		// stream-json 模式下不发 result 行）；同时仍带 --permission-mode。
 		args := e.buildArgsBase(Request{Tools: ToolsOn, Permission: c.tier})
 		got, ok := argValue(args, "--permission-mode")
 		if !ok {
@@ -383,8 +393,8 @@ func TestClaudeBuildArgsPermissionTiers(t *testing.T) {
 		if got != c.wantMode {
 			t.Errorf("%s(--tools on): --permission-mode = %q, want %q", c.tier, got, c.wantMode)
 		}
-		if _, has := argValue(args, "--tools"); has {
-			t.Errorf("%s(--tools on): 不该传 --tools（on = 引擎默认全工具）", c.tier)
+		if got, _ := argValue(args, "--tools"); got != "default" {
+			t.Errorf("%s(--tools on): --tools = %q, want default（显式开全部内置）", c.tier, got)
 		}
 		// 改造后不该再出现 --dangerously-skip-permissions（档位统一走 --permission-mode）。
 		for _, a := range args {
@@ -392,9 +402,22 @@ func TestClaudeBuildArgsPermissionTiers(t *testing.T) {
 				t.Errorf("%s: 仍在传 --dangerously-skip-permissions，应统一走 --permission-mode", c.tier)
 			}
 		}
-		// 沙箱只能经 --settings 进（claude 没有 --sandbox flag）。
-		if _, has := argValue(args, "--settings"); !has {
-			t.Errorf("%s: 缺少 --settings（沙箱配置没有 CLI flag，只能从这里进）", c.tier)
+		// 第 4 档**不**带 --settings（实测 2026-10-01：claude CLI 在
+		// tools=default + bypassPermissions + `{"sandbox":{"enabled":false}}`
+		// 组合下报「Invalid JSON provided to --settings」、exit 0 零输出）。
+		// 其他档：沙箱只能经 --settings 进（claude 没有 --sandbox flag）。
+		hasSettings := false
+		if _, has := argValue(args, "--settings"); has {
+			hasSettings = true
+		}
+		if c.tier == PermissionFull {
+			if hasSettings {
+				t.Errorf("%s(--tools on): full 档不应带 --settings（实测 2026-10-01 触发 claude CLI bug）", c.tier)
+			}
+		} else {
+			if !hasSettings {
+				t.Errorf("%s(--tools on): 缺少 --settings（沙箱配置没有 CLI flag，只能从这里进）", c.tier)
+			}
 		}
 
 		// --tools 白名单
@@ -422,22 +445,22 @@ func TestClaudeBuildArgsPermissionTiers(t *testing.T) {
 
 // TestClaudeBuildArgsDefaultTierUnchanged 默认档的 argv 与改造前的语义一致。
 //
-// 改造前：--tools on → --dangerously-skip-permissions（无 --settings）。
-// 改造后：--tools on → --permission-mode bypassPermissions + --settings{"sandbox":{"enabled":false}}。
-// 两者在 claude 官方文档里是**等价**的（"Equivalent to --permission-mode bypassPermissions"），
-// 且显式关沙箱能覆盖用户 settings 里可能开着的 sandbox.enabled。
+// 2026-10-01 修订：默认档（Permission 零值 = PermissionFull / bypassPermissions）
+// **不**带 --settings。原因是 claude CLI 在 tools=default + bypassPermissions +
+// `{"sandbox":{"enabled":false}}` 组合下报「Invalid JSON provided to --settings」、
+// exit 0 零输出（实测）。bypassPermissions 与 sandbox 互斥，写 enabled=false 反而
+// 触发那个 bug。让 sandboxSettings 在 full 档返 nil、外层整段不下发即可。
 func TestClaudeBuildArgsDefaultTierUnchanged(t *testing.T) {
 	e := &ClaudeEngine{}
 	args := e.buildArgsBase(Request{Tools: ToolsOn}) // Permission 零值
 	if got, _ := argValue(args, "--permission-mode"); got != "bypassPermissions" {
 		t.Errorf("默认档 --permission-mode = %q, want bypassPermissions", got)
 	}
-	payload, ok := argValue(args, "--settings")
-	if !ok {
-		t.Fatal("默认档应带 --settings（显式关闭沙箱）")
+	if got, _ := argValue(args, "--tools"); got != "default" {
+		t.Errorf("默认档 --tools = %q, want default（2026-10-01 必须显式 --tools default）", got)
 	}
-	if got := dig(decodeSettings(t, payload), "sandbox", "enabled"); got != false {
-		t.Errorf("默认档 sandbox.enabled = %v, want false", got)
+	if _, has := argValue(args, "--settings"); has {
+		t.Errorf("默认档（full）不应带 --settings（实测触发 claude CLI bug）")
 	}
 }
 

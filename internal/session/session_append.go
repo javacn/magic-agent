@@ -124,6 +124,20 @@ func (a *Appender) Close() {
 	}
 }
 
+// AppendTransportAvailable 报告本平台是否具备「追加入口」的传输能力。
+//
+// 存在的意义（2026-10-01）：Windows 没有 unix domain socket，
+// ListenAppend 在那里必然失败。调用方（cli 层 kaEnabled）据此**提前**判定，
+// 让「默认值触发的常驻」在 Windows 上静默不启用 —— 而不是让用户撞上
+// 「--keep-alive: 常驻会话目前只支持 macOS/Linux」这种
+// 「我没要求它开、它却报错」的错。
+//
+// 显式传 --keep-alive 时仍应报错（用户明确要了这件事，要说清为什么不行），
+// 那个判断在 cli 层的 prepareAsk，不在这里。
+func AppendTransportAvailable() bool {
+	return runtime.GOOS != "windows"
+}
+
 // ListenAppend 为一条会话开追加入口，并把路径写进会话记录（客户端据此找到它）。
 //
 // 目录/文件权限：sessions 目录 0700、socket 文件 0600 → 仅同用户可连。
@@ -131,7 +145,7 @@ func ListenAppend(h *Handle) (*Appender, error) {
 	if h == nil {
 		return nil, fmt.Errorf("no session handle")
 	}
-	if runtime.GOOS == "windows" {
+	if !AppendTransportAvailable() {
 		return nil, fmt.Errorf("常驻会话（--keep-alive）与 --append 目前只支持 macOS/Linux：Windows 没有 unix domain socket")
 	}
 	dir := Dir()

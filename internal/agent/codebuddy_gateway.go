@@ -337,6 +337,10 @@ func (e *CodeBuddyGatewayEngine) run(ctx context.Context, req Request, onEvent f
 		sessionID: convID,
 	}
 	if err := e.consumeStream(httpCtx, client, r, runID, st, req.JSONSchema); err != nil {
+		// 流被截断 / 任务 failed / HTTP 拒绝都走这一条：已发出的正文 item
+		// 必须收成 failed，不能让它永远停在 running（消费方只能靠超时猜，
+		// 历史回放里那一条会永远显示「生成中」）。语义见 cbGatewayStreamState.fail。
+		st.fail(err)
 		return st.result(e, req, start), err
 	}
 	res := st.result(e, req, start)

@@ -14,13 +14,13 @@
 | 引擎调用 | `-e <engine> -p "<prompt>"`（含超时、重试、退出码） | 稳定 | `internal/cli/ask.go` |
 | 探测与能力 | `--engines [--no-models]`：`ok` / `bin` / `install` / `version` / `models` / `capabilities` … | 稳定 | `internal/cli/root.go` |
 | 契约 envelope | `--contract`：`{contractVersion, features, engines[]}`，`engines[]` 与 `--engines` **同构** | v1 | `internal/cli/root.go` + `internal/agent/capability.go` |
-| 事件流 | `--stream --events`：NDJSON，每行带 `v` / `seq`，首行 `ready` | v1 | `internal/cli/events.go` |
+| 事件流 | `--stream --events`：NDJSON，每行带 `v` / `seq`，首行 `ready`；文本/轮次事件带状态收敛四元组（`item_id` / `item_revision` / `status` / `snapshot`，见 1.1.1） | v1 | `internal/cli/events.go` |
 | 控制回传 | `--stream --control`：stdin 收 NDJSON 命令（`ping` / `interrupt` / `stop` / `answer`） | v1 | `internal/cli/control.go` |
 | 会话追加 | `--stream --keep-alive` + `--append <id>`；`--sessions` / `--stop <id>` | 稳定 | `internal/cli/session.go` |
 
 ### 1.1 事件流形状
 
-未开 `--events` 时是历史形状（逐字节不变）：
+`--stream` 的事件形状（`--events` 只额外加 `v` / `seq` 与 core 自己的事件）：
 
 ```json
 {"type":"thinking","text":"…"}
@@ -28,10 +28,16 @@
 {"type":"tool_use","text":"<args JSON>","name":"Bash","id":"toolu_x"}
 {"type":"tool_result","text":"<output>","id":"toolu_x"}
 {"type":"turn_end","text":"<该轮正文>","session_id":"…"}
+{"type":"turn_failed","session_id":"…","error":"<完整错误链>","reason":"<根因>","status":"failed"}
 {"type":"ask","text":"<一行摘要>","ask":{…}}
 {"type":"result","engine":"…","model":"…","session_id":"…","text":"<全文>","thinking":"…","tools":[…]}
 {"type":"error","engine":"…","reason":"<根因>","error":"<完整错误链>"}
 ```
+
+⚠️ 上面省略了 1.1.1 的收敛字段（omitempty，**开不开 `--events` 都会出现**）。
+1.1.1 之前这里写的是「历史形状（逐字节不变）」，实现并非如此 ——
+`--stream` 与 `--events` 共用同一个 payload，两条路径都会带上新字段。
+此处按实际实现更正；消费方按「忽略未知字段」处理即可向后兼容。
 
 开 `--events` 后**字段集不变**，每行多 `v` / `seq`（`seq` 从 1 单调 +1），
 并额外产出四类 core 自己的事件：`ready`（首行，带 `engine` / `model`）、
@@ -39,6 +45,75 @@
 
 两条不变量（有测试钉住）：**每轮一定以 `result` 或 `error` 收尾**；
 `--events` 与 `--stream` 的字段集只差 `v` / `seq`。
+
+### 1.1.1 状态收敛字段（2026-10-02 新增，只增字段不升版本）
+
+`thinking` / `text` / `turn_end` / `turn_failed` 四类事件带一组收敛字段
+（非空才出现，omitempty）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `item_id` | 稳定 item 标识。**思考与正文是两条 item**：`<engine>_msg_<原生 message id>` 与 `<engine>_think_<同一 id>`；无原生 id 时退化为 `<engine>_msg_local_<n>` |
+| `item_revision` | 该 item 的第几个版本，从 1 起**单调递增**（每条 item 各自计数） |
+| `status` | `running`（还在增长）/ `final`（已定型）/ `failed`（异常终止） |
+| `snapshot` | 该 item 到此刻的**整段内容**（累积快照，不是增量） |
+| `error` / `reason` | 仅 `turn_failed`：完整错误链 / 最内层根因 |
+
+⚠️ **`text` 仍是增量片段**，不是 snapshot。两者并存是刻意的：
+`text` 服务终端直打与老消费者逐行拼接，`snapshot` 服务「按 item 覆盖」的
+多端同步。消费方二选一即可。
+
+⚠️ **为什么思考与正文分成两条 item**（别合并回去）：共享一个 `item_id` 时，
+后到的 `text` 帧会覆盖先到的 `thinking` 帧（revision 更高），
+**思考内容静默消失**。`text` 是增量所以终端直打看不出来，
+出问题的是走 `snapshot` 的历史回放与多端同步。
+两条 item 内嵌**同一个原生 message id**，要合并展示时按它关联即可。
+
+⚠️ **一轮里可能有多个 `item_id`**：工具调用后继续回答会产生多条
+assistant message，每条各有一个 item（快照不跨 item 累积）。
+把一轮当「一个 item」处理的消费方会漏掉前面的回复。
+
+⚠️ **`turn_end` 只收尾正文 item**：result 行里是整条消息的正文，
+不含思考链。给思考 item 也发 `final` 会让它的 `snapshot` 回退成空。
+思考 item 的终止靠轮级信号（`turn_end` / `turn_failed`）判定。
+
+**推荐的消费方式**（覆盖式 upsert）：
+
+```
+按 item_id 维护一张表；收到事件时
+  若 item_revision <= 表中已有版本 → 丢弃（重复或乱序的旧帧，天然幂等）
+  否则 → 用 snapshot 覆盖，状态取 status
+收到 status=final 或 status=failed → 该 item 生命周期结束，不再等增长
+收到 turn_end / turn_failed → 本轮全部 item 结束
+```
+
+⚠️ 一轮里可能先出现 `turn_failed`（引擎没吐 result 行）、
+再出现 `type:"error"`（core 层收尾）。二者语义不同：
+前者是**流级**截断（含已流出的半截正文 + 其 item 状态），
+后者是**进程级**错误报告。消费方按 `item_id` 归并时以 `turn_failed` 标记
+那些 item 的终态即可，不要把 `error` 当成第二个 item 事件。
+
+会话落盘（`magic-agent session log <id>` 与插件 `/desk/session/{id}/messages`）
+落的是同一组字段，所以**历史回放与实时渲染的收敛语义完全一致**。
+
+⚠️ **覆盖范围（2026-10-02）**：收敛字段目前覆盖
+claude / codebuddy(+ai) / trae（走统一的 `streamAccumulator`）、
+codebuddy-gateway 与 arkclaw（在自己的 emit 路径里直接持有 tracker）。
+codex / dsh(+sdk) / llm / openclaw 暂不带 `item_id`，
+消费方需按「无 item 的纯增量」兼容处理。
+
+各引擎的**原生 item id 取法不同**，消费方不要按前缀反推语义，
+只按 `item_id` 分组即可：
+
+| 引擎 | item id | 取自 |
+| --- | --- | --- |
+| claude / codebuddy / trae | `<engine>_msg_<native>` / `<engine>_think_<同一 id>` | 原生 assistant message id |
+| codebuddy-gateway | `codebuddy-gateway_msg_<runId>` | 网关分配的 runId（一个 run 恒定） |
+| arkclaw | `arkclaw_msg_<taskId>` | A2A `result.id`（**不是** `contextId`） |
+
+⚠️ **arkclaw 的 `contextId` 是会话锚点、跨轮不变**，
+拿它当 item id 会让同一会话每一轮共用一条 item、后一轮覆盖前一轮。
+它只会出现在 `session_id` 字段里。
 
 ### 1.2 控制命令
 

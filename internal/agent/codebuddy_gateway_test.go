@@ -242,13 +242,33 @@ func TestCodeBuddyGatewayCompletedEmitsRemainderOnly(t *testing.T) {
 	srv, _ := cbGatewayTestServer(t, "run-1", frames)
 	e := cbGatewayServerEngine(srv)
 
+	// ⚠️ 必须**按 kind 过滤**收集，不能无脑 append ev.Text：
+	// Text 字段在多种事件上都有值（turn_end 带权威全文、tool_use 带 args JSON），
+	// 无脑收集在 claude 上本来就会把工具参数混进「正文」。这里顺带把
+	// 「正文只来自 KindText」这条不变量也钉住。
 	var got []string
+	var end *StreamEvent
 	if _, err := e.Stream(context.Background(), Request{Messages: []Message{{Role: "user", Content: "x"}}},
-		func(ev StreamEvent) { got = append(got, ev.Text) }); err != nil {
+		func(ev StreamEvent) {
+			switch ev.Kind {
+			case KindText:
+				got = append(got, ev.Text)
+			case KindTurnEnd:
+				ev := ev
+				end = &ev
+			}
+		}); err != nil {
 		t.Fatalf("Stream 失败: %v", err)
 	}
 	if len(got) != 2 || got[0] != "你好" || got[1] != "，世界" {
 		t.Errorf("增量 = %v want [你好 ，世界]", got)
+	}
+	// 轮次边界：turn_end 带权威全文（与 claude / dsh 同一约定，见 finish 的注释）。
+	if end == nil {
+		t.Fatal("缺少 turn_end 轮次边界事件")
+	}
+	if end.Text != "你好，世界" {
+		t.Errorf("turn_end.Text = %q，want 权威全文「你好，世界」", end.Text)
 	}
 }
 
@@ -669,5 +689,220 @@ func TestCodeBuddyGatewayStreamTimeout(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Errorf("超时没生效，耗时 %v", time.Since(start))
+	}
+}
+
+// ---------- 状态收敛（2026-10-02）----------
+
+// TestCodeBuddyGatewayConverges 整条流必须给出「同 item id、单调 revision、
+// running…→ final」的完整收敛序列。
+//
+// 这条挡的是「接了 tracker 但没接进 emit 路径」这类接线错误 ——
+// 单元测试全绿但 wire 上没有 item_id，症状是消费方拿不到收敛能力。
+func TestCodeBuddyGatewayConverges(t *testing.T) {
+	frames := []string{
+		cbGatewayFrameJSON("streaming", `"content":{"chunk":"第一"}`),
+		cbGatewayFrameJSON("streaming", `"content":{"chunk":"第二"}`),
+		cbGatewayFrameJSON("completed", `"content":{"markdown":"第一第二"}`),
+	}
+	srv, _ := cbGatewayTestServer(t, "run-conv-1", frames)
+	e := cbGatewayServerEngine(srv)
+
+	var evs []StreamEvent
+	if _, err := e.Stream(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "x"}},
+	}, func(ev StreamEvent) { evs = append(evs, ev) }); err != nil {
+		t.Fatalf("Stream 失败: %v", err)
+	}
+
+	var texts []StreamEvent
+	var ends []StreamEvent
+	for _, ev := range evs {
+		switch ev.Kind {
+		case KindText:
+			texts = append(texts, ev)
+		case KindTurnEnd:
+			ends = append(ends, ev)
+		}
+	}
+	// 两帧 streaming 各一条正文；completed 帧正文与已发增量相同（前缀去重后差量为空），
+	// 所以正文只有 2 条，轮次边界由 turn_end 承担。
+	if len(texts) != 2 {
+		t.Fatalf("text 事件数 = %d，want 2：%+v", len(texts), texts)
+	}
+	if len(ends) != 1 {
+		t.Fatalf("turn_end 事件数 = %d，want 1：%+v", len(ends), ends)
+	}
+	// turn_end 承担 final：同 item id + 更高 revision。
+	if ends[0].ItemID != texts[0].ItemID {
+		t.Errorf("turn_end 应挂在正文 item 上：%q vs %q", ends[0].ItemID, texts[0].ItemID)
+	}
+	if ends[0].ItemRevision <= texts[len(texts)-1].ItemRevision {
+		t.Errorf("turn_end revision 必须更高：正文末帧=%d turn_end=%d",
+			texts[len(texts)-1].ItemRevision, ends[0].ItemRevision)
+	}
+	if ends[0].Status != StatusFinal {
+		t.Errorf("turn_end status = %q，want final", ends[0].Status)
+	}
+	for i, ev := range texts {
+		if ev.ItemID == "" || ev.ItemRevision == 0 {
+			t.Errorf("[%d] 缺收敛字段: %+v", i, ev)
+		}
+		if !strings.HasPrefix(ev.ItemID, "codebuddy-gateway_msg_") {
+			t.Errorf("[%d] item id 前缀不对: %q", i, ev.ItemID)
+		}
+	}
+	// 同一条 item（整轮只有一个 run）→ id 全同。
+	for i, ev := range texts {
+		if ev.ItemID != texts[0].ItemID {
+			t.Errorf("[%d] item id 变了：%q vs %q", i, ev.ItemID, texts[0].ItemID)
+		}
+	}
+	// revision 严格递增，末帧为 final。
+	for i := 1; i < len(texts); i++ {
+		if texts[i].ItemRevision <= texts[i-1].ItemRevision {
+			t.Errorf("revision 未递增：%d 之后是 %d", texts[i-1].ItemRevision, texts[i].ItemRevision)
+		}
+	}
+	if texts[0].Status != StatusRunning {
+		t.Errorf("首帧 status = %q，want running", texts[0].Status)
+	}
+}
+
+// TestCodeBuddyGatewaySnapshotIsCumulative snapshot 必须是**累积整段**，
+// text 才是增量 —— 两者混了就等于没有收敛能力。
+//
+// 特别验 completed 帧那一帧：传入 emitText 的是「差量」（此处为空所以不发），
+// 但 snapshot 仍要等于累积到此刻的全文，不能是差量或空串。
+func TestCodeBuddyGatewaySnapshotIsCumulative(t *testing.T) {
+	frames := []string{
+		cbGatewayFrameJSON("streaming", `"content":{"chunk":"你好"}`),
+		cbGatewayFrameJSON("streaming", `"content":{"chunk":"世界"}`),
+		cbGatewayFrameJSON("completed", `"content":{"markdown":"你好世界！"}`),
+	}
+	srv, _ := cbGatewayTestServer(t, "run-conv-2", frames)
+	e := cbGatewayServerEngine(srv)
+
+	var texts, ends []StreamEvent
+	if _, err := e.Stream(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "x"}},
+	}, func(ev StreamEvent) {
+		switch ev.Kind {
+		case KindText:
+			texts = append(texts, ev)
+		case KindTurnEnd:
+			ends = append(ends, ev)
+		}
+	}); err != nil {
+		t.Fatalf("Stream 失败: %v", err)
+	}
+	if len(texts) != 3 {
+		t.Fatalf("text 事件数 = %d，want 3：%+v", len(texts), texts)
+	}
+	if len(ends) != 1 {
+		t.Fatalf("turn_end 事件数 = %d，want 1：%+v", len(ends), ends)
+	}
+
+	// 逐帧校验：text 是增量，snapshot 是累积。
+	wantDelta := []string{"你好", "世界", "！"}
+	wantSnap := []string{"你好", "你好世界", "你好世界！"}
+	for i, ev := range texts {
+		if ev.Text != wantDelta[i] {
+			t.Errorf("[%d] text = %q，want 增量 %q", i, ev.Text, wantDelta[i])
+		}
+		if ev.Snapshot != wantSnap[i] {
+			t.Errorf("[%d] snapshot = %q，want 累积 %q", i, ev.Snapshot, wantSnap[i])
+		}
+	}
+	// 终帧（turn_end）的 snapshot 必须是完整正文。
+	if ends[0].Snapshot != "你好世界！" {
+		t.Errorf("turn_end snapshot = %q，want 全文", ends[0].Snapshot)
+	}
+	if ends[0].Text != "你好世界！" {
+		t.Errorf("turn_end text = %q，want 权威全文", ends[0].Text)
+	}
+}
+
+// TestCodeBuddyGatewayNoItemIDWithoutEvents onEvent 为 nil（非流式 Complete 路径）
+// 时不发任何事件，自然也不该构造 tracker。
+func TestCodeBuddyGatewayCompleteHasNoItemID(t *testing.T) {
+	frames := []string{cbGatewayFrameJSON("completed", `"content":{"markdown":"完成"}`)}
+	srv, _ := cbGatewayTestServer(t, "run-conv-3", frames)
+	e := cbGatewayServerEngine(srv)
+
+	res, err := e.Complete(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "x"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete 失败: %v", err)
+	}
+	if res.Text != "完成" {
+		t.Errorf("Text = %q", res.Text)
+	}
+}
+
+// TestCodeBuddyGatewayTurnFailedOnTruncatedStream 流被截断（没有 completed 帧）
+// 必须补 turn_failed，否则那条 item 永远停在 running —— 消费方只能靠超时猜，
+// 历史回放里那一条会永远显示「生成中」。
+func TestCodeBuddyGatewayTurnFailedOnTruncatedStream(t *testing.T) {
+	frames := []string{
+		cbGatewayFrameJSON("streaming", `"content":{"chunk":"只说了半句"}`),
+	}
+	srv, _ := cbGatewayTestServer(t, "run-fail-1", frames)
+	e := cbGatewayServerEngine(srv)
+
+	var texts, failed []StreamEvent
+	_, err := e.Stream(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "x"}},
+	}, func(ev StreamEvent) {
+		switch ev.Kind {
+		case KindText:
+			texts = append(texts, ev)
+		case KindTurnFailed:
+			failed = append(failed, ev)
+		}
+	})
+	if err == nil {
+		t.Fatal("无终帧的流应报错")
+	}
+	if len(texts) != 1 || len(failed) != 1 {
+		t.Fatalf("事件形状 = text %d / turn_failed %d，want 1/1", len(texts), len(failed))
+	}
+	// failed 挂在同一个 item 上：partial 还在，只是这条 item 不再增长。
+	if failed[0].ItemID != texts[0].ItemID {
+		t.Errorf("turn_failed 应挂在正文 item 上：%q vs %q", failed[0].ItemID, texts[0].ItemID)
+	}
+	if failed[0].Status != StatusFailed {
+		t.Errorf("status = %q，want failed", failed[0].Status)
+	}
+	if failed[0].ItemRevision <= texts[0].ItemRevision {
+		t.Errorf("turn_failed revision 必须更高：%d vs %d", failed[0].ItemRevision, texts[0].ItemRevision)
+	}
+	if failed[0].Error == "" || failed[0].Reason == "" {
+		t.Errorf("turn_failed 必须带 error / reason：%+v", failed[0])
+	}
+	if failed[0].Snapshot != "只说了半句" {
+		t.Errorf("snapshot = %q，want 保留 partial", failed[0].Snapshot)
+	}
+}
+
+// TestCodeBuddyGatewayNoTurnFailedWithoutText 一句正文都没流出来时**不该**造
+// failed 帧：消费方会凭空多出一条空 item。
+func TestCodeBuddyGatewayNoTurnFailedWithoutText(t *testing.T) {
+	// 只有受理帧，没有 streaming / completed。
+	srv, _ := cbGatewayTestServer(t, "run-empty-1", []string{
+		cbGatewayFrameJSON("accepted", ""),
+	})
+	e := cbGatewayServerEngine(srv)
+
+	var kinds []StreamEventKind
+	_, err := e.Stream(context.Background(), Request{
+		Messages: []Message{{Role: "user", Content: "x"}},
+	}, func(ev StreamEvent) { kinds = append(kinds, ev.Kind) })
+	if err == nil {
+		t.Fatal("无终帧的流应报错")
+	}
+	if len(kinds) != 0 {
+		t.Errorf("没有正文时不该发任何事件，收到 %v", kinds)
 	}
 }

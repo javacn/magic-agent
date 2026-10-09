@@ -43,6 +43,68 @@ func arkClawWorkingFrame(contextID string) string {
 		`"history":[]}}`, contextID)
 }
 
+// arkClawSplit 把事件按 kind 拆成「正文增量」与「轮次边界」两组。
+//
+// 为什么测试不能直接 len(events)：completed 帧收尾会多发一条 KindTurnEnd
+// （带权威全文，status=final），它**不是**又一段正文。收齐所有 ev.Text 再拼会
+// 把 final 全文重复算进增量（与 codebuddy-gateway 改测试时踩的同一个坑）。
+// 同理，turn_end 不能触发 AppendSupportOf 的 keep-alive 收工 —— arkclaw 不在名单里。
+func arkClawSplit(events *[]StreamEvent) (texts []StreamEvent, ends []StreamEvent) {
+	for _, ev := range *events {
+		switch ev.Kind {
+		case KindText:
+			texts = append(texts, ev)
+		case KindTurnEnd:
+			ends = append(ends, ev)
+		}
+	}
+	return texts, ends
+}
+
+// arkClawSplitFailed 与 arkClawSplit 同构，但收的是**异常终态** turn_failed。
+// 单独一个入口是为了让「截断/失败」用例不必记住第三种 kind 的存在 ——
+// 终态只有两种（turn_end 成功 / turn_failed 异常），正文永远只是 turn。
+func arkClawSplitFailed(events *[]StreamEvent) (texts []StreamEvent, failed []StreamEvent) {
+	for _, ev := range *events {
+		switch ev.Kind {
+		case KindText:
+			texts = append(texts, ev)
+		case KindTurnFailed:
+			failed = append(failed, ev)
+		}
+	}
+	return texts, failed
+}
+
+// assertArkClawFinal 断言 turn_end 承担了 final：挂在正文 item 上、revision 更高、
+// 正文是权威全文。与 gateway / claude 同一约定。
+func assertArkClawFinal(t *testing.T, texts, ends []StreamEvent, wantFinal string) {
+	t.Helper()
+	if len(texts) == 0 {
+		t.Fatal("缺少正文事件")
+	}
+	if len(ends) != 1 {
+		t.Fatalf("turn_end 事件数 = %d，want 1", len(ends))
+	}
+	end := ends[0]
+	if end.Status != StatusFinal {
+		t.Errorf("turn_end.Status = %q want %q", end.Status, StatusFinal)
+	}
+	if end.Text != wantFinal {
+		t.Errorf("turn_end.Text = %q want 权威全文 %q", end.Text, wantFinal)
+	}
+	if end.ItemID != texts[0].ItemID {
+		t.Errorf("turn_end 应挂在正文 item 上：%q vs %q", end.ItemID, texts[0].ItemID)
+	}
+	if end.ItemRevision <= texts[len(texts)-1].ItemRevision {
+		t.Errorf("turn_end revision 必须更高：正文末帧=%d turn_end=%d",
+			texts[len(texts)-1].ItemRevision, end.ItemRevision)
+	}
+	if end.ItemID == "" {
+		t.Error("turn_end 缺 item_id（状态收敛字段为空）")
+	}
+}
+
 // arkClawArtifactFrame 组一个把正文挂在 artifacts 上的帧（网关将来吐增量时的形态）。
 func arkClawArtifactFrame(state, contextID, text string) string {
 	return fmt.Sprintf(`{"jsonrpc":"2.0","id":"req-1","result":{"kind":"task","id":"task-1",`+
@@ -102,13 +164,16 @@ func TestArkClawStreamSSECompleted(t *testing.T) {
 		t.Errorf("method = %q want message/stream", sent.Method)
 	}
 
-	// 事件：working 帧**不发事件**（网关没有增量可发），completed 帧发一条正文增量。
-	if len(*events) != 1 {
-		t.Fatalf("事件数 = %d want 1: %+v", len(*events), *events)
+	// 事件：working 帧**不发事件**（网关没有增量可发），completed 帧发一条正文增量，
+	// 收尾多发一条 turn_end（final，不是又一段正文 —— 见 arkClawSplit）。
+	texts, ends := arkClawSplit(events)
+	if len(texts) != 1 {
+		t.Fatalf("正文增量数 = %d want 1: %+v", len(texts), *events)
 	}
-	if ev := (*events)[0]; ev.Kind != KindText || ev.Text != text {
+	if ev := texts[0]; ev.Kind != KindText || ev.Text != text {
 		t.Errorf("事件 = %+v want KindText/%q", ev, text)
 	}
+	assertArkClawFinal(t, texts, ends, text)
 
 	if res.Text != text {
 		t.Errorf("Text = %q", res.Text)
@@ -136,8 +201,8 @@ func TestArkClawStreamSkipsHeartbeatAndNonDataLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if len(*events) != 1 || (*events)[0].Text != "正文" {
-		t.Errorf("事件 = %+v want 单条正文", *events)
+	if texts, _ := arkClawSplit(events); len(texts) != 1 || texts[0].Text != "正文" {
+		t.Errorf("正文增量 = %+v want 单条正文", texts)
 	}
 	if res.Text != "正文" {
 		t.Errorf("Text = %q", res.Text)
@@ -160,8 +225,10 @@ func TestArkClawStreamDedupWhenArtifactsRepeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if len(*events) != 1 {
-		t.Fatalf("事件数 = %d want 1（同一份正文不得发两次）: %+v", len(*events), *events)
+	// 正文只发一次（status.message 与 artifacts 同文，去重后差量为空）；
+	// 收尾的 turn_end 不算正文，见 arkClawSplit。
+	if texts, _ := arkClawSplit(events); len(texts) != 1 {
+		t.Fatalf("正文增量数 = %d want 1（同一份正文不得发两次）: %+v", len(texts), *events)
 	}
 	if res.Text != "同一份正文" {
 		t.Errorf("Text = %q", res.Text)
@@ -182,12 +249,16 @@ func TestArkClawStreamForwardsArtifactIncrements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if len(*events) != 2 {
-		t.Fatalf("事件数 = %d want 2: %+v", len(*events), *events)
+	// 正文两条增量（第一段 / 第二段），completed 帧的整段前缀去重后无新增。
+	// turn_end 单独承担轮次边界，不计入增量。
+	texts, ends := arkClawSplit(events)
+	if len(texts) != 2 {
+		t.Fatalf("正文增量数 = %d want 2: %+v", len(texts), *events)
 	}
-	if (*events)[0].Text != "第一段" || (*events)[1].Text != "第二段" {
-		t.Errorf("增量 = %q / %q", (*events)[0].Text, (*events)[1].Text)
+	if texts[0].Text != "第一段" || texts[1].Text != "第二段" {
+		t.Errorf("增量 = %q / %q", texts[0].Text, texts[1].Text)
 	}
+	assertArkClawFinal(t, texts, ends, "第一段第二段")
 	if res.Text != "第一段第二段" {
 		t.Errorf("Text = %q", res.Text)
 	}
@@ -256,9 +327,13 @@ func TestArkClawStreamJSONSchemaPostProcess(t *testing.T) {
 	if err := json.Unmarshal([]byte(res.Text), &out); err != nil {
 		t.Fatalf("Text 不是纯 JSON: %v (%q)", err, res.Text)
 	}
-	if len(*events) != 1 || (*events)[0].Text != res.Text {
+	// 增量正文（已 JSONSchema 抽取）必须与收尾正文逐字节相同。
+	// 注意别把 turn_end 的权威全文当成第二段增量算进来。
+	texts, ends := arkClawSplit(events)
+	if len(texts) != 1 || texts[0].Text != res.Text {
 		t.Errorf("增量应与收尾正文一致: events=%+v text=%q", *events, res.Text)
 	}
+	assertArkClawFinal(t, texts, ends, res.Text)
 }
 
 // ---------- 错误路径 ----------
@@ -395,8 +470,15 @@ func TestArkClawStreamNonSSEFallback(t *testing.T) {
 	if res.Text != "一次性正文" || res.SessionID != "ctx-f1" {
 		t.Errorf("res = %+v", res.Response)
 	}
-	if len(*events) != 1 || (*events)[0].Text != "一次性正文" {
-		t.Errorf("事件 = %+v want 单条正文", *events)
+	// 回退路径同样有状态收敛：整段正文一条 text + 一条 turn_end(final)，
+	// 且 item id 取 task id（与 SSE 路径同源，见 arkClawTaskID 的注释）。
+	texts, ends := arkClawSplit(events)
+	if len(texts) != 1 || texts[0].Text != "一次性正文" {
+		t.Errorf("正文增量 = %+v want 单条正文", texts)
+	}
+	assertArkClawFinal(t, texts, ends, "一次性正文")
+	if !strings.HasPrefix(texts[0].ItemID, "arkclaw_msg_") || strings.Contains(texts[0].ItemID, "local_") {
+		t.Errorf("回退路径应沿用原生 task id 而非降级序号: %q", texts[0].ItemID)
 	}
 	if !strings.Contains(buf.String(), "SSE") {
 		t.Errorf("回退应在 stderr 说明原因: %q", buf.String())

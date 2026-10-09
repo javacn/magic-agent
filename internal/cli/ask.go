@@ -124,7 +124,7 @@ func bindAskFlags(cmd *cobra.Command, opts *askOptions) {
 	f.StringVarP(&opts.workspace, "workspace", "w", "", "工作目录（workspace）：在该目录里执行引擎；codex 走原生 -C，claude/codebuddy/trae/dsh 用子进程 cwd，llm/arkclaw/openclaw 不支持（忽略并提示）")
 	f.StringVarP(&opts.file, "file", "f", "", "从文件读 prompt（\"-\" = stdin）")
 	f.StringArrayVarP(&opts.attach, "attach", "a", nil, "附件路径（截图/图片等），可重复或逗号分隔；与提示词一起发给引擎（各引擎落地方式见 --engines 的 attachments 字段）")
-	f.StringVar(&opts.tools, "tools", "off", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)")
+	f.StringVar(&opts.tools, "tools", "on", "工具开关: off | on | 逗号分隔白名单(如 Bash,Read)（默认 on，2026-10-01 与 engine.toolsOrDefault 默认同步反转）")
 	f.StringVar(&opts.session, "session", "", "会话续接 id（空=新会话；传入上次输出里的 session_id 继续同一会话；arkclaw 传 contextId；dsh 不支持续接）")
 	f.BoolVarP(&opts.continueF, "continue", "c", false, "续接当前目录最近一次会话（不需要 session id；与 --session 同时给时 --session 优先）")
 	f.StringVar(&opts.stop, "stop", "", "停止指定会话/运行：传 session_id 或 run_id（--sessions 可见），杀掉它的引擎进程组")
@@ -583,10 +583,15 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 		// ⚠️ 这里只走**引擎事件**。用户提问（kind:"user"）与失败（kind:"error"）
 		//    不由流事件触发，见上面 runStreamAsk 里的 push 与下面的 error 分支。
 		/* ToolKind 与 SSE 流同源（同一个 toolKindOfEvent）：历史回放与实时渲染
-		   因此画出同一种卡，而不是各按工具名猜一套（见 agent/toolkind.go）。 */
+		   因此画出同一种卡，而不是各按工具名猜一套（见 agent/toolkind.go）。
+		   状态收敛四元组同样落盘 —— 历史回放按 (item_id, item_revision)
+		   覆盖式 upsert，语义与实时流完全一致。 */
 		sessionLog.push(sessionEvent{
 			Kind: string(ev.Kind), Text: ev.Text, Name: ev.Name, ID: ev.ID,
 			ToolKind: toolKindOfEvent(ev), Ask: ev.Ask,
+			ItemID: ev.ItemID, ItemRevision: ev.ItemRevision,
+			Status: string(ev.Status), Snapshot: ev.Snapshot,
+			Error: ev.Error, Reason: ev.Reason,
 		})
 	}
 	if format == agent.FormatJSON {
@@ -622,6 +627,12 @@ func runStreamAsk(cmd *cobra.Command, args []string, opts *askOptions) error {
 				// ⚠️ headless 下 claude 会在模型提问后**自行拒绝**（模型拿不到答案），
 				// 要真正作答得把答案作为后续 user 消息补进去（agent.EncodeAskFollowUp）。
 				fmt.Fprint(stderr, "❓ "+ev.Text+"\n")
+			case agent.KindTurnFailed:
+				// 本轮异常收尾（引擎没给 result 行）。打 stderr：stdout 是正文通道，
+				// 往里写错误会让 `> file` 存下一堆垃圾。真正的失败 envelope 由下面
+				// runStreamAsk 的 error 分支写（stdout 一条 error 事件），这里只
+				// 保证 text 模式的调用方也**看得见**这一轮没有正常结束。
+				fmt.Fprint(stderr, "✗ 本轮异常收尾："+ev.Reason+"\n")
 			}
 			wireLogger(ev)
 		}
@@ -877,17 +888,24 @@ func prepareAsk(cmd *cobra.Command, args []string, opts *askOptions) (agent.Engi
 			"magic-agent: 提示：当前 --tools off（不调用任何工具），--permission %s 不会生效；如需工具请加 --tools on\n", tier)
 	}
 	// 常驻会话默认值按引擎区分（见 kaEnabled / agent.AppendDefaultOn），但只在
-	// 「流式 + 引擎支持追加」时才有意义。显式 `--keep-alive` 却没满足条件 → 明确报错；
-	// 默认值不满足条件 → 静默忽略（不影响原有调用）。
+	// 「流式 + 引擎支持追加 + 本平台有追加入口」时才有意义。显式 `--keep-alive`
+	// 却不满足条件 → 明确报错；默认值不满足条件 → 静默忽略（不影响原有调用）。
 	if flagChanged(cmd, "keep-alive") && opts.keepAlive {
 		if !opts.stream {
 			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
 				"--keep-alive 是常驻会话（首轮结束后等 --append 追加），必须配合 --stream：追加轮次的输出要靠事件流送出")}
 		}
+		// 平台检查放在引擎检查**之后**：先说「这个引擎不支持」更有信息量，
+		// 再说「这台机器开不出来」。两者都成立时，平台原因才是最终拦路虎。
 		if !agent.AppendSupportOf(engine.Name()) {
 			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
 				"--keep-alive 暂不支持 %s 引擎（当前支持 claude、codebuddy、codebuddy-ai：靠 stream-json 输入持续收 user 消息；"+
 					"dsh：靠 SDK 通道对同一会话继续 prompt）", engine.Name())}
+		}
+		if !session.AppendTransportAvailable() {
+			return nil, "", agent.Request{}, &usageError{fmt.Errorf(
+				"--keep-alive 暂不支持 Windows：追加入口依赖 unix domain socket，本平台没有等价通道。" +
+					"去掉 --keep-alive 即可正常流式调用（提示词已改走 stdin，多行内容在 Windows 上同样是完整的）")}
 		}
 	}
 	if opts.idle < 0 {

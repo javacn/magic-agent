@@ -302,7 +302,9 @@ func (e *TraeEngine) Stream(ctx context.Context, req Request, onEvent func(Strea
 		return StreamResult{}, err
 	}
 	if !seenResult {
-		return StreamResult{}, fmt.Errorf("trae CLI stream ended without result line")
+		err := fmt.Errorf("trae CLI stream ended without result line")
+		acc.emitTurnFailed(acc.SessionID, err)
+		return StreamResult{}, err
 	}
 	if fin.IsError {
 		return StreamResult{}, fmt.Errorf("trae CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))

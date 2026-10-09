@@ -161,7 +161,11 @@ func (s *eventSink) notice(kind string, attrs map[string]any) error {
 }
 
 // streamEventPayload 流式事件的 wire 形状 —— `--stream` 与 `--stream --events` 共用。
-// 两边的字段集必须只差 v / seq，test 里有专门的防漂断言。
+// 两条边的字段集必须只差 v / seq，test 里有专门的防漂断言。
+//
+// ⚠️ 状态收敛字段（item_id / item_revision / status / snapshot / error / reason）
+// 只在**非空时**出现（全部 omitempty）—— 老引擎（trae 走 delta 但无 item 概念）、
+// 老事件（turn_end 之外的轮次事件）不带这些字段时与历史逐字节一致。
 func streamEventPayload(ev agent.StreamEvent) any {
 	return struct {
 		Type      string            `json:"type"`
@@ -171,14 +175,32 @@ func streamEventPayload(ev agent.StreamEvent) any {
 		ToolKind  string            `json:"tool_kind,omitempty"`
 		SessionID string            `json:"session_id,omitempty"`
 		Ask       *agent.AskRequest `json:"ask,omitempty"`
+		/* 状态收敛四元组（2026-10-02，对齐 agents-anywhere 的 timeline item）。
+		   消费方按 (item_id, item_revision) 覆盖式 upsert 即可：
+		   同一 item 的多个 partial 帧 + 最后一个 final 帧，
+		   乱序到达也能收敛到正确结果（重复投递同 revision 天然幂等）。 */
+		ItemID       string `json:"item_id,omitempty"`
+		ItemRevision uint64 `json:"item_revision,omitempty"`
+		Status       string `json:"status,omitempty"`
+		Snapshot     string `json:"snapshot,omitempty"`
+		/* 异常收尾（仅 turn_failed）：Error 是完整错误链，Reason 是最内层根因，
+		   与 -o json 的失败 envelope 同源（都走 agent.ReasonOf）。 */
+		Error  string `json:"error,omitempty"`
+		Reason string `json:"reason,omitempty"`
 	}{
-		Type:      string(ev.Kind),
-		Text:      ev.Text,
-		Name:      ev.Name,
-		ID:        ev.ID,
-		ToolKind:  toolKindOfEvent(ev),
-		SessionID: ev.SessionID,
-		Ask:       ev.Ask,
+		Type:         string(ev.Kind),
+		Text:         ev.Text,
+		Name:         ev.Name,
+		ID:           ev.ID,
+		ToolKind:     toolKindOfEvent(ev),
+		SessionID:    ev.SessionID,
+		Ask:          ev.Ask,
+		ItemID:       ev.ItemID,
+		ItemRevision: ev.ItemRevision,
+		Status:       string(ev.Status),
+		Snapshot:     ev.Snapshot,
+		Error:        ev.Error,
+		Reason:       ev.Reason,
 	}
 }
 

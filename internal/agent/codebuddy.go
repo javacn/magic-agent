@@ -271,47 +271,10 @@ func (c codebuddyCore) complete(ctx context.Context, req Request) (Response, err
 	// 自定义模型才补端点（用户可能刚在 App 里配好就直接 -m 调用，没打开过选择器）。
 	c.ensureCustomModelEndpoint(req.Model)
 
-	// 附件（截图）：与 claude 同族，--print 文本模式收不了图，走
-	// --input-format stream-json（图片 content block 经 stdin）。
-	if hasImageAttachment(req.Attachments) {
-		return c.completeWithAttachments(ctx, req, start)
-	}
-
-	args := c.buildArgs(req)
-
-	// workspace：codebuddy 与 claude 同族（无工作目录 flag，--add-dir 只加额外目录）
-	stdout, stderr, err := runCLIEnvIn(ctx, req.Workspace, c.extraEnv, bin, args...)
-	if err != nil {
-		return Response{}, wrapCliError(c.name, stdout, stderr, err)
-	}
-
-	raw := strings.TrimSpace(stdout)
-	if raw == "" {
-		return Response{}, fmt.Errorf("%s CLI returned empty output", c.name)
-	}
-
-	text := extractCodeBuddyResult(raw)
-
-	// 兜底：个别版本会把 user 请求回显（<user_query>…</user_query>）当正文。
-	if cleaned := stripUserQueryEcho(text); cleaned != text {
-		text = cleaned
-	}
-	if strings.TrimSpace(text) == "" {
-		return Response{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
-	}
-
-	return Response{
-		Text:      text,
-		Model:     req.Model,
-		SessionID: extractCodeBuddySession(raw),
-		Latency:   time.Since(start),
-	}, nil
-}
-
-// completeWithAttachments 走 stream-json 输入通道跑一次带附件的调用
-// （codebuddy 与 claude 同族协议），把事件归约成单次 Response。
-func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request, start time.Time) (Response, error) {
-	bin := c.bin()
+	// 提示词走 stdin 的 stream-json 通道（**所有**调用，含无附件的纯文本）。
+	// 与 claude 完全同构、同理由：位置参数在 Windows 上会被 .cmd 批处理拆坏
+	// （含换行时整段丢失），详见 claude.go Complete 的注释与 launch.go。
+	// 2026-10-01 起这不再是「附件专用」路径。
 	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
 	if prompt == "" {
 		return Response{}, fmt.Errorf("%s: empty prompt", c.name)
@@ -321,7 +284,11 @@ func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request,
 	if err != nil {
 		return Response{}, err
 	}
-	acc := &streamAccumulator{Engine: c.name, OnSessionID: req.OnSessionID}
+	acc := &streamAccumulator{
+		Engine:           c.name,
+		OnSessionID:      req.OnSessionID,
+		SanitizeTurnText: stripThinkBlock,
+	}
 	var fin streamJSONResult
 	seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, strings.NewReader(stdin), acc, &fin)
 	if err != nil {
@@ -333,7 +300,7 @@ func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request,
 	if fin.IsError {
 		return Response{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
 	}
-	text := stripUserQueryEcho(finalizeStreamText(fin, acc))
+	text := stripThinkBlock(stripUserQueryEcho(finalizeStreamText(fin, acc)))
 	if strings.TrimSpace(text) == "" {
 		return Response{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 	}
@@ -345,13 +312,15 @@ func (c codebuddyCore) completeWithAttachments(ctx context.Context, req Request,
 	}, nil
 }
 
-// buildArgs 构造 codebuddy CLI 参数（Complete 与 Stream 共用）。
+// buildArgs 构造 codebuddy CLI 参数（含末尾的位置参数 prompt）。
+//
+// ⚠️ 2026-10-01 起**生产路径已不再用它**（提示词全走 stdin），
+// 保留是因为 buildArgsBase 的语义仍被 streamJSONArgs 依赖。
 func (c codebuddyCore) buildArgs(req Request) []string {
 	return append(c.buildArgsBase(req), FlattenPrompt(req.SystemPrompt, req.Messages, false))
 }
 
-// buildArgsBase 构造参数（不含末尾的位置参数 prompt）——附件场景复用：
-// 那条路提示词走 stdin，不能再作为命令行参数传。
+// buildArgsBase 构造参数（不含末尾的位置参数 prompt）——提示词走 stdin 的路径复用它。
 func (c codebuddyCore) buildArgsBase(req Request) []string {
 	args := []string{"--print", "--output-format", "json"}
 	switch {
@@ -381,7 +350,10 @@ func (c codebuddyCore) buildArgsBase(req Request) []string {
 		// 四档权限档位：codebuddy 与 claude 同族，--permission-mode 取值完全一致
 		//（default / acceptEdits / auto / bypassPermissions），故复用同一映射。
 		// 改造前这里恒传 -y（= --dangerously-skip-permissions，第 4 档）。
-		args = append(args, "--permission-mode", claudePermissionMode(req.Permission))
+		// ⚠️ 2026-10-01：与 claude 同坑 —— 只传 --permission-mode 不传 --tools 时，
+		// codebuddy CLI 在 stream-json 模式下也不发 result 行；必须显式 --tools default。
+		args = append(args, "--tools", "default",
+			"--permission-mode", claudePermissionMode(req.Permission))
 	default:
 		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","),
 			"--permission-mode", claudePermissionMode(req.Permission))
@@ -414,97 +386,50 @@ func (c codebuddyCore) stream(ctx context.Context, req Request, onEvent func(Str
 	// 自定义模型才补端点（同 complete，见 custom_models.go）。
 	c.ensureCustomModelEndpoint(req.Model)
 
-	args := c.buildArgs(req)
-	if req.Append != nil || hasImageAttachment(req.Attachments) {
-		// 附件 / 常驻会话 → stream-json 输入通道：提示词改走 stdin（见 streamjson.go）。
-		prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
-		var stdin io.Reader
-		if req.Append != nil {
-			pipe, perr := streamJSONInputPipe(prompt, req.Attachments, req.Append)
-			if perr != nil {
-				return StreamResult{}, perr
-			}
-			stdin = pipe
-		} else {
-			line, serr := streamJSONUserLine(prompt, req.Attachments)
-			if serr != nil {
-				return StreamResult{}, serr
-			}
-			stdin = strings.NewReader(line)
-		}
-		args = streamJSONArgs(c.buildArgsBase(req), prompt, true)
-		acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent, OnSessionID: req.OnSessionID}
-		var fin streamJSONResult
-		seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, stdin, acc, &fin)
-		if err != nil {
-			return StreamResult{}, err
-		}
-		if !seen {
-			return StreamResult{}, fmt.Errorf("%s CLI stream ended without result line", c.name)
-		}
-		if fin.IsError {
-			return StreamResult{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
-		}
-		text := stripUserQueryEcho(finalizeStreamText(fin, acc))
-		if strings.TrimSpace(text) == "" {
-			return StreamResult{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
-		}
-		return StreamResult{
-			Response: Response{
-				Engine:    c.name,
-				Text:      text,
-				Model:     fin.Model,
-				SessionID: fin.SessionID,
-				Latency:   time.Since(start),
-			},
-			Thinking: acc.Thinking.String(),
-			Tools:    acc.Tools,
-		}, nil
+	// 提示词一律走 stdin 的 stream-json 输入通道（不再当位置参数）。
+	// 与 claude 完全同构、同理由（2026-10-01 改，Windows 实测）：
+	// 位置参数在 Windows 上会被 .cmd 批处理拆坏，含换行时整段丢失。
+	// 常驻会话（Request.Append 非 nil）的区别只在 stdin 是个**流**。
+	prompt := FlattenPrompt(req.SystemPrompt, req.Messages, false)
+	if prompt == "" {
+		return StreamResult{}, fmt.Errorf("%s: empty prompt", c.name)
 	}
-	for i := range args {
-		if args[i] == "--output-format" {
-			args[i+1] = "stream-json"
-			break
-		}
-	}
-	args = append(args, "--include-partial-messages", "--verbose")
-
-	acc := &streamAccumulator{Engine: c.name, OnEvent: onEvent}
-	var fin struct {
-		Type      string `json:"type"`
-		Subtype   string `json:"subtype"`
-		IsError   bool   `json:"is_error"`
-		Result    string `json:"result"`
-		SessionID string `json:"session_id"`
-		Model     string `json:"model"`
-	}
-	seenResult := false
-
-	err := runStreamCLIEnvIn(ctx, req.Workspace, c.extraEnv, bin, args, func(line string) error {
-		isResult, perr := acc.handleNDJSONLine(line)
+	var stdin io.Reader
+	if req.Append != nil {
+		pipe, perr := streamJSONInputPipe(prompt, req.Attachments, req.Append)
 		if perr != nil {
-			return perr
+			return StreamResult{}, perr
 		}
-		if isResult {
-			_ = json.Unmarshal([]byte(line), &fin)
-			seenResult = true
+		stdin = pipe
+	} else {
+		line, serr := streamJSONUserLine(prompt, req.Attachments)
+		if serr != nil {
+			return StreamResult{}, serr
 		}
-		return nil
-	})
+		stdin = strings.NewReader(line)
+	}
+	args := streamJSONArgs(c.buildArgsBase(req), prompt, true)
+	acc := &streamAccumulator{
+		Engine:           c.name,
+		OnEvent:          onEvent,
+		OnSessionID:      req.OnSessionID,
+		AggregateOnly:    true,
+		SanitizeTurnText: stripThinkBlock,
+	}
+	var fin streamJSONResult
+	seen, err := runStreamJSONIn(ctx, req.Workspace, c.extraEnv, bin, args, stdin, acc, &fin)
 	if err != nil {
 		return StreamResult{}, err
 	}
-	if !seenResult {
-		return StreamResult{}, fmt.Errorf("%s CLI stream ended without result line", c.name)
+	if !seen {
+		err := fmt.Errorf("%s CLI stream ended without result line", c.name)
+		acc.emitTurnFailed(acc.SessionID, err)
+		return StreamResult{}, err
 	}
 	if fin.IsError {
 		return StreamResult{}, fmt.Errorf("%s CLI error (subtype=%s): %s", c.name, fin.Subtype, truncateStr(fin.Result, 500))
 	}
-
-	text := stripUserQueryEcho(fin.Result)
-	if strings.TrimSpace(text) == "" {
-		text = strings.TrimSpace(acc.Text.String())
-	}
+	text := stripThinkBlock(stripUserQueryEcho(finalizeStreamText(fin, acc)))
 	if strings.TrimSpace(text) == "" {
 		return StreamResult{}, fmt.Errorf("%s CLI 返回内容仅为请求回显（无模型正文）", c.name)
 	}
@@ -872,6 +797,47 @@ func (e *CodeBuddyAIEngine) buildArgs(req Request) []string { return e.core().bu
 func (e *CodeBuddyAIEngine) buildArgsBase(req Request) []string { return e.core().buildArgsBase(req) }
 
 // ── 输出解析（两个后端共用）──────────────────────────────────
+
+// stripThinkBlock 剥离整段 <think>…</think> 思维链块。
+//
+// 为什么需要（2026-10-01 实测）：codebuddy 在 --tools off + 「直接输出纯文本
+// markdown」的约束下，仍会把推理写进 result 字段，形如
+//
+//	<think>The user is asking me to…</think>\n\n1
+//
+// 也就是**推理与正文同处一个字符串**。不剥掉的话：
+//   - `-o text` 的正文里混着英文推理，用户看到的是一段莫名其妙的话；
+//   - 更糟的是 --tools off 注入的约束里有「第一行必须是答案正文」，
+//     模型为遵守它而把答案挪到 think 块之后，客户端按行渲染会全乱。
+//
+// 与 stripUserQueryEcho 的关系：两者都是「剥掉不该当正文的前缀」，
+// 串联使用（先剥回显、再剥思维链）。llm 引擎的 thinkSplitter 是**流式**版本
+// （逐行喂、边喂边分流），这里是整段版本，用于 result 行一次性给全的场景。
+//
+// 找不到闭合标签时原样返回（宁可把标签露出来，也不要吞掉真内容）。
+//
+// ⚠️ 必须**循环**剥而不是只剥第一段：codebuddy 在多轮工具调用后会把每一轮的
+// 推理各写一个 think 块（<think>a</think>正文<think>b</think>正文…）。
+// 只剥第一段的话，第二段推理会原样漏进用户看到的正文 —— 症状是
+// 「回答中间突然冒出一段英文」，比整段漏出来更难定位。
+func stripThinkBlock(s string) string {
+	const (
+		open  = "<think>"
+		close = "</think>"
+	)
+	for {
+		i := strings.Index(s, open)
+		if i < 0 {
+			return s
+		}
+		j := strings.Index(s[i:], close)
+		if j < 0 {
+			// 未闭合 → 整段原样（不吞真内容）
+			return s
+		}
+		s = strings.TrimSpace(s[i+j+len(close):])
+	}
+}
 
 // stripUserQueryEcho 剥离 <user_query>…</user_query> 请求回显。
 func stripUserQueryEcho(s string) string {

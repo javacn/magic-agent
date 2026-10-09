@@ -260,3 +260,92 @@ func TestSessionWriterConcurrentSetIDAndPush(t *testing.T) {
 	wg.Wait()
 	sw.close()
 }
+
+// TestSessionLogBackwardCompatible 老 session log（没有收敛字段的）必须仍能读。
+//
+// 兼容性方向很重要：**新代码读旧数据**。字段全是 omitempty，所以旧 log 的
+// 每一行仍能解析成 sessionEvent，收敛字段读出来是零值。
+//
+// 反方向不成立且不需要成立：旧代码读新 log 时，多出来的键会被
+// encoding/json 忽略（没有 DisallowUnknownFields），也不会报错。
+func TestSessionLogBackwardCompatible(t *testing.T) {
+	dir := t.TempDir()
+	cli := SessionLogDirOverride
+	defer func() { SessionLogDirOverride = cli }()
+	SessionLogDirOverride = dir
+
+	// 一份 2026-10-02 之前写出的真实形状：没有任何收敛字段。
+	legacy := `{"kind":"thinking","text":"我应该","seq":1}
+{"kind":"text","text":"收到","seq":2,"session_id":"sess-old"}
+{"kind":"turn_end","text":"收到","seq":3,"session_id":"sess-old"}
+`
+	path := filepath.Join(dir, "sess-old.jsonl")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := ReadSessionLog(dir, "sess-old")
+	if err != nil {
+		t.Fatalf("读旧 log 失败: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("事件数 = %d，want 3", len(events))
+	}
+	for i, ev := range events {
+		if ev.ItemID != "" || ev.ItemRevision != 0 || ev.Status != "" || ev.Snapshot != "" {
+			t.Errorf("旧 log 的收敛字段应为零值，第 %d 条却是 %+v", i, ev)
+		}
+	}
+	// 旧数据的关键内容仍要读得出来。
+	if events[2].Kind != "turn_end" || events[2].Text != "收到" {
+		t.Errorf("旧 log 内容读取错误: %+v", events[2])
+	}
+}
+
+// TestSessionLogRoundTripsConvergenceFields 新写出的 log 必须带上收敛字段，
+// 且按 (item_id, item_revision) 读回来能复原出与实时流一致的收敛序列。
+func TestSessionLogRoundTripsConvergenceFields(t *testing.T) {
+	dir := t.TempDir()
+	cli := SessionLogDirOverride
+	defer func() { SessionLogDirOverride = cli }()
+	SessionLogDirOverride = dir
+
+	sw, err := newSessionWriterAuto(sessionLogDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sw.setSessionID("sess-conv")
+	// 真实 Claude 一轮：思考两条 item 各两帧 + 正文一条 item + 终帧。
+	sw.push(sessionEvent{Kind: "thinking", Text: "先", ItemID: "claude_think_msg_x", ItemRevision: 1, Status: "running", Snapshot: "先"})
+	sw.push(sessionEvent{Kind: "thinking", Text: "想", ItemID: "claude_think_msg_x", ItemRevision: 2, Status: "running", Snapshot: "先想"})
+	sw.push(sessionEvent{Kind: "text", Text: "2", ItemID: "claude_msg_msg_x", ItemRevision: 1, Status: "running", Snapshot: "2"})
+	sw.push(sessionEvent{Kind: "turn_end", Text: "2", ItemID: "claude_msg_msg_x", ItemRevision: 2, Status: "final", Snapshot: "2"})
+	drain(t, sw)
+
+	events, err := ReadSessionLog(dir, "sess-conv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("事件数 = %d，want 4", len(events))
+	}
+
+	// 按 item 覆盖式 upsert 回放，验证落盘数据足以复原收敛结果。
+	final := map[string]string{}
+	for _, ev := range events {
+		if ev.ItemID == "" {
+			t.Fatalf("落盘缺 item_id: %+v", ev)
+		}
+		final[ev.ItemID] = ev.Snapshot
+	}
+	if final["claude_msg_msg_x"] != "2" {
+		t.Errorf("正文 item 收敛结果 = %q，want \"2\"", final["claude_msg_msg_x"])
+	}
+	if final["claude_think_msg_x"] != "先想" {
+		t.Errorf("思考 item 收敛结果 = %q，want \"先想\"", final["claude_think_msg_x"])
+	}
+	// 两条 item 都在，且互不覆盖 —— 这正是拆 lane 的目的。
+	if len(final) != 2 {
+		t.Errorf("应收敛出 2 条 item，实得 %d：%v", len(final), final)
+	}
+}

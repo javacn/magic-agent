@@ -3,15 +3,27 @@ package agent
 // claude.go - Claude Code CLI 引擎。
 //
 // 后端：claude（Claude Code，本机 /opt/homebrew/bin/claude）。
-// 非交互模式：-p（--print）+ --output-format json，拿到稳定 envelope：
 //
-//	{"type":"result","subtype":"success","result":"<正文>",
-//	 "session_id":"...","is_error":false, "total_cost_usd":...}
+// ## 提示词一律走 stdin（2026-10-01 改，Windows 实测）
 //
-// 关键 flags：
+// 以前用 `-p <prompt>` 把提示词当**位置参数**传。实测在 Windows 上这是
+// 结构性不可靠的：npm 装的 claude 是 `claude.cmd` 批处理，含换行的位置参数
+// 会被 cmd.exe 拆坏，子进程拿不到完整 prompt 就**静默退 0、零输出**
+//（对照实验：同一命令单行 20 行 / 含换行 0 行；非流式同样整段丢内容）。
+//
+// 现在 Complete 与 Stream **都**走 `--input-format stream-json` 的 stdin
+// 通道（streamjson.go），提示词永不作为 argv。unix 上协议完全相同，
+// 故**不加平台分支** —— 一条路径两平台通吃。
+//
+// 收尾正文从 NDJSON 的 result 行取（这条协议要求 --output-format 也是
+// stream-json），故连非流式的 Complete 也要归约一遍事件。
+//
+// ## 关键 flags：
 //
 //	--model <m>                    传裸模型名（sonnet / opus / claude-sonnet-4-6...）
 //	--tools ""                     禁用全部内置工具，纯 chat 一次成型
+//	                                 （Windows 上经 launch.go 改写成 --tools=，
+//	                                  空串作独立参数会被 cmd.exe 丢弃）
 //	--permission-mode <mode>       四档权限档位（见 permission.go）：
 //	                               manual → default；accept-edits → acceptEdits；
 //	                               auto → auto；full → bypassPermissions（默认档）
@@ -39,7 +51,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -121,17 +132,6 @@ func (e *ClaudeEngine) ListModels(_ context.Context) ([]string, error) {
 	return models, nil
 }
 
-// claudeResult 对应 --output-format json 的 envelope。
-type claudeResult struct {
-	Type         string  `json:"type"`
-	Subtype      string  `json:"subtype"`
-	IsError      bool    `json:"is_error"`
-	Result       string  `json:"result"`
-	SessionID    string  `json:"session_id"`
-	Model        string  `json:"model"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-}
-
 // Complete 实现 Engine：单次调用 claude CLI。
 func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
@@ -145,54 +145,14 @@ func (e *ClaudeEngine) Complete(ctx context.Context, req Request) (Response, err
 		return Response{}, fmt.Errorf("claude: empty prompt")
 	}
 
-	// 附件（截图）：claude 的 -p 文本模式收不了图，唯一的原生通道是
-	// --input-format stream-json（图片作为 content block 走 stdin）。该模式下
-	// --output-format 也必须是 stream-json，所以这里跑一遍流式协议、把事件归约成
-	// 单次结果返回（Complete 的语义就是「一次性拿最终答案」，不给调用方发事件）。
-	if hasImageAttachment(req.Attachments) {
-		return e.completeWithAttachments(ctx, req, prompt, start)
-	}
-
-	args := e.buildArgs(req, prompt)
-
-	// workspace：claude 没有工作目录 flag，子进程 cwd 就是原生方式（见 Request.Workspace）
-	stdout, stderr, err := runCLIIn(ctx, req.Workspace, bin, args...)
-	if err != nil {
-		return Response{}, wrapCliError("claude", stdout, stderr, err)
-	}
-
-	raw := strings.TrimSpace(stdout)
-	if raw == "" {
-		return Response{}, fmt.Errorf("claude CLI returned empty output")
-	}
-
-	var env claudeResult
-	if err := json.Unmarshal([]byte(raw), &env); err != nil {
-		// 个别版本对 --print + json 仍吐纯文本：原样返回。
-		return Response{
-			Text:    raw,
-			Model:   req.Model,
-			Latency: time.Since(start),
-		}, nil
-	}
-	if env.IsError {
-		return Response{}, fmt.Errorf("claude CLI error (subtype=%s): %s", env.Subtype, truncateStr(env.Result, 500))
-	}
-	if env.Result == "" {
-		return Response{}, fmt.Errorf("claude CLI returned empty result")
-	}
-	return Response{
-		Text:      env.Result,
-		Model:     env.Model,
-		SessionID: env.SessionID,
-		Latency:   time.Since(start),
-	}, nil
-}
-
-// completeWithAttachments 走 stream-json 输入通道跑一次带附件的调用，
-// 把事件归约成单次 Response（不向调用方发增量事件）。
-func (e *ClaudeEngine) completeWithAttachments(ctx context.Context, req Request, prompt string, start time.Time) (Response, error) {
-	bin := e.bin()
+	// 提示词走 stdin 的 stream-json 通道（**所有**调用，含无附件的纯文本）。
+	//
+	// 为什么不再用 `-p <prompt>` 位置参数（2026-10-01 改，Windows 实测）：
+	// 位置参数在 Windows 上会被 .cmd 批处理拆坏 —— 含换行时整段内容丢失，
+	// claude 收到空 prompt 后回一句 "How can I help you today?"（实测）。
+	// unix 上位置参数本来能用，但统一走 stdin 可让两平台行为完全一致，
+	// 省掉一类「只在某个平台复现」的问题。代价是要多解析一层 NDJSON，
+	// 而 streamJSONArgs/runStreamJSONIn 已是附件路径的现成实现。
 	args := streamJSONArgs(e.buildArgsBase(req), prompt, false)
 	stdin, err := streamJSONUserLine(prompt, req.Attachments)
 	if err != nil {
@@ -205,7 +165,11 @@ func (e *ClaudeEngine) completeWithAttachments(ctx context.Context, req Request,
 		return Response{}, wrapCliError("claude", "", "", err)
 	}
 	if !seen {
-		return Response{}, fmt.Errorf("claude CLI stream ended without result line")
+		// 补终态事件（2026-10-02）：非流式路径通常没有 onEvent，nil 时静默跳过。
+		// 有 onEvent 的场景（观察者）才能看到「这一轮异常结束」而不是凭空消失。
+		err := fmt.Errorf("claude CLI stream ended without result line")
+		acc.emitTurnFailed(acc.SessionID, err)
+		return Response{}, err
 	}
 	if fin.IsError {
 		return Response{}, fmt.Errorf("claude CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
@@ -222,14 +186,16 @@ func (e *ClaudeEngine) completeWithAttachments(ctx context.Context, req Request,
 	}, nil
 }
 
-// buildArgs 构造 claude CLI 参数（Complete 与 Stream 共用）。
-// outputFormat："json"（单结果 envelope）或 "stream-json"（流式 NDJSON）。
+// buildArgs 构造 claude CLI 参数（含末尾的位置参数 prompt）。
+//
+// ⚠️ 2026-10-01 起**生产路径已不再用它**：Complete 与 Stream 都把提示词
+// 走 stdin（见各自注释里的理由），只有测试与「显式要位置参数」的场合还可能用。
+// 保留是因为 buildArgsBase 的语义（"不含位置参数"）仍被 streamJSONArgs 依赖。
 func (e *ClaudeEngine) buildArgs(req Request, prompt string) []string {
 	return append(e.buildArgsBase(req), prompt)
 }
 
-// buildArgsBase 构造参数（不含末尾的位置参数 prompt）——给附件场景复用：
-// 那条路提示词走 stdin，不能再作为命令行参数传（streamJSONArgs 负责剔除）。
+// buildArgsBase 构造参数（不含末尾的位置参数 prompt）——提示词走 stdin 的路径复用它。
 func (e *ClaudeEngine) buildArgsBase(req Request) []string {
 	// 工具模式 × 权限档位（四档模型见 permission.go）：
 	//	off        --tools ""（无工具调用，权限档位无意义，不传）
@@ -252,7 +218,13 @@ func (e *ClaudeEngine) buildArgsBase(req Request) []string {
 	case tools.IsOff():
 		args = append(args, "--tools", "")
 	case tools.IsOn():
-		args = append(args, "--permission-mode", claudePermissionMode(req.Permission))
+		// ⚠️ 2026-10-01：必须显式 --tools default —— 只传 --permission-mode
+		// 不传 --tools 时，claude CLI 在 stream-json 模式下不发 result 行
+		// （实测）：表现为「stream ended without result line」，魔法端把整轮
+		// 标 turn_failed、UI 一句话都渲染不出来。--tools default 才是「开工具」
+		// 的正路（与 ""=关、name1,name2=白名单 同列；"default" 是「全部内置」）。
+		args = append(args, "--tools", "default",
+			"--permission-mode", claudePermissionMode(req.Permission))
 	default: // allowlist
 		args = append(args, "--tools", strings.Join(tools.Allowlist(), ","),
 			"--permission-mode", claudePermissionMode(req.Permission))
@@ -287,102 +259,56 @@ func (e *ClaudeEngine) Stream(ctx context.Context, req Request, onEvent func(Str
 		return StreamResult{}, fmt.Errorf("claude: empty prompt")
 	}
 
-	// 附件（截图）→ stream-json 输入通道：提示词不再当位置参数，改走 stdin。
-	// 常驻会话（Request.Append 非 nil）走同一条通道 —— 区别只在 stdin 是个**流**：
+	// 提示词一律走 stdin 的 stream-json 输入通道（不再当位置参数）。
+	//
+	// 为什么这是**默认**而不是「附件时才走」（2026-10-01 改，Windows 实测）：
+	// 位置参数在 Windows 上是结构性不可靠的 —— npm 装的 claude 是 .cmd 批处理，
+	// 含换行的位置参数会被 cmd.exe 拆坏，子进程拿不到完整 prompt 就
+	// **静默退 0、零输出**（对照实验：同一命令单行 20 行 / 含换行 0 行）。
+	// 不只是流式受损：非流式的 -p 同样整段丢内容。
+	// agents-anywhere 对此的处理是提示词全走 SDK stdin（connector/runtimes/claude/
+	// sdk/client.py:160 的 query(content)），从架构上就没有这条破路。
+	//
+	// unix 上走 stdin 同样正确（协议一致），故**不加平台分支** ——
+	// 一条路径两平台通吃，避免两套行为漂移。
+	//
+	// 常驻会话（Request.Append 非 nil）的区别只在 stdin 是个**流**：
 	// 追加消息源源不断写进去，通道关闭才 EOF（子进程随之收尾）。
-	args := e.buildArgs(req, prompt)
-	if req.Append != nil || hasImageAttachment(req.Attachments) {
-		var stdin io.Reader
-		if req.Append != nil {
-			pipe, perr := streamJSONInputPipe(prompt, req.Attachments, req.Append)
-			if perr != nil {
-				return StreamResult{}, perr
-			}
-			stdin = pipe
-		} else {
-			line, serr := streamJSONUserLine(prompt, req.Attachments)
-			if serr != nil {
-				return StreamResult{}, serr
-			}
-			stdin = strings.NewReader(line)
-		}
-		args = streamJSONArgs(e.buildArgsBase(req), prompt, true)
-		acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent, OnSessionID: req.OnSessionID}
-		var fin streamJSONResult
-		seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, stdin, acc, &fin)
-		if err != nil {
-			return StreamResult{}, err
-		}
-		if !seen {
-			return StreamResult{}, fmt.Errorf("claude CLI stream ended without result line")
-		}
-		if fin.IsError {
-			return StreamResult{}, fmt.Errorf("claude CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
-		}
-		text := finalizeStreamText(fin, acc)
-		if text == "" {
-			return StreamResult{}, errEmptyStreamContent("claude")
-		}
-		return StreamResult{
-			Response: Response{
-				Engine:    e.Name(),
-				Text:      text,
-				Model:     fin.Model,
-				SessionID: fin.SessionID,
-				Latency:   time.Since(start),
-			},
-			Thinking: acc.Thinking.String(),
-			Tools:    acc.Tools,
-		}, nil
-	}
-
-	// json → stream-json：替换 --output-format 值并追加流式 flags。
-	for i := range args {
-		if args[i] == "--output-format" {
-			args[i+1] = "stream-json"
-			break
-		}
-	}
-	args = append(args, "--include-partial-messages", "--verbose")
-
-	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent}
-	var fin struct {
-		Type      string `json:"type"`
-		Subtype   string `json:"subtype"`
-		IsError   bool   `json:"is_error"`
-		Result    string `json:"result"`
-		SessionID string `json:"session_id"`
-		Model     string `json:"model"`
-	}
-	seenResult := false
-
-	err := runStreamCLIIn(ctx, req.Workspace, bin, args, func(line string) error {
-		isResult, perr := acc.handleNDJSONLine(line)
+	var stdin io.Reader
+	if req.Append != nil {
+		pipe, perr := streamJSONInputPipe(prompt, req.Attachments, req.Append)
 		if perr != nil {
-			return perr
+			return StreamResult{}, perr
 		}
-		if isResult {
-			_ = json.Unmarshal([]byte(line), &fin)
-			seenResult = true
+		stdin = pipe
+	} else {
+		line, serr := streamJSONUserLine(prompt, req.Attachments)
+		if serr != nil {
+			return StreamResult{}, serr
 		}
-		return nil
-	})
+		stdin = strings.NewReader(line)
+	}
+	args := streamJSONArgs(e.buildArgsBase(req), prompt, true)
+	acc := &streamAccumulator{Engine: e.Name(), OnEvent: onEvent, OnSessionID: req.OnSessionID}
+	var fin streamJSONResult
+	seen, err := runStreamJSONIn(ctx, req.Workspace, nil, bin, args, stdin, acc, &fin)
 	if err != nil {
 		return StreamResult{}, err
 	}
-	if !seenResult {
-		return StreamResult{}, fmt.Errorf("claude CLI stream ended without result line")
+	if !seen {
+		// 补终态事件：流被截断（引擎崩 / 被杀 / 没吐 result）时，已流出去的半截正文
+		// 在事件流上永远停在 running —— 消费方看到的是一条悬空 item。
+		// 对齐 agents-anywhere 的 failed_terminal_event（见 emitTurnFailed）。
+		err := fmt.Errorf("claude CLI stream ended without result line")
+		acc.emitTurnFailed(acc.SessionID, err)
+		return StreamResult{}, err
 	}
 	if fin.IsError {
 		return StreamResult{}, fmt.Errorf("claude CLI error (subtype=%s): %s", fin.Subtype, truncateStr(fin.Result, 500))
 	}
-
-	text := fin.Result
+	text := finalizeStreamText(fin, acc)
 	if text == "" {
-		text = strings.TrimSpace(acc.Text.String())
-	}
-	if text == "" {
-		return StreamResult{}, fmt.Errorf("claude CLI returned empty result")
+		return StreamResult{}, errEmptyStreamContent("claude")
 	}
 	return StreamResult{
 		Response: Response{

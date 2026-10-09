@@ -67,6 +67,19 @@ type arkClawStreamState struct {
 	completed bool   // 是否见过 completed 帧
 	state     string // 最近一次 status.state（错误信息用）
 	sessionID string // contextId（会话锚点，逐帧刷新）
+
+	// tracker 状态收敛的身份与版本（见 itemtracker.go）。
+	textTrack *itemTracker
+	// textTrack 是否已经发过事件（发过就不能再换 item id）。
+	textStarted bool
+}
+
+// trackers 惰性建立跟踪器。
+func (st *arkClawStreamState) trackers() *itemTracker {
+	if st.textTrack == nil {
+		st.textTrack = newItemTracker("arkclaw", laneText)
+	}
+	return st.textTrack
 }
 
 // Stream 实现 Streamer：走 A2A 官方 SSE 通道（见文件头）。
@@ -155,8 +168,24 @@ func (e *ArkClawEngine) Stream(ctx context.Context, req Request, onEvent func(St
 			return StreamResult{Response: resp}, perr
 		}
 		fmt.Fprintln(stderr, "magic-agent: arkclaw 网关未按 SSE 回（message/stream 不可用？），本轮按一次性响应处理（无增量）")
+		// 一次性响应也走 tracker：一次性只是**没有增量帧**，不是**没有状态收敛**。
+		// 收尾发 turn_end（final）而不是又一条 text，与 SSE 路径同一约定。
 		if onEvent != nil && resp.Text != "" {
-			onEvent(StreamEvent{Kind: KindText, Text: resp.Text})
+			fst := &arkClawStreamState{onEvent: onEvent, sessionID: resp.SessionID}
+			// 原生 id 与 SSE 路径同源：一次性 body 里也有 result.id（task id），
+			// 用 arkClawParseResponse 解析出的响应拿不到它，所以这里按帧重解一次。
+			if id := arkClawTaskID(raw); id != "" {
+				fst.trackers().Begin(id)
+			}
+			ev := StreamEvent{Kind: KindText, Text: resp.Text, SessionID: resp.SessionID}
+			// 一次性响应是整段到达，没有前序增量：snapshot 就是全文本身。
+			fst.trackers().nextWith(StatusRunning, resp.Text).apply(&ev)
+			onEvent(ev)
+			end := StreamEvent{Kind: KindTurnEnd, Text: resp.Text, SessionID: resp.SessionID}
+			if attrs, ok := fst.trackers().Finalize(resp.Text); ok {
+				attrs.apply(&end)
+			}
+			onEvent(end)
 		}
 		return StreamResult{Response: resp}, nil
 	}
@@ -171,6 +200,7 @@ func (e *ArkClawEngine) Stream(ctx context.Context, req Request, onEvent func(St
 		}
 		done, herr := st.handleFrame([]byte(payload), req.JSONSchema)
 		if herr != nil {
+			st.fail(herr)
 			return st.result(e, req, start), herr
 		}
 		if done {
@@ -180,18 +210,27 @@ func (e *ArkClawEngine) Stream(ctx context.Context, req Request, onEvent func(St
 	if serr := sc.Err(); serr != nil {
 		// 超时/取消会在读 body 时爆出来（请求头早就到了，卡的是流）。
 		if cerr := httpCtx.Err(); cerr != nil {
-			return st.result(e, req, start), fmt.Errorf("arkclaw: 流式读取中断: %w", cerr)
+			err := fmt.Errorf("arkclaw: 流式读取中断: %w", cerr)
+			st.fail(err)
+			return st.result(e, req, start), err
 		}
-		return st.result(e, req, start), fmt.Errorf("arkclaw: 读取流式响应失败: %w", serr)
+		err := fmt.Errorf("arkclaw: 读取流式响应失败: %w", serr)
+		st.fail(err)
+		return st.result(e, req, start), err
 	}
 
 	if !st.completed {
-		return st.result(e, req, start),
-			fmt.Errorf("arkclaw: 流式响应结束但没有 completed 帧（最后状态 %q）", st.state)
+		err := fmt.Errorf("arkclaw: 流式响应结束但没有 completed 帧（最后状态 %q）", st.state)
+		st.fail(err)
+		return st.result(e, req, start), err
 	}
 	res := st.result(e, req, start)
 	if strings.TrimSpace(res.Text) == "" {
-		return res, fmt.Errorf("arkclaw: 网关返回空正文（流式）")
+		// 正文空 → 整轮没有可用输出。item 可能已建立（网关发过 artifact），
+		// 必须收成 failed，否则那条 item 永远停在 running。
+		err := fmt.Errorf("arkclaw: 网关返回空正文（流式）")
+		st.fail(err)
+		return res, err
 	}
 	return res, nil
 }
@@ -212,6 +251,17 @@ func (st *arkClawStreamState) handleFrame(raw []byte, schema *JSONSchema) (bool,
 	res := *env.Result
 	if id := strings.TrimSpace(res.ContextID); id != "" {
 		st.sessionID = id
+	}
+	/* 原生 item id 用 **taskId（res.ID）** 而不是 contextId —— 两者语义不同，
+	   用错会让两轮共用一个 item：
+	   - contextId 是**会话**锚点，跨轮不变（下一轮带着它续接，见
+	     arkClawBuildRequest 的 contextID 参数），拿它当 item id 的话
+	     一个会话里的每一轮都是同一个 item，后一轮覆盖前一轮
+	     （症状：多轮对话只剩最后一次回复）。
+	   - taskId 是**单轮**任务 id，每个 message/stream 一次，天然是一轮一个 item。
+	   两者都拿不到时降级到本轮内稳定的 local_<n>（见 itemTracker.ensure）。 */
+	if id := strings.TrimSpace(res.ID); id != "" && !st.textStarted {
+		st.trackers().Note(id)
 	}
 	state := strings.ToLower(strings.TrimSpace(res.Status.State))
 	st.state = state
@@ -237,6 +287,8 @@ func (st *arkClawStreamState) handleFrame(raw []byte, schema *JSONSchema) (bool,
 		st.final = text
 		st.completed = true
 		st.emitText(text)
+		// completed = 轮次终点：发 turn_end 把 item 收成 final（见 finish 的注释）。
+		st.finish()
 		return true, nil
 	}
 
@@ -265,9 +317,61 @@ func (st *arkClawStreamState) emitText(text string) {
 		return
 	}
 	st.emitted.WriteString(text)
-	if st.onEvent != nil {
-		st.onEvent(StreamEvent{Kind: KindText, Text: text})
+	if st.onEvent == nil {
+		return
 	}
+	/* snapshot 直接取 st.emitted（累积到此刻的全文），**不能**喂给 tracker 的
+	   Append —— Append 的语义是「把这段**增量**拼到已有 snapshot 后面」，
+	   而这里传的是「累积到此刻的全文」，两者混用会逐帧翻倍
+	   （「你好」→「你好你好」，与 codebuddy-gateway 踩过的同一个坑）。
+	   正确分工见 itemtracker.go 文件头：tracker 管 id/revision/status，
+	   内容累积由调用方独家负责。 */
+	ev := StreamEvent{Kind: KindText, Text: text}
+	st.trackers().nextWith(StatusRunning, st.emitted.String()).apply(&ev)
+	st.textStarted = true
+	st.onEvent(ev)
+}
+
+// finish 收尾：把 item 标成 final（completed 帧已到，正文不会再变）。
+//
+// 发 **KindTurnEnd** 而不是又一条 KindText，理由同 codebuddy-gateway：
+// completed 是**轮次边界**而非「又一段正文」；补一条空 Text 的 KindText
+// 会打破既有按 ev.Text 收集的消费者（既有测试就是这么写的）。
+// arkclaw 不在 AppendSupportOf 名单里，不会启用常驻会话，
+// 所以不会被误触发 keep-alive 空闲收工。
+func (st *arkClawStreamState) finish() {
+	if st.onEvent == nil || !st.textStarted {
+		return
+	}
+	ev := StreamEvent{Kind: KindTurnEnd, Text: st.final, SessionID: st.sessionID}
+	if attrs, ok := st.trackers().Finalize(st.emitted.String()); ok {
+		attrs.apply(&ev)
+	}
+	st.onEvent(ev)
+}
+
+// fail 收尾异常路径：流被截断 / 任务 failed / JSON-RPC error / 空正文时，把已经发出去的
+// 正文 item 收成 failed，而不是让它永远停在 running（消费方只能靠超时猜，
+// 历史回放更糟：那一条永远显示「生成中」）。
+//
+// 语义与 finish 的分工：turn_end = 网关给了 completed 帧（成功收尾），
+// turn_failed = 没有（异常收尾），带 Error / Reason。partial 的内容仍然存在，
+// 只是这条 item 不会再更新（Status=failed 明确终止增长）。
+func (st *arkClawStreamState) fail(err error) {
+	if st.onEvent == nil || err == nil || !st.textStarted {
+		return
+	}
+	ev := StreamEvent{
+		Kind:      KindTurnFailed,
+		SessionID: st.sessionID,
+		Error:     err.Error(),
+		Reason:    ReasonOf(err),
+		Status:    StatusFailed,
+	}
+	if attrs, ok := st.trackers().Failed(st.emitted.String()); ok {
+		attrs.apply(&ev)
+	}
+	st.onEvent(ev)
 }
 
 // result 把累积状态收成 StreamResult（终态与错误路径共用）。
@@ -304,6 +408,20 @@ func arkClawSSEPayload(line string) (string, bool) {
 		return "", false
 	}
 	return payload, true
+}
+
+// arkClawTaskID 从一次性响应体里取 task id（result.id）。
+//
+// 非 SSE 回退路径专用：那里走 arkClawParseResponse 拿不到 result 结构
+// （它只返回拼好的 Response），但原生 id 不该因此降级到 local_<n> ——
+// 同一个 task 在 SSE 与一次性两条路径下必须得到**同一个** item id，
+// 否则同一轮回复会因走不同通道而在消费方眼里裂成两条 item。
+func arkClawTaskID(raw []byte) string {
+	env := arkClawEnvelope{}
+	if err := json.Unmarshal(raw, &env); err != nil || env.Result == nil {
+		return ""
+	}
+	return strings.TrimSpace(env.Result.ID)
 }
 
 // arkClawIsEventStream 响应是否为 SSE（content-type 判断，容忍参数与大小写）。

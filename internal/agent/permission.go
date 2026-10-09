@@ -205,18 +205,31 @@ func claudePermissionMode(t PermissionTier) string {
 	return "default"
 }
 
-// sandboxSettings 构造 settings.sandbox 子对象。第 4 档返回显式关闭。
+// sandboxSettings 构造 settings.sandbox 子对象。
+//
+//	第 1/2/3 档（manual / accept-edits / auto）—— 返回 `{"enabled": true, ...}`，
+//	                        配合 --permission-mode 让模型知道「沙箱里运行」+ 哪些操作免确认
+//	第 4 档（full / bypassPermissions）—— **返回 nil，让外层不写 sandbox 段
+//	                        整段都不下发**：
+//	                        1. bypassPermissions 与 sandbox 互斥（开了也是空跑）；
+//	                        2. 实测 2026-10-01：claude CLI 在 tools=default +
+//	                           bypassPermissions + `--settings {"sandbox":{"enabled":false}}`
+//	                           组合下报「Invalid JSON provided to --settings」、
+//	                           exit 0 零输出。bypassPermissions 本身就意味着不沙箱，
+//	                           显式写 enabled=false 反而触发那个 bug。
+//	                        3. 用户的 ~/.claude/settings.json 若开了 sandbox，
+//	                           第 4 档「--settings 优先级更高」这条契约靠的是把整段
+//	                           覆盖成空 sandbox，不是不写。两段都不写 = 沙箱启用 + 第 4 档，
+//	                           是 bug。
+//	                        见 magic-stock `.workbuddy/memory/2026-10-01.md` 的「Invalid JSON
+//	                        provided to --settings」一节。
 //
 // engine 用于区分两家文档确认过的键集：CodeBuddy 文档未列 `failIfUnavailable`，
 // 未知键的行为没有保证，故只在 claude 上注入。
 func sandboxSettings(tier PermissionTier, opts PermissionOptions, engine string) map[string]any {
 	if permissionOrDefault(tier) == PermissionFull {
-		// 第 4 档：显式关闭沙箱。
-		// 不只是「保持与改造前一致」—— 显式写出来才真正保证档位语义：
-		// 若用户的 ~/.claude/settings.json 里开着 sandbox.enabled=true，
-		// 不写这一项会让第 4 档继承到沙箱，与「沙箱关闭」的档位承诺矛盾。
-		// --settings 属于 flag 层，优先级高于 user settings，故能覆盖它。
-		return map[string]any{"enabled": false}
+		// 第 4 档：sandbox 整段都不写（见上方注释）
+		return nil
 	}
 	sb := map[string]any{
 		"enabled": true,
@@ -299,7 +312,9 @@ func agentSettingsPayload(req Request, engine string) (string, bool) {
 
 	// 沙箱 / autoMode / 权限规则只在真会调用工具时注入。
 	if !toolsIsOff(req) {
-		settings["sandbox"] = sandboxSettings(tier, opts, engine)
+		if sb := sandboxSettings(tier, opts, engine); sb != nil {
+			settings["sandbox"] = sb
+		}
 		if am := autoModeSettings(tier, opts); am != nil {
 			settings["autoMode"] = am
 		}

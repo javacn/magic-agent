@@ -115,6 +115,21 @@ type cbGatewayStreamState struct {
 	status    string // 最近一次 status（错误信息用）
 	sessionID string // 会话锚点（网关回 sessionId 时以它为准）
 	tools     []ToolCall
+
+	// tracker 状态收敛的身份与版本（见 itemtracker.go）。
+	// 原生 id = 网关分配的 runId（一个 run 恒定，见 codebuddy_gateway.go 的 deliver）。
+	textTrack *itemTracker
+	// textTrack 是否已经发过事件（发过就不能再换 item id）。
+	textStarted bool
+}
+
+// trackers 惰性建立跟踪器。
+func (st *cbGatewayStreamState) trackers() *itemTracker {
+	if st.textTrack == nil {
+		st.textTrack = newItemTracker(cbGatewayEngineName, laneText)
+		st.textTrack.Begin(st.runID)
+	}
+	return st.textTrack
 }
 
 // Stream 实现 Streamer：走 webhook 投递 + SSE 收流（见文件头）。
@@ -241,6 +256,8 @@ func (st *cbGatewayStreamState) handleFrame(raw []byte, schema *JSONSchema) (boo
 		st.final = text
 		st.completed = true
 		st.emitText(text)
+		// completed = 轮次终点：发 turn_end 把 item 收成 final（见 finish 的注释）。
+		st.finish(firstNonEmpty(st.convID, st.sessionID))
 		return true, nil
 
 	case "streaming":
@@ -279,9 +296,72 @@ func (st *cbGatewayStreamState) emitText(full string) {
 		return
 	}
 	st.emitted.WriteString(full)
-	if st.onEvent != nil {
-		st.onEvent(StreamEvent{Kind: KindText, Text: full})
+	if st.onEvent == nil {
+		return
 	}
+	// ⚠️ snapshot 直接取 st.emitted（累积到此刻的全文），**不能**喂给
+	// tracker 的 Append —— Append 的语义是「把这段**增量**拼到已有 snapshot
+	// 后面」，而这里传进去的是「累积到此刻的全文」，两者混用会逐帧翻倍
+	// （第一帧"你好"、第二帧"你好世界"，累加后得到"你好你好世界"）。
+	//
+	// 正确分工见 itemtracker.go 文件头：tracker 管 id / revision / status，
+	// 内容累积由调用方独家负责。nextWith 就是为此准备的入口。
+	ev := StreamEvent{Kind: KindText, Text: full}
+	st.trackers().nextWith(StatusRunning, st.emitted.String()).apply(&ev)
+	st.textStarted = true
+	st.onEvent(ev)
+}
+
+// fail 异常收尾（status=failed）：流被截断 / 任务 failed / HTTP 拒绝 / 读出错。
+//
+// 与 finish 的分工：turn_end = 网关给了 completed 帧（成功收尾），
+// turn_failed = 没有（异常收尾），带 Error / Reason。
+// 挂到**已有**正文 item 上：partial 的内容仍然存在，只是这条 item 不再增长。
+// 从没建立过 item 时直接返回 —— 不该为「一句正文都没流出来」的轮次硬造 item。
+//
+// 只有一个调用点（run 里的 consumeStream 错误分支）：它已经覆盖了
+// handleFrame 报错、读流中断、无终帧、非 SSE 缺终帧等全部异常出口，
+// 在这里收口比在每个 return err 处各写一遍可靠。
+func (st *cbGatewayStreamState) fail(err error) {
+	if st.onEvent == nil || err == nil || !st.textStarted {
+		return
+	}
+	ev := StreamEvent{
+		Kind:      KindTurnFailed,
+		SessionID: firstNonEmpty(st.convID, st.sessionID),
+		Error:     err.Error(),
+		Reason:    ReasonOf(err),
+		Status:    StatusFailed,
+	}
+	if attrs, ok := st.trackers().Failed(st.emitted.String()); ok {
+		attrs.apply(&ev)
+	}
+	st.onEvent(ev)
+}
+
+// finish 收尾：把 item 标成 final（completed 帧已到，正文不会再变）。
+//
+// 发的是 **KindTurnEnd** 而不是又一条 KindText，原因有三个：
+//  1. 语义对：completed 帧是**轮次边界**，不是「又来了一段正文」。
+//     之前试过补一条空 Text 的 KindText 帧，能过测试但语义是错的 ——
+//     消费方按 Text 拼正文的实现会收到一个空增量。
+//  2. 不破坏既有收集器：现有测试与调用方都按「KindText 就是正文增量」收集，
+//     多一条空帧会让它们数错条数。
+//  3. 轮次边界有独立信号后，思考 lane（将来若有）也能靠它收尾 ——
+//     与 claude / dsh 引擎的处理方式一致。
+//
+// ⚠️ keep-alive 的空闲收工挂在 KindTurnEnd 上（见 keepAlive 的调用点），
+// 但 codebuddy-gateway 不在 AppendSupportOf 名单里，不会启用常驻会话，
+// 所以这里发 turn_end 是安全的。
+func (st *cbGatewayStreamState) finish(sessionID string) {
+	if st.onEvent == nil || !st.textStarted {
+		return
+	}
+	ev := StreamEvent{Kind: KindTurnEnd, Text: st.final, SessionID: sessionID}
+	if attrs, ok := st.trackers().Finalize(st.emitted.String()); ok {
+		attrs.apply(&ev)
+	}
+	st.onEvent(ev)
 }
 
 // result 把累积状态收成 StreamResult（终态与错误路径共用）。

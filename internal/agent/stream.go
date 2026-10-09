@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -83,6 +84,35 @@ const (
 	// 要真正作答，得把答案作为**后续 user 消息**补进去（见 EncodeAskFollowUp），
 	// 正好复用常驻会话的 --append 通道。
 	KindAsk StreamEventKind = "ask"
+	// KindTurnFailed 一轮**没有走到终帧**（引擎流被截断、没吐 result 行）。
+	//
+	// 为什么需要它（2026-10-02，对齐 agents-anywhere 的 failed_terminal_event）：
+	// 此前这条路径只有 `return fmt.Errorf("... without result line")`，
+	// 于是「已经流出去的半截正文」在事件流上永远停在 running —— 消费方
+	// （多端同步 / 历史回放）看到的是一条**悬空**的 item：既不知道它完了没有，
+	// 也不知道该显示什么。补一条终态事件，一轮就绝不会悬空。
+	//
+	// 与 KindTurnEnd 的分工：turn_end = 引擎给出了 result 行（成功收尾）；
+	// turn_failed = 引擎没给（异常收尾，带 Error / Reason）。
+	// 两者都终结「这一轮」，消费方可以统一当边界用。
+	KindTurnFailed StreamEventKind = "turn_failed"
+)
+
+// StreamStatus 事件所描述的 item 状态 —— 对齐 agents-anywhere 的
+// timeline.item_status（2026-10-02）。
+//
+// 为什么要它：delta 广播只能告诉消费方「又来了几个字」，没法告诉它
+// 「这条消息已经完整了」。多端同步时前者要客户端自己判断何时停止拼接
+// （易错：漏拼、重复拼、乱序），后者只需「覆盖到 final 为止」。
+type StreamStatus string
+
+const (
+	// StatusRunning 还在增长中（partial）。消费方应持续覆盖同一 item。
+	StatusRunning StreamStatus = "running"
+	// StatusFinal 终态：这条 item 的内容已经定型，不会再变。
+	StatusFinal StreamStatus = "final"
+	// StatusFailed 异常终态：引擎没走完就被掐断（见 KindTurnFailed）。
+	StatusFailed StreamStatus = "failed"
 )
 
 // StreamEvent 一条流式增量。
@@ -106,6 +136,58 @@ type StreamEvent struct {
 	// 有了它，调用方不必再分辨这次是 claude 的 tool_use 形态还是 control_request 形态
 	//（两种形态在 wire 上字段完全不同，见 ask.go 的 ParseAskLine）。
 	Ask *AskRequest
+
+	/* ── 状态收敛字段（2026-10-02，对齐 agents-anywhere 的 timeline item）──
+	 *
+	 * 此前的事件模型是**纯 delta 广播**：只说「又来了这几个字」，
+	 * 消费方要自己拼、自己判断何时完整。对「终端直打」够用，但撑不起
+	 * 多端同步 / 历史回放 / 断线重连 —— 那些场景里同一条消息会被
+	 * 反复投递、乱序到达，前端不得不自己去重、排序、猜终态。
+	 *
+	 * agents-anywhere 的做法（claude/timeline/stream.py + core/timeline.py）：
+	 * 事件语义是**状态收敛**而非增量广播：
+	 *   · 每个可更新 item 有**稳定 id**（引擎原生 message id 派生）
+	 *   · 每次更新带**单调递增的 revision**
+	 *   · partial 与 final 用**同一个 id**，final 只是 revision 更高的覆盖
+	 *   · 幂等公式 revision = max(item.revision, existing.revision+1)
+	 *     ⇒ 重复投递不产生新版本
+	 * 消费方于是只需要「按 (id, revision) 覆盖式 upsert」，天然幂等。
+	 *
+	 * ⚠️ **Text 的语义保持不变（仍是增量片段）** —— 这是本设计最重要的一条
+	 * 取舍。`--stream -o text` 的正文直打、sessionlog 落盘、老客户端的
+	 * 逐行拼接全都依赖它，改成整段快照会静默打断所有既有消费方。
+	 * 想做 upsert 的消费方读 Snapshot；想增量拼接的继续读 Text。
+	 * 两个字段并存，引擎层一次投影同时喂饱两类消费方。 */
+
+	// ItemID 稳定的 item 标识（timeline item id）。空串 = 本事件不参与状态收敛
+	//（老引擎 / 无法归一化身份时）。取值形如 "msg_<native message id>"。
+	//
+	// 同一轮里的 thinking / text / 工具事件共享同一个 message item id，
+	// revision 各自递增 —— 消费方按 (ItemID, Revision) upsert 即得最终全文。
+	ItemID string
+
+	// Revision 该 item 的第几个版本，从 1 起单调递增。
+	// 同一个 ItemID 下：partial 是 1..N，final 是 N+1（覆盖，不是追加）。
+	ItemRevision uint64
+
+	// Status 本事件描述的 item 状态（见 StreamStatus）。空串 = 老语义
+	//（纯增量，既无终态也无状态机），消费方可按「非空才启用收敛」处理。
+	Status StreamStatus
+
+	// Snapshot 该 item 的**当前完整内容**（累积到此刻为止），与 Text（增量）并存。
+	//
+	// 为什么已经累积了还要发增量：两类消费方要的东西不同 ——
+	// 终端直打要增量（否则重打一遍全文）；多端同步要快照（否则要自己拼，
+	// 且拼不回去的历史/乱序场景无解）。发了快照，消费方可以完全忽略 Text。
+	//
+	// 仅在 ItemID 非空时携带；Snapshot 不可靠的引擎留空（消费方回退到 delta 拼接）。
+	Snapshot string
+
+	// Error 本轮异常收尾的原因（仅 KindTurnFailed 携带）。
+	Error string
+	// Reason 根因摘要（仅 KindTurnFailed 携带），与 -o json 的失败 envelope 同源
+	//（同走 agent.ReasonOf），同一次失败在事件流与 stderr 两处的说法必然一致。
+	Reason string
 }
 
 // ToolCall 一次完整的工具调用记录（用于收尾汇总）。
@@ -488,6 +570,34 @@ type streamAccumulator struct {
 	// 留空也能跑：解析本身与引擎无关，只有 header 上限之类的归一化需要它。
 	Engine string
 
+	// AggregateOnly 标记本引擎的正文**只**出现在 assistant 聚合行里、
+	// 不会走 stream_event 的 content_block_delta（2026-10-01，codebuddy 实测）。
+	//
+	// 为什么需要它：handleNDJSONLine 的 assistant 分支历史上只做兜底、不 emit
+	// （因为 claude/trae 的增量已经在 stream_event 里发过了，再 emit 会重复）。
+	// 但 codebuddy 不发 delta —— 不开这个开关，它的 `-o text` 实时输出全程空白。
+	// 由引擎显式声明，而不是「猜」（猜错就是重复输出，两种错法都很难查）。
+	AggregateOnly bool
+
+	// SanitizeTurnText 该引擎的「轮次正文清洗器」：把 result 行的**原始**
+	// result 字段整理成可以直接当正文交出去的样子。
+	//
+	// 为什么需要它（2026-10-01，codebuddy 实测）：result 行里的 result 字段是
+	// 未经处理的引擎原始输出 —— codebuddy 把思维链以 <think>…</think>
+	// 塞在同一个字符串里。于是同一轮里三个来源的"干净程度"并不一致：
+	//
+	//	acc.Text    已清洗（emit 时过 stripThinkBlock）
+	//	fin.Result  未清洗（← turn_end 直接拿它发，于是漏了）
+	//	最终正文     由调用方 stripThinkBlock(finalizeStreamText(...)) 得到，已清洗
+	//
+	// 于是 `-o json` 的 NDJSON 里会出现「text 干净、turn_end 脏」的自相矛盾。
+	// 症状极隐蔽：内容本身是对的，只是 turn_end 那一条夹着一段英文推理，
+	// 消费方（观物台把 turn_end 当轮次边界）就会把推理当成正文收进去。
+	//
+	// 由引擎声明（claude 留 nil = 原样不动），而不是在 emitTurnEnd 里对所有引擎
+	// 无脑套 think 剥离 —— 那会把合法输出里恰好出现的 <think> 字面量也切掉。
+	SanitizeTurnText func(string) string
+
 	// SessionID 流里最近见到的 session_id（system/init、assistant、result 行都带）。
 	//
 	// 为什么要它：KindAsk 事件必须能**直接接住** —— 宿主看到提问后要把用户的答案
@@ -509,6 +619,223 @@ type streamAccumulator struct {
 	// 被识别到 —— 一次是 content_block_start/stop 累积出的 tool_use（含完整 questions），
 	// 一次是随后那份聚合 assistant 消息（也带完整 input）。只该报一次。
 	askSeen map[string]bool
+
+	/* ── 状态收敛状态机（2026-10-02，见 StreamEvent 的状态收敛字段注释）──
+	 *
+	 * agents-anywhere 的 ClaudeStreamAccumulator（runtimes/claude/timeline/stream.py）
+	 * 维护三样东西，本文件照抄同一套：
+	 *   partial_message_id  稳定 item id（message_start 记原生 id 派生）
+	 *   partial_*_blocks    按 content block index 的累积文本
+	 *   partial_revision    当前 revision 计数
+	 * 终帧沿用同 id + revision+1 覆盖。 */
+
+	/* 正文与思考各一条 item（2026-10-02 修正，理由见 itemtracker.go
+	   itemLane 的注释）：共享一个 item id 时消费方覆盖式 upsert 会丢掉
+	   先到的那一半。两条 item 内嵌同一个原生 message id，合并展示时
+	   按原生 id 关联即可。 */
+	textTrack  *itemTracker
+	thinkTrack *itemTracker
+
+	// textBlocks 按 content block index 累积的正文片段。
+	textBlocks map[int]string
+	// thinkBlocks 按 content block index 累积的思考片段。
+	thinkBlocks map[int]string
+}
+
+// trackers 惰性建立两条 lane 的跟踪器（prefix 依赖 Engine，
+// 累加器是零值构造的，不能在字段声明处建）。
+func (a *streamAccumulator) trackers() trackerPair {
+	if a.textTrack == nil {
+		a.textTrack = newItemTracker(a.Engine, laneText)
+	}
+	if a.thinkTrack == nil {
+		a.thinkTrack = newItemTracker(a.Engine, laneThink)
+	}
+	return trackerPair{text: a.textTrack, think: a.thinkTrack}
+}
+
+/* ── 稳定 item id 的建立与降级链 ──────────────────────────────────
+ *
+ * agents-anywhere 的规则（claude/timeline/messages.py stable_message_item_id）：
+ * 从 message_start 记下的原生 id 派生 `claude_msg_<hash>`，**跨事件稳定**。
+ * 拿不到 message_start.id 时它「丢弃并 warning，不猜」。
+ *
+ * 我们同理，但降级链多两级（引擎协议不保证每次都有原生 id）：
+ *
+ *	1. 原生 message id（claude/codebuddy 实测必有，贯穿整条消息）
+ *	2. 本轮内稳定的**序号**（首个 text/thinking 块出现时定下，
+ *	   之后本轮不再变）—— 同一轮内稳定，重放时靠 seq 也能推回同一个
+ *
+ * ⚠️ 降级到 2 时**绝不能**每帧新造一个 id（否则一条消息被拆成 N 个 item），
+ * 所以序号在首次建立后写进 tracker.itemID，之后只读不重算。 */
+
+// beginMessage 声明一条新 assistant message 开始，清空块桶。
+//
+// 为什么必须切：一轮里可能有**多条** assistant message（工具调用后
+// 继续对话，每次 tool_result 之后都是新的 message_start）。不切的话它们
+// 共用一个 item id，前一条被后一条覆盖 —— 症状是「只看到最后一段回复」。
+//
+// 与 agents-anywhere 同动作（runtimes/claude/timeline/stream.py:35-36 在
+// message_start 里 clear() 块桶并把 revision 归零），这里是封装。
+func (a *streamAccumulator) beginMessage(nativeID string) {
+	p := a.trackers()
+	p.text.Begin(nativeID)
+	p.think.Begin(nativeID)
+	a.textBlocks = nil
+	a.thinkBlocks = nil
+}
+
+// observeNativeMessageID 从任意 NDJSON 行里捞出原生 assistant message id。
+//
+// 2026-10-02 实测（claude stream-json 抓包）：message_start 事件里
+// event.message.id 与后续 assistant 聚合行 message.id **完全一致**，
+// 且整条消息期间不变 —— 所以两条路任一先到都能定下同一个 id。
+func (a *streamAccumulator) observeNativeMessageID(line string) {
+	var probe struct {
+		Type    string `json:"type"`
+		Message struct {
+			ID string `json:"id"`
+		} `json:"message"`
+		Event struct {
+			Type    string `json:"type"`
+			Message struct {
+				ID string `json:"id"`
+			} `json:"message"`
+		} `json:"event"`
+	}
+	if json.Unmarshal([]byte(line), &probe) != nil {
+		return
+	}
+	// message_start = 一条新 assistant message 开始：切 item、记原生 id。
+	// 必须在事件路由**之前**做（message_start 早于所有 content_block_delta），
+	// 否则新消息的第一个 delta 会挂到上一条消息的 item 上。
+	if probe.Event.Type == "message_start" {
+		nativeID := probe.Event.Message.ID
+		if nativeID == "" && probe.Type == "assistant" {
+			nativeID = probe.Message.ID
+		}
+		a.beginMessage(nativeID)
+		return
+	}
+	// 聚合 assistant 行也带 message.id（实测与 message_start 的 id 一致），
+	// 作为 message_start 缺失时定下 id 的第二条路。
+	if probe.Type == "assistant" && probe.Message.ID != "" {
+		p := a.trackers()
+		p.text.Note(probe.Message.ID)
+		p.think.Note(probe.Message.ID)
+	}
+}
+
+// appendBlock 往某个 index 累积文本块。
+func (a *streamAccumulator) appendBlock(store map[int]string, index int, text string) {
+	if text == "" || store == nil {
+		return
+	}
+	store[index] += text
+}
+
+// joinBlocks 按 index 升序拼接所有块（与到达顺序无关）。
+func (a *streamAccumulator) joinBlocks(store map[int]string) string {
+	if len(store) == 0 {
+		return ""
+	}
+	idx := make([]int, 0, len(store))
+	for i := range store {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	var sb strings.Builder
+	for _, i := range idx {
+		sb.WriteString(store[i])
+	}
+	return sb.String()
+}
+
+// emit 聚合并转发一条增量（基础版本：thinking / text）。
+//
+// 两种模式并存（2026-10-02）：
+//   - OnEvent == nil：不发事件，只累积到 Text / Thinking（老行为）。
+//   - 已建立 item：Text 仍带增量（**不破坏**终端直打与老客户端），
+//     同时带 ItemID / ItemRevision / Status / Snapshot 四元组，
+//     消费方按 (ItemID, Revision) upsert 即得状态收敛。
+func (a *streamAccumulator) emit(kind StreamEventKind, text string) {
+	switch kind {
+	case KindThinking:
+		a.Thinking.WriteString(text)
+	case KindText:
+		a.Text.WriteString(text)
+	}
+	if a.OnEvent == nil {
+		return
+	}
+	ev := StreamEvent{Kind: kind, Text: text}
+	if kind == KindThinking || kind == KindText {
+		a.decorateTextEvent(&ev, kind)
+	}
+	a.OnEvent(ev)
+}
+
+// decorateTextEvent 给 thinking/text 事件补上状态收敛四元组。
+//
+// 累积策略：**整段 snapshot**（不是增量片段）—— 与 agents-anywhere 一致。
+// 消费方覆盖式 upsert，天然去重，不需要「先删 partial 再插 final」的顺序逻辑。
+func (a *streamAccumulator) decorateTextEvent(ev *StreamEvent, kind StreamEventKind) {
+	/* snapshot 从「按 content block index 升序拼接的块」取，而不是从
+	   到达顺序累积的 builder 取。区别是实质性的：一条消息里正文可能分散
+	   在多个 text 块，而块的**到达顺序**不保证等于 index 顺序
+	   （实测：index=1 的块先到、index=0 的块后到是可能的）。
+	   按到达顺序拼会给消费方一份顺序错乱的正文，而且错得很隐蔽 ——
+	   内容都在，只是读起来不对。 */
+	if kind == KindThinking {
+		a.trackers().think.nextWith(StatusRunning, a.joinBlocks(a.thinkBlocks)).apply(ev)
+		return
+	}
+	a.trackers().text.nextWith(StatusRunning, a.joinBlocks(a.textBlocks)).apply(ev)
+}
+
+// emitTextDelta 累积一个内容块的增量并发出带状态收敛元数据的事件。
+//
+// index 来自 claude 的 content_block index（-1 = 协议没给，如 trae /
+// codebuddy 聚合行）。按 index 分桶累积而不是一路 append，是因为
+// 一条 assistant 消息里正文可能分散在多个 text 块，而块的**到达顺序**
+// 不保证等于 index 顺序（实测 thinking=0 先到、text=1 后到，但反过来也可能）。
+func (a *streamAccumulator) emitTextDelta(index int, kind StreamEventKind, text string) {
+	if text == "" {
+		return
+	}
+	if a.textBlocks == nil {
+		a.textBlocks = make(map[int]string)
+	}
+	if a.thinkBlocks == nil {
+		a.thinkBlocks = make(map[int]string)
+	}
+	store := a.textBlocks
+	if kind == KindThinking {
+		store = a.thinkBlocks
+	}
+	a.appendBlock(store, index, text)
+	a.emit(kind, text)
+}
+
+// emitAggregateText 从 assistant 聚合行发正文（AggregateOnly 引擎专用）。
+//
+// ⚠️ 与 emitTextDelta 的**关键区别**：聚合行给的是**整条消息的全文**，
+// 不是增量。所以 snapshot 是「整体替换」而不是「追加」——
+// 追加会得到 "你好你好"（同一份内容被数了两遍），这正是 codebuddy 路径
+// 最容易踩的坑（它只发聚合行，delta 路径一次都不走）。
+//
+// Text 字段仍然原样带整段（保持 codebuddy 历史行为：终端直打逐行拼出来
+// 恰好就是全文），不做差分 —— 对聚合引擎而言两者的结果本来就相同。
+func (a *streamAccumulator) emitAggregateText(full string) {
+	if full == "" {
+		return
+	}
+	if a.textBlocks == nil {
+		a.textBlocks = make(map[int]string)
+	}
+	// 单桶：整段覆盖（协议给不了 index，用 0 桶并始终覆盖）。
+	a.textBlocks[0] = full
+	a.emit(KindText, full)
 }
 
 // toolUseOrphanGuard 安全释放：若 content_block_stop 到来但 openToolName 为空，
@@ -628,6 +955,12 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 			a.OnSessionID(probe.SessionID)
 		}
 	}
+	/* 原生 assistant message id（状态收敛的锚点，2026-10-02）。
+	   必须**在事件路由之前**观察：message_start 早于所有 content_block_delta，
+	   在它之后才建立 item id 的话，前几个 delta 会落到「序号降级」id 上。
+	   实测（claude 抓包）：message_start.event.message.id 与 assistant 聚合行的
+	   message.id 一致，所以两条路都能定下同一个 id。 */
+	a.observeNativeMessageID(line)
 
 	switch probe.Type {
 	case "result":
@@ -642,7 +975,10 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 		// trae: delta.content 直出增量
 		var se struct {
 			Event struct {
-				Type         string `json:"type"`
+				Type    string `json:"type"`
+				Message struct {
+					ID string `json:"id"`
+				} `json:"message"`
 				ContentBlock struct {
 					Type      string `json:"type"`
 					Name      string `json:"name"`
@@ -714,12 +1050,14 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 				a.flushToolResult(d.Text)
 			case d.Type == "thinking_delta" || d.Thinking != "":
 				if d.Thinking != "" {
-					a.emit(KindThinking, d.Thinking)
+					// 按 content block index 累积：思考与正文可能分处不同块，
+					// snapshot 必须按 index 拼，不能按到达顺序 append。
+					a.emitTextDelta(se.Event.Index, KindThinking, d.Thinking)
 				}
 			case d.Type == "text_delta" || d.Text != "":
 				if d.Text != "" {
 					if cbType == "" || cbType == "text" {
-						a.emit(KindText, d.Text)
+						a.emitTextDelta(se.Event.Index, KindText, d.Text)
 					}
 				}
 			}
@@ -735,8 +1073,9 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 		}
 
 		// trae delta.content 直出增量（无 thinking / tool 通道）。
+		// index 恒为 -1（协议不给），单桶累积 = 整段拼接，与到达顺序一致。
 		if c := se.Delta2.Content; c != "" && se.Delta2.Role == "assistant" {
-			a.emit(KindText, c)
+			a.emitTextDelta(-1, KindText, c)
 		}
 
 	case "assistant":
@@ -754,6 +1093,19 @@ func (a *streamAccumulator) handleNDJSONLine(line string) (isResult bool, err er
 		// emitAsk 的 askSeen 去重，不会重复上报。
 		if req, ok := ParseAskLine(a.Engine, line); ok {
 			a.emitAsk(req)
+		}
+		/* AggregateOnly 引擎（2026-10-01，codebuddy 实测）：它**不发**
+		   content_block_delta，正文只出现在这份聚合行里。若不在这里 emit，
+		   `-o text` 的实时 stdout 会全程空（用户看到「转圈然后什么都没有」），
+		   只有 json 模式收尾的 result 行才有正文。
+		   claude/trae 走 stream_event 增量，这里再 emit 会**重复输出**，
+		   所以由引擎显式声明（见 streamAccumulator.AggregateOnly）。 */
+		if a.AggregateOnly {
+			if txt := assistantLineText(line); txt != "" {
+				// 与收尾路径同一个过滤器：codebuddy 会把推理以 <think>…</think>
+				// 的形式塞进正文，不剥的话实时输出里会混进英文推理。
+				a.emitAggregateText(stripThinkBlock(txt))
+			}
 		}
 
 	case "control_request":
@@ -859,24 +1211,116 @@ func extractToolResultText(raw json.RawMessage) string {
 	return ""
 }
 
-// emit 聚合并转发一条增量（基础版本：thinking / text）。
-func (a *streamAccumulator) emit(kind StreamEventKind, text string) {
-	switch kind {
-	case KindThinking:
-		a.Thinking.WriteString(text)
-	case KindText:
-		a.Text.WriteString(text)
+// assistantLineText 从 assistant 聚合行里取出纯文本正文。
+//
+// 行形状（claude / codebuddy 同族）：
+//
+//	{"type":"assistant","message":{"content":[{"type":"text","text":"…"}]}}
+//
+// content 可能是字符串（少见）或块数组。tool_use / tool_result 块跳过 ——
+// 它们由 content_block_* 与 user 消息两条路负责，不在这里重复发。
+// 嵌套的 thinking 块也跳过（codebuddy 会把推理塞在 result 字符串里，
+// 由 codebuddy.go 的 stripThinkBlock 在收尾时整段剥离）。
+func assistantLineText(line string) string {
+	var msg struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
-	if a.OnEvent != nil {
-		a.OnEvent(StreamEvent{Kind: kind, Text: text})
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return ""
 	}
+	raw := msg.Message.Content
+	if len(raw) == 0 {
+		return ""
+	}
+	// 形态 1：content 直接是字符串。
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// 形态 2：块数组，只取 type=="text" 的 text 拼接。
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
 }
 
 // emitTurnEnd 发一轮结束事件：text = 该轮正文（引擎 result 行的 result），
 // sessionID = 该轮的会话 id（见 StreamEvent.SessionID 的说明）。
+//
+// text 会先过一遍 SanitizeTurnText（由引擎声明的清洗器）——
+// 不然这里发出去的是引擎**原始** result，与同一轮的 text / result 事件不一致
+// （codebuddy 的 <think> 泄漏正是从这条路出去的，见 SanitizeTurnText 的注释）。
 func (a *streamAccumulator) emitTurnEnd(text, sessionID string) {
 	if a.OnEvent == nil {
 		return
 	}
-	a.OnEvent(StreamEvent{Kind: KindTurnEnd, Text: text, SessionID: sessionID})
+	if a.SanitizeTurnText != nil {
+		text = a.SanitizeTurnText(text)
+	}
+	ev := StreamEvent{Kind: KindTurnEnd, Text: text, SessionID: sessionID}
+	/* 终帧 = 状态收敛的**最后一次 upsert**：沿用与 partial 同一个 ItemID、
+	   revision 再 +1、Status 标 final。消费方按 (ItemID, Revision) 覆盖即可，
+	   不需要「先删 partial 再插 final」这种有顺序要求的逻辑（agents-anywhere
+	   的做法，见 claude/timeline/stream.py next_final_revision）。
+	   Snapshot 用 result 行的正文而非累积分片 —— 引擎给出的 result 是权威值，
+	   与增量拼接有出入时以它为准（claude 的 result 行 = 完整正文；codebuddy 的
+	   result 行还要过 stripThinkBlock，上面已过）。
+
+	   ⚠️ 只收尾**正文** lane：result 行是整条消息的正文，不含思考链。
+	   思考 lane 已经在最后一个 thinking_delta 上收到过内容，此后不会再增长；
+	   若也给它发 final，消费方会看到一条「内容中途消失」的 final（快照回退成空），
+	   反而制造出比不收尾更糟的状态。想标记思考已结束，靠消费方见到 result
+	   事件后停止等待即可 —— 它拿得到 turn 级的终态信号。 */
+	if attrs, ok := a.trackers().finalize(text); ok {
+		attrs.apply(&ev)
+	}
+	a.OnEvent(ev)
+}
+
+// emitTurnFailed 补一条「本轮异常收尾」事件（引擎没给 result 行）。
+//
+// 对齐 agents-anywhere 的 failed_terminal_event（claude/turns/lifecycle.py）：
+// 流被截断也**必须**发终态事件，绝不让一轮悬空。
+//
+// 为什么这条不能省（2026-10-02）：此前这条路径只有 return error，
+// 于是「已经流出去、正打到一半」的正文在事件流上永远停在 running ——
+// 多端同步的客户端看到的是一个既不增长也不结束的 item，
+// 只能靠超时猜；历史回放更糟：那一条永远显示「生成中」。
+//
+// 语义与 KindTurnEnd 的分工：
+//
+//	turn_end    = 引擎给出了 result 行（成功收尾）
+//	turn_failed = 引擎没给（异常收尾），带 Error / Reason
+func (a *streamAccumulator) emitTurnFailed(sessionID string, err error) {
+	if a.OnEvent == nil || err == nil {
+		return
+	}
+	ev := StreamEvent{
+		Kind:      KindTurnFailed,
+		SessionID: sessionID,
+		Error:     err.Error(),
+		Reason:    ReasonOf(err),
+		Status:    StatusFailed,
+	}
+	// 已建立 item 时把失败也挂到同一个 item 上：partial 的内容仍然存在，
+	// 只是这条 item 不会再更新了（Status=failed 明确终止增长）。
+	if attrs, ok := a.trackers().failText(a.joinBlocks(a.textBlocks)); ok {
+		attrs.apply(&ev)
+	}
+	a.OnEvent(ev)
 }

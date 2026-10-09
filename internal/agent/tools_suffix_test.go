@@ -220,16 +220,23 @@ func hasArgToken(args, want string) bool {
 	return false
 }
 
-// nil ToolsMode 必须按 off 处理（默认关工具，向后兼容）。
+// nil ToolsMode 必须按 on 处理（2026-10-01 反转默认）—— magic-agent 的定位是
+// 本机 agent，调用方不显式声明工具 = 想要工具；想关显式传 ToolsOff。
 func TestToolsIsOffDefaultsToOff(t *testing.T) {
-	if !toolsIsOff(Request{}) {
-		t.Error("空 Tools 应视为 off")
+	/* 旧断言是「空 Tools 应视为 off」—— 那是早期 magic-agent 当 chat 套壳的
+	   口径。2026-10-01 用户报障「claude 只闲聊不读文件」就是这个默认兜底。
+	   本测试改名 + 反转断言，钉住新默认。 */
+	if toolsIsOff(Request{}) {
+		t.Error("空 Tools 在 2026-10-01 反转后视为 on（magic-agent 默认开工具）")
 	}
 	if toolsIsOff(Request{Tools: ToolsOn}) {
 		t.Error("ToolsOn 不应判定为 off")
 	}
 	if toolsIsOff(Request{Tools: ToolsAllowlist([]string{"Read"})}) {
 		t.Error("白名单不应判定为 off")
+	}
+	if !toolsIsOff(Request{Tools: ToolsOff}) {
+		t.Error("显式 ToolsOff 仍应判定为 off（兜底反转不影响显式传值）")
 	}
 }
 

@@ -248,6 +248,35 @@ func TestCLIResolveEnvVar(t *testing.T) {
 	}
 }
 
+// TestLLMBaseCoversBothVenvLayouts llm 的 venv 探测候选必须同时覆盖
+// **两个平台的 venv 布局**：Windows 是 `Scripts\`，Unix 是 `bin/`。
+//
+// 这条挡的是 2026-10-01 实测踩到的一个真实故障：`npm i -g magic-agent` 的
+// postinstall 明明把 llm 装进了 `~/.llm-venv/Scripts/`（install.js 自己按
+// win32 选 Scripts），`--engines` 却仍报 "llm CLI not found" —— 因为
+// llmBase.candidates 只列了 Unix 的 `bin/` 一条。安装器与探测器各说各话，
+// 两边都不报错，排查成本很高。
+//
+// 断言只查「候选列表里有哪两条」，不碰真实文件系统：路径在不同机器上不一定存在。
+func TestLLMBaseCoversBothVenvLayouts(t *testing.T) {
+	// 与 npm/install.js 的 venvDir() 保持一致：
+	//   process.platform === "win32" ? "Scripts" : "bin"
+	want := map[string]bool{
+		"~/.llm-venv/Scripts/llm.exe": false, // Windows
+		"~/.llm-venv/bin/llm":         false, // Unix
+	}
+	for _, c := range llmBase.candidates {
+		if _, ok := want[c]; ok {
+			want[c] = true
+		}
+	}
+	for c, found := range want {
+		if !found {
+			t.Errorf("llmBase.candidates 缺少 %q —— 另一个平台的 venv 布局会探测不到", c)
+		}
+	}
+}
+
 /* ── 引擎版本读取（2026-09-23）──
  * 用户：「引擎检测除了 a2a 的 其他也要支持有升级」—— 版本号是「升级」可验证的前提
  * （重探一次比对旧新，才能如实说「已升级」或「版本未变」）。 */

@@ -13,7 +13,14 @@ npm/dist/
 config.json
 # 工作记忆 / agent 状态（与 magic-test 的 .gitignore 对齐）
 .workbuddy/
+.workbuddy-ai/
 .openclaw/
+
+# 本机构建产物 / 探测产物（不该入库）
+#   magic-agent.exe        —— 在仓库根直接 go build 出来的 15MB 二进制
+#   engines_output.json    —— `magic-agent --engines` 的本机探测结果（含本机绝对路径）
+/magic-agent.exe
+engines_output.json
 
 # HTML 报告的导出 zip（是仓库里那些 .html 报告的副本，可重新生成）
 .trae-html-share-packages/
